@@ -1,0 +1,2 @@
+# CSV 改为普通文件，避免 LFS 对象缺失导致无法推送
+# *.csv filter=lfs diff=lfs merge=lfs -text

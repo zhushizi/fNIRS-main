@@ -1,0 +1,81 @@
+# Virtual env
+software/env
+
+# Altium files
+*.PrjPCBStructure
+*.SchDocPreview
+*.PcbDocPreview
+__Previews
+*.PrjPcbStructure
+*.Dat
+*.REP 
+*.TLT
+*.LOG
+*.log
+*.htm
+*.$$$
+*.DS_Store
+*.OutJob
+*.BomDoc
+Project\ Outputs
+Project\ Logs
+Project Outputs for*
+History
+exports/*
+!exports/manual
+
+# workspace data
+.vscode/
+.metadata/
+*.xml
+*.bin
+*makefile
+
+#DS_Store
+*.DS_Store
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+*.list
+*.mk
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# CSV Files
+*.csv
+# but don’t ignore the CSV files in software/sample_data
+!software/sample_data/*.csv
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]

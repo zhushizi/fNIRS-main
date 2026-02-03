@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>fNIRS Data Visualization</title>
+  <!-- Load Bootstrap CSS -->
+  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
+  <!-- Load Plotly -->
+  <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+  <!-- Load jQuery -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <style>
+    /* Global Styles */
+    body {
+      background-color: #eef2f7;
+      font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+      color: #333;
+    }
+
+    h1,
+    h5 {
+      color: #004085;
+    }
+
+    .container {
+      max-width: 1500px;
+      padding-left: 10px;
+      padding-right: 10px;
+    }
+
+    /* Card Styles */
+    .card {
+      margin-bottom: 20px;
+      border: none;
+      border-radius: 10px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    }
+
+    .card-header {
+      background-color: #004085;
+      color: #fff;
+      border-top-left-radius: 10px;
+      border-top-right-radius: 10px;
+      text-align: center;
+      font-size: 1.25rem;
+    }
+
+    .card-body {
+      background-color: #fff;
+      padding: 20px;
+    }
+
+    /* Graph Container Styles */
+    .graph-container {
+      padding: 15px;
+      background-color: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+      margin-bottom: 20px;
+    }
+
+    .btn-custom {
+      background-color: white;
+      color: #004085;
+      border: 2px solid #004085;
+    }
+
+    .btn-custom:hover,
+    .btn-custom:focus,
+    .btn-custom:active {
+      background-color: #004085;
+      color: white;
+    }
+
+    .btn-custom.active {
+      background-color: #004085;
+      color: white;
+    }
+
+    /* Brain Mesh Container */
+    #brainMeshContainer {
+      width: 100%;
+      height: 800px;
+    }
+
+    .custom-legend {
+      font-size: 18px;
+      /* Increase legend text size */
+      line-height: 1.5;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="container my-4">
+    <!-- Page Header -->
+    <div class="text-center mb-4">
+      <h1>fNIRS Data Visualization</h1>
+    </div>
+
+    <div class="row">
+      <!-- Left Column: Brain Mesh -->
+      <div class="col-md-8">
+        <div class="card mb-4">
+          <div class="card-header">3D Brain Mesh with Sensor Nodes</div>
+          <div class="card-body">
+            <!-- Custom Legend -->
+            <div class="custom-legend mb-3">
+              <div>
+                <strong>Sensor Type:</strong>
+                <span class="legend-item"
+                  style="display: inline-block; width: 12px; height: 12px; background-color: white; border: 1px solid #ccc; margin: 0 5px;"></span>
+                Emitter,
+                <span class="legend-item"
+                  style="display: inline-block; width: 12px; height: 12px; background-color: black; margin: 0 5px;"></span>
+                Detector
+              </div>
+              <div>
+                <strong>Sensor Wavelength:</strong>
+                <span class="legend-item"
+                  style="display: inline-block; width: 12px; height: 12px; background-color: #39FF14; margin: 0 5px;"></span>
+                940 nm,
+                <span class="legend-item"
+                  style="display: inline-block; width: 12px; height: 12px; background-color: #32CD32; margin: 0 5px;"></span>
+                660 nm
+              </div>
+              <div>
+                <strong>Highlights:</strong>
+                <span class="legend-item"
+                  style="display: inline-block; width: 12px; height: 12px; background-color: yellow; margin: 0 5px;"></span>
+                Sensor Group Mapping,
+                <span class="legend-item"
+                  style="display: inline-block; width: 12px; height: 12px; background-color: red; margin: 0 5px;"></span>
+                Activated Regions
+              </div>
+            </div>
+            <div id="brainMeshContainer"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right Column: Control Panels -->
+      <div class="col-md-4">
+        <!-- Sensor Group Buttons Panel -->
+        <div class="card mb-4">
+          <div class="card-header">Sensor Group Mappings</div>
+          <div class="card-body">
+            <div class="row">
+              <div class="col-6 custom-btn-group" role="group">
+                <button type="button" class="btn btn-custom btn-sm btn-block mb-2">Group 1</button>
+                <button type="button" class="btn btn-custom btn-sm btn-block mb-2">Group 2</button>
+                <button type="button" class="btn btn-custom btn-sm btn-block mb-2">Group 3</button>
+                <button type="button" class="btn btn-custom btn-sm btn-block">Group 4</button>
+              </div>
+              <div class="col-6 custom-btn-group" role="group">
+                <button type="button" class="btn btn-custom btn-sm btn-block mb-2">Group 5</button>
+                <button type="button" class="btn btn-custom btn-sm btn-block mb-2">Group 6</button>
+                <button type="button" class="btn btn-custom btn-sm btn-block mb-2">Group 7</button>
+                <button type="button" class="btn btn-custom btn-sm btn-block">Group 8</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Control Panel: MUX Control (Top) and Emitter Control (Bottom) -->
+        <div class="card">
+          <div class="card-header">Control Panel</div>
+          <div class="card-body">
+            <!-- MUX Control Section -->
+            <div class="mb-4">
+              <h5>MUX Control</h5>
+              <div class="mb-2">
+                <label for="mux_control_override_enable">Override Enable:</label>
+                <input type="checkbox" id="mux_control_override_enable" onchange="updateControlData()">
+              </div>
+              <div class="mb-2">
+                <label for="mux_control_state">Control State:</label>
+                <select id="mux_control_state" onchange="updateControlData()" disabled>
+                  <option value="0">MUX Disabled</option>
+                  <option value="1">MUX Channel 1</option>
+                  <option value="2">MUX Channel 2</option>
+                  <option value="3">MUX Channel 3</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Emitter Control Section -->
+            <div>
+              <h5>Emitter Control</h5>
+              <div class="mb-2">
+                <label for="emitter_control_override_enable">Override Enable:</label>
+                <input type="checkbox" id="emitter_control_override_enable" onchange="updateControlData()">
+              </div>
+              <div class="mb-2">
+                <label for="emitter_control_state">Control State:</label>
+                <select id="emitter_control_state" onchange="updateControlData()" disabled>
+                  <option value="0">DISABLED</option>
+                  <option value="1">IDLE</option>
+                  <option value="2">DEFAULT_MODE</option>
+                  <option value="3">USER_CONTROL</option>
+                  <option value="4">CYCLING</option>
+                  <option value="5">FULLY_ENABLED_940NM</option>
+                  <option value="6">FULLY_ENABLED_660NM</option>
+                </select>
+              </div>
+              <!-- Emitter PWM Control Table -->
+              <div id="emitter_pwm_controls" style="display: none;">
+                <table class="table table-bordered">
+                  <thead>
+                    <tr>
+                      <th>Emitter</th>
+                      <th>940nm</th>
+                      <th>660nm</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>Emitter 1</td>
+                      <td><input type="checkbox" id="emitter_0_940"></td>
+                      <td><input type="checkbox" id="emitter_0_660"></td>
+                    </tr>
+                    <tr>
+                      <td>Emitter 2</td>
+                      <td><input type="checkbox" id="emitter_1_940"></td>
+                      <td><input type="checkbox" id="emitter_1_660"></td>
+                    </tr>
+                    <tr>
+                      <td>Emitter 3</td>
+                      <td><input type="checkbox" id="emitter_2_940"></td>
+                      <td><input type="checkbox" id="emitter_2_660"></td>
+                    </tr>
+                    <tr>
+                      <td>Emitter 4</td>
+                      <td><input type="checkbox" id="emitter_3_940"></td>
+                      <td><input type="checkbox" id="emitter_3_660"></td>
+                    </tr>
+                    <tr>
+                      <td>Emitter 5</td>
+                      <td><input type="checkbox" id="emitter_4_940"></td>
+                      <td><input type="checkbox" id="emitter_4_660"></td>
+                    </tr>
+                    <tr>
+                      <td>Emitter 6</td>
+                      <td><input type="checkbox" id="emitter_5_940"></td>
+                      <td><input type="checkbox" id="emitter_5_660"></td>
+                    </tr>
+                    <tr>
+                      <td>Emitter 7</td>
+                      <td><input type="checkbox" id="emitter_6_940"></td>
+                      <td><input type="checkbox" id="emitter_6_660"></td>
+                    </tr>
+                    <tr>
+                      <td>Emitter 8</td>
+                      <td><input type="checkbox" id="emitter_7_940"></td>
+                      <td><input type="checkbox" id="emitter_7_660"></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div> <!-- End Card Body for Control Panel -->
+        </div> <!-- End Control Panel Card -->
+
+        <!-- Mode Selection Panel -->
+        <div class="card mt-4">
+          <div class="card-header">Mode Selection</div>
+          <div class="card-body">
+            <p><strong>Select Mode:</strong></p>
+            <div>
+              <input type="radio" id="live_mode" name="mode" value="live">
+              <label for="live_mode">Live Readings (ADC Only)</label>
+            </div>
+            <div>
+              <input type="radio" id="record_mode" name="mode" value="record">
+              <label for="record_mode">Record & Visualize (ADC and/or mBLL)</label>
+            </div>
+            <div id="record_options" style="display:none; margin-top:10px;">
+              <p><strong>Select Sources:</strong></p>
+              <div>
+                <input type="checkbox" id="source_ADC" name="source" value="ADC">
+                <label for="source_ADC">ADC</label>
+              </div>
+              <div>
+                <input type="checkbox" id="source_mBLL" name="source" value="mBLL">
+                <label for="source_mBLL">mBLL</label>
+              </div>
+            </div>
+            <br>
+            <button id="modeToggleButton" class="btn btn-custom btn-block" onclick="toggleMode()">Start</button>
+            <div id="stopwatch" style="margin-top:10px; font-size:20px; text-align:center; display:none;">00:00</div>
+            <br>
+            <!-- Container for per-source button groups (hidden until recording stops) -->
+            <div id="sourceButtons" style="display:none;"></div>
+          </div>
+        </div>
+
+      </div> <!-- End Right Column -->
+    </div> <!-- End Row -->
+  </div>
+
+  <!-- Load Bootstrap JS and dependencies -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
+  <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.js"></script>
+
+  <script>
+    // Define LED colors:
+    const LED_GREEN = "#39FF14";     // Bright LED green for 940nm
+    const LED_DIM_GREEN = "#32CD32"; // Dimmer LED green for 660nm
+    const WHITE = "white";
+
+    var currentGroup = null;  // global variable to store the selected group
+    var currentCamera = null; // Global variable to store current camera settings
+    var currentMode = null;  // Global variable to store the selected mode.
+    var selectedSources = [];
+
+    // Global variables for timer and process state.
+    var timerInterval;
+    var elapsedSeconds = 0;
+    var processingStarted = false;
+
+    // Emitter & MUX control logic
+    let controlData = {
+      emitter_control_override_enable: 0,
+      emitter_control_state: 0,
+      emitter_pwm_control_h: 0,
+      emitter_pwm_control_l: 0,
+      mux_control_override_enable: 0,
+      mux_control_state: 0
+    };
+
+    var socket = io();
+    socket.on('brain_mesh_update', function (data) {
+      console.log('Received brain mesh update:', data);
+      const brainFig = JSON.parse(data.brain_mesh);
+      Plotly.react("brainMeshContainer", brainFig.data, brainFig.layout);
+    });
+
+    // Toggle additional options if "Record & Visualize" is selected.
+    $('input[name="mode"]').change(function () {
+      if ($(this).val() === 'record') {
+        $('#record_options').show();
+      } else {
+        $('#record_options').hide();
+      }
+    });
+
+    // Attach a listener to capture camera changes.
+    // Using Plotly's built-in event handler.
+    function attachCameraListener() {
+      var brainDiv = document.getElementById("brainMeshContainer");
+      if (brainDiv) {
+        // Remove any previously attached listener first (if needed)
+        // Then attach the listener.
+        brainDiv.on('plotly_relayout', function (eventData) {
+          if (eventData['scene.camera']) {
+            currentCamera = eventData['scene.camera'];
+            // console.log("Camera updated:", currentCamera);
+          }
+        });
+      }
+    }
+
+    // Enforce that only one checkbox per emitter can be checked
+    function handleEmitterCheckboxChange(emitterIndex, wavelength) {
+      if (wavelength === '940') {
+        if ($("#emitter_" + emitterIndex + "_940").is(":checked")) {
+          // Uncheck the 660nm checkbox for the same emitter.
+          $("#emitter_" + emitterIndex + "_660").prop("checked", false);
+        }
+      } else if (wavelength === '660') {
+        if ($("#emitter_" + emitterIndex + "_660").is(":checked")) {
+          // Uncheck the 940nm checkbox for the same emitter.
+          $("#emitter_" + emitterIndex + "_940").prop("checked", false);
+        }
+      }
+      // After enforcing exclusivity, update control data.
+      updateControlData();
+    }
+
+    // Function to update emitter colors in the Plotly brain mesh.
+    function updateEmitterColors() {
+      var brainDiv = document.getElementById("brainMeshContainer");
+      if (!brainDiv || !brainDiv.data) return;
+
+      // Get emitter control state from the select element.
+      var emitterControlState = parseInt($("#emitter_control_state").val());
+      var emitterColors = [];
+
+      // If FULLY_ENABLED_940NM is selected (value 5), use LED_GREEN for all emitters.
+      if (emitterControlState === 5) {
+        for (var i = 0; i < 8; i++) {
+          emitterColors.push(LED_GREEN);
+        }
+      }
+      // If FULLY_ENABLED_660NM is selected (value 6), use LED_DIM_GREEN for all emitters.
+      else if (emitterControlState === 6) {
+        for (var i = 0; i < 8; i++) {
+          emitterColors.push(LED_DIM_GREEN);
+        }
+      }
+      // Otherwise, use individual checkbox values.
+      else {
+        for (var i = 0; i < 8; i++) {
+          if ($("#emitter_" + i + "_940").is(":checked")) {
+            emitterColors.push(LED_GREEN);
+          } else if ($("#emitter_" + i + "_660").is(":checked")) {
+            emitterColors.push(LED_DIM_GREEN);
+          } else {
+            emitterColors.push(WHITE);
+          }
+        }
+      }
+
+      // Identify the emitter traces in the Plotly graph.
+      var emitterTraceIndices = [];
+      for (var i = 0; i < brainDiv.data.length; i++) {
+        if (brainDiv.data[i].name === "Emitter") {
+          emitterTraceIndices.push(i);
+        }
+      }
+
+      // Update each emitter trace's color.
+      emitterTraceIndices.forEach(function (traceIndex, idx) {
+        Plotly.restyle(brainDiv, { 'color': [emitterColors[idx]] }, traceIndex);
+      });
+    }
+
+
+    // Attach a click handler to each sensor group button.
+    $(document).ready(function () {
+      for (var i = 0; i < 8; i++) {
+        // When the 940nm checkbox is changed.
+        $("#emitter_" + i + "_940").on("change", function () {
+          var emitterIndex = this.id.split('_')[1];
+          if ($(this).is(":checked")) {
+            // Uncheck the corresponding 660nm checkbox.
+            $("#emitter_" + emitterIndex + "_660").prop("checked", false);
+          }
+          updateControlData();
+        });
+        // When the 660nm checkbox is changed.
+        $("#emitter_" + i + "_660").on("change", function () {
+          var emitterIndex = this.id.split('_')[1];
+          if ($(this).is(":checked")) {
+            // Uncheck the corresponding 940nm checkbox.
+            $("#emitter_" + emitterIndex + "_940").prop("checked", false);
+          }
+          updateControlData();
+        });
+      }
+
+      // Attach a click handler to each sensor group button.
+      $(".custom-btn-group button").click(function () {
+        // Extract the group number from the button text (assumes format "Sensor Group X").
+        var buttonText = $(this).text().trim();
+        var groupId = parseInt(buttonText.split(" ")[1]);
+
+        // Set the global variable to persist the selection.
+        currentGroup = groupId;
+
+        // Update button styles so only one appears active
+        $(".custom-btn-group button").removeClass("active");
+        $(this).addClass("active");
+
+        // Call the endpoint to get the updated brain mesh with the selected group highlighted.
+        $.getJSON("/select_group/" + groupId, function (data) {
+          if (data.brain_mesh) {
+            const brainFig = JSON.parse(data.brain_mesh);
+            // If a camera setting exists, reapply it.
+            if (currentCamera) {
+              brainFig.layout.scene.camera = currentCamera;
+            }
+            // Use Plotly.react and then, once finished, reapply the camera.
+            Plotly.react("brainMeshContainer", brainFig.data, brainFig.layout).then(function () {
+              if (currentCamera) {
+                Plotly.relayout("brainMeshContainer", { "scene.camera": currentCamera });
+              }
+              attachCameraListener();
+            });
+          }
+        });
+      });
+
+      // Initial rendering of graphs and control UI
+      updateGraphs();
+      setInterval(flashEmitters, 4000);
+    });
+
+
+    // Update control data based on user input
+    function updateControlData() {
+      controlData.emitter_control_override_enable = document.getElementById('emitter_control_override_enable').checked ? 1 : 0;
+      controlData.emitter_control_state = parseInt(document.getElementById('emitter_control_state').value);
+      controlData.emitter_pwm_control_h = getPwmControlValue('h');
+      controlData.emitter_pwm_control_l = getPwmControlValue('l');
+      controlData.mux_control_override_enable = document.getElementById('mux_control_override_enable').checked ? 1 : 0;
+      controlData.mux_control_state = parseInt(document.getElementById('mux_control_state').value);
+
+      $.ajax({
+        url: '/update_control_data',
+        type: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify(controlData),
+        success: function (response) {
+          console.log('Control data updated:', response);
+        }
+      });
+
+      updateUI();
+      updateEmitterColors();
+    }
+
+    // Helper function to get PWM control value based on emitter selection
+    function getPwmControlValue(type) {
+      let value = 0;
+      if (type === 'l') {
+        // For lower register: channels 0-7 come from emitters 0-3.
+        for (let emitter = 0; emitter < 4; emitter++) {
+          // 660nm channel (even channel: 2*emitter)
+          const checkbox660 = document.getElementById(`emitter_${emitter}_660`);
+          if (checkbox660 && checkbox660.checked) {
+            value |= (1 << (2 * emitter));
+          }
+          // 940nm channel (odd channel: 2*emitter + 1)
+          const checkbox940 = document.getElementById(`emitter_${emitter}_940`);
+          if (checkbox940 && checkbox940.checked) {
+            value |= (1 << (2 * emitter + 1));
+          }
+        }
+      } else if (type === 'h') {
+        // For higher register: channels 8-15 come from emitters 4-7.
+        // We map these channels to bit positions 0-7 in the high register.
+        for (let emitter = 4; emitter < 8; emitter++) {
+          // Determine bit position in the high register for emitter X.
+          let bitPos = (emitter - 4) * 2;
+          const checkbox660 = document.getElementById(`emitter_${emitter}_660`);
+          if (checkbox660 && checkbox660.checked) {
+            value |= (1 << bitPos);
+          }
+          const checkbox940 = document.getElementById(`emitter_${emitter}_940`);
+          if (checkbox940 && checkbox940.checked) {
+            value |= (1 << (bitPos + 1));
+          }
+        }
+      }
+      return value;
+    }
+
+    function getEmitterTraceIndices() {
+      var brainDiv = document.getElementById("brainMeshContainer");
+      var indices = [];
+      for (var i = 0; i < brainDiv.data.length; i++) {
+        if (brainDiv.data[i].name === "Emitter") {
+          indices.push(i);
+        }
+      }
+      return indices;
+    }
+
+    function flashEmitters() {
+      var overrideEnabled = document.getElementById('emitter_control_override_enable').checked;
+      // Only flash if override is not enabled.
+      if (!overrideEnabled) {
+        var brainDiv = document.getElementById("brainMeshContainer");
+        // Get the emitter trace indices.
+        var emitterIndices = getEmitterTraceIndices();
+        if (emitterIndices.length > 0) {
+          // Temporarily set color to LED_GREEN (#39FF14) for all emitter traces.
+          Plotly.restyle(brainDiv, { 'color': ['#39FF14'] }, emitterIndices);
+          // After 500ms, restore the original colors.
+          setTimeout(function () {
+            updateEmitterColors();
+          }, 500);
+        }
+      }
+    }
+
+
+    // Update UI based on control data
+    function updateUI() {
+      const emitterOverrideEnabled = document.getElementById('emitter_control_override_enable').checked;
+      const muxOverrideEnabled = document.getElementById('mux_control_override_enable').checked;
+      const emitterControlState = parseInt(document.getElementById('emitter_control_state').value);
+
+      document.getElementById('emitter_control_state').disabled = !emitterOverrideEnabled;
+      document.getElementById('mux_control_state').disabled = !muxOverrideEnabled;
+      document.getElementById('emitter_pwm_controls').style.display = (emitterControlState === 3 && emitterOverrideEnabled) ? 'block' : 'none';
+    }
+
+    // Function to update brain mesh and sensor charts
+    function updateGraphs() {
+      var endpoint = currentGroup !== null ? '/select_group/' + currentGroup : '/update_graphs';
+      // console.log('Updating graphs with endpoint:', endpoint);
+      $.getJSON(endpoint, function (data) {
+        // Update brain mesh
+        if (data.brain_mesh) {
+          const brainFig = JSON.parse(data.brain_mesh);
+          var brainDiv = document.getElementById("brainMeshContainer");
+          // Use currentCamera if available, otherwise try to get the current camera from the existing layout.
+          if (currentCamera) {
+            brainFig.layout.scene.camera = currentCamera;
+          } else if (brainDiv && brainDiv._fullLayout && brainDiv._fullLayout.scene && brainDiv._fullLayout.scene.camera) {
+            brainFig.layout.scene.camera = brainDiv._fullLayout.scene.camera;
+          }
+          Plotly.react("brainMeshContainer", brainFig.data, brainFig.layout).then(function () {
+            if (currentCamera) {
+              Plotly.relayout("brainMeshContainer", { "scene.camera": currentCamera });
+            }
+            attachCameraListener();
+            updateEmitterColors();
+          });
+        }
+        else {
+          console.error('No brain mesh data received.');
+        }
+      });
+    }
+
+    // Update stopwatch display.
+    function updateStopwatch() {
+      elapsedSeconds++;
+      var minutes = Math.floor(elapsedSeconds / 60);
+      var seconds = elapsedSeconds % 60;
+      $('#stopwatch').text(
+        (minutes < 10 ? "0" + minutes : minutes) + ":" +
+        (seconds < 10 ? "0" + seconds : seconds)
+      );
+    }
+
+    function toggleMode() {
+      if (!processingStarted) {
+        // Start mode: hide per-source buttons and (if record mode) the mode selection card.
+        $("#sourceButtons").hide();
+        $("#modeSelection").hide(); // if you have this container
+
+        // Get selected mode from radio buttons.
+        var selectedMode = $('input[name="mode"]:checked').val();
+        if (!selectedMode) {
+          alert("Please select a mode.");
+          return;
+        }
+        currentMode = selectedMode; // save the selected mode
+
+        // Determine sources.
+        if (selectedMode === 'live') {
+          selectedSources = ["ADC"];
+        } else if (selectedMode === 'record') {
+          selectedSources = [];
+          if ($('#source_ADC').is(':checked')) selectedSources.push("ADC");
+          if ($('#source_mBLL').is(':checked')) selectedSources.push("mBLL");
+          if (selectedSources.length === 0) {
+            alert("Please select at least one source (ADC and/or mBLL) for Record & Visualize.");
+            return;
+          }
+        }
+
+        // Send start request to server.
+        $.ajax({
+          url: '/start_processing',
+          method: 'POST',
+          contentType: 'application/json',
+          data: JSON.stringify({
+            mode: selectedMode,
+            sources: selectedSources
+          }),
+          success: function (response) {
+            console.log(response.status);
+            processingStarted = true;
+            // For ADC live mode, do not show stopwatch and use "Stop" as button text.
+            if (selectedMode === 'live') {
+              $('#modeToggleButton').text("Stop");
+              $('#stopwatch').hide();
+            } else {
+              // For record mode, show the stopwatch and set button text accordingly.
+              $('#modeToggleButton').text("Stop Recording");
+              $('#stopwatch').show();
+              elapsedSeconds = 0;
+              timerInterval = setInterval(updateStopwatch, 1000);
+            }
+          },
+          error: function (err) {
+            console.error("Error starting processing:", err);
+          }
+        });
+      } else {
+        // Stop mode.
+        $.ajax({
+          url: '/stop_processing',
+          method: 'POST',
+          success: function (response) {
+            console.log(response.status);
+            processingStarted = false;
+            clearInterval(timerInterval);
+            $('#stopwatch').hide();
+            $('#modeToggleButton').text("Start");
+
+            // If record mode, build per-source button groups.
+            if (currentMode === 'record') {
+              var html = "";
+              selectedSources.forEach(function (source) {
+                html += "<div class='source-group' style='margin-bottom:15px;'>";
+                html += "<h5>" + source + "</h5>";
+                html += "<button class='btn btn-custom' onclick='downloadCSV(\"" + source + "\")'>Download CSV</button> ";
+                html += "<button class='btn btn-custom' onclick='viewStatic(\"" + source + "\")'>View Static Plot</button> ";
+                html += "<button class='btn btn-custom' onclick='viewAnimation(\"" + source + "\")'>View Animation</button>";
+                html += "</div>";
+              });
+              $("#sourceButtons").html(html);
+              $("#sourceButtons").show();
+              $("#modeSelection").show();
+            } else {
+              // For live mode, no additional UI is needed.
+              $("#modeSelection").show();
+            }
+          },
+          error: function (err) {
+            console.error("Error stopping processing:", err);
+          }
+        });
+      }
+    }
+
+    // Function to download CSV for a given source.
+    function downloadCSV(source) {
+      // Default filename: source.csv (e.g., ADC.csv)
+      let defaultName = source + ".csv";
+      let fileName = prompt("Please enter the file name for download (e.g., mydata.csv):", defaultName);
+      if (fileName) {
+        window.location.href = '/download/' + source + '?filename=' + encodeURIComponent(fileName);
+      }
+    }
+
+    // Function to view the static plot for a given source.
+    function viewStatic(source) {
+      window.open('/view_static/' + source, '_blank');
+    }
+
+    function viewAnimation(source) {
+      $.ajax({
+        url: '/view_animation/' + source,
+        method: 'GET'
+      });
+    }
+
+  </script>
+</body>
+
+</html>

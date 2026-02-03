@@ -1,0 +1,6 @@
+../Core/Src/sensing.c:45:24:sensing_low_pass_filter	1
+../Core/Src/sensing.c:50:6:sensing_init	1
+../Core/Src/sensing.c:58:10:sensing_get_sensor_calibrated_value	1
+../Core/Src/sensing.c:63:7:sensing_get_temperature_reading	1
+../Core/Src/sensing.c:68:6:sensing_update_all_temperature_readings	1
+../Core/Src/sensing.c:73:6:sensing_update_all_sensor_channels	2

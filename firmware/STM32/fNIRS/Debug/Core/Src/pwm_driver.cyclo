@@ -1,0 +1,8 @@
+../Core/Src/pwm_driver.c:33:6:pwm_driver_config	10
+../Core/Src/pwm_driver.c:85:6:pwm_driver_assert_enable_line	1
+../Core/Src/pwm_driver.c:90:6:pwm_driver_deassert_enable_line	1
+../Core/Src/pwm_driver.c:95:6:pwm_driver_enable_sleep_mode	1
+../Core/Src/pwm_driver.c:110:6:pwm_driver_disable_sleep_mode	1
+../Core/Src/pwm_driver.c:125:6:pwm_driver_update_frequency	2
+../Core/Src/pwm_driver.c:156:6:pwm_driver_update_individual_patterns	7
+../Core/Src/pwm_driver.c:222:6:pwm_driver_update_all_patterns	7
