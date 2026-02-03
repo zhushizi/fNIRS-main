@@ -29,8 +29,6 @@ from scipy.spatial import cKDTree
 import socketio as sio_client_lib
 import pandas as pd
 
-import eventlet
-eventlet.monkey_patch()
 import config
 
 # Check command-line arguments for a demo flag.
@@ -52,7 +50,7 @@ logging.basicConfig(level=logging.DEBUG)
 # Flask and Socket.IO Setup
 # -----------------------------------------------------
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # -----------------------------------------------------
 # Global Variables and Data Queue (for processed packets)
