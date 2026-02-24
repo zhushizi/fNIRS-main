@@ -1,8 +1,8 @@
 """
 adc_live.py
 ==================
-This script reads data from a serial port and displays it in a PyQt5 GUI using pyqtgraph.
-It is designed to visualize ADC readings from a device connected via USB.
+该脚本从串口读取数据，并通过 PyQt5 + pyqtgraph 图形界面实时显示。
+用于可视化通过 USB 连接设备输出的 ADC 读数。
 """
 
 import sys
@@ -15,40 +15,45 @@ from config import SERIAL_PORT, BAUD_RATE, TIMEOUT
 
 PACKET_SIZE = 64
 
+# 打开串口：参数来自 config.py（端口、波特率、超时）
 ser = serial.Serial(SERIAL_PORT, baudrate=BAUD_RATE, timeout=TIMEOUT)
 
-# Define colors and labels for the traces.
+# 定义曲线颜色与图例标签。
 trace_colors = ["red", "green", "blue"]
 trace_labels = ["Channel 1", "Channel 2", "Channel 3"]
 
-# Parse the incoming data packet.
+# 解析串口接收到的数据包。
 def parse_packet(data):
     """
-    Parse the incoming data packet into a structured format.
-    Each packet contains 8 groups of data, each with 5 fields:
-    - Group ID
-    - Short value
-    - Long value 1
-    - Long value 2
-    - Emitter value
-    The function returns a 2D numpy array with shape (8, 5).
-    Each row corresponds to a group, and each column corresponds to a field.
+    将输入数据包解析为结构化数组。
+    每个数据包包含 8 组数据，每组 5 个字段：
+    - 组 ID
+    - Short 值
+    - Long1 值
+    - Long2 值
+    - Emitter 值
+    返回形状为 (8, 5) 的二维 numpy 数组：
+    每一行对应一组，每一列对应一个字段。
     """
     parsed_data = np.zeros((8, 5), dtype=int)
     for i in range(8):
+        # 每组固定 8 字节，因此第 i 组偏移量为 i*8
         offset = i * 8
         group_id = data[offset]
+        # 固件按大端序发送 16 位 ADC 值
         raw_short = struct.unpack('>H', data[offset+1:offset+3])[0]
         raw_long1 = struct.unpack('>H', data[offset+3:offset+5])[0]
         raw_long2 = struct.unpack('>H', data[offset+5:offset+7])[0]
         emitter   = data[offset+7]
+        # 输出格式：[组ID, Short, Long1, Long2, 发射器状态]
         parsed_data[i] = [group_id, raw_short, raw_long1, raw_long2, emitter]
     return parsed_data
 
 class SerialReaderThread(QtCore.QThread):
     """
-    SerialReaderThread is a QThread that reads data from a serial port.
-    It emits a signal with the parsed data when a complete packet is received.
+    串口读取线程。
+    持续从串口读取字节流；当接收到完整数据包后，
+    发出包含解析结果的 Qt 信号。
     """
     newData = QtCore.pyqtSignal(np.ndarray)
     def __init__(self, parent=None):
@@ -56,47 +61,50 @@ class SerialReaderThread(QtCore.QThread):
         self.running = True
     def run(self):
         """
-        Continuously read data from the serial port and parse it into packets.
-        Emit the parsed data when a complete packet is received.
+        持续读取串口并拆分为完整数据包。
+        每解析出一帧数据就发信号给主线程。
         """
         read_buffer = b""
         while self.running:
+            # 一次多读一些字节，减少系统调用开销
             chunk = ser.read(256)
             if chunk:
                 read_buffer += chunk
+                # 只要缓冲区够 1 帧（64B）就持续拆包
                 while len(read_buffer) >= PACKET_SIZE:
                     packet = read_buffer[:PACKET_SIZE]
                     read_buffer = read_buffer[PACKET_SIZE:]
                     arr_8x5 = parse_packet(packet)
+                    # 通过 Qt 信号把新数据发给主线程（线程安全）
                     self.newData.emit(arr_8x5)
-            QtCore.QThread.msleep(1)  # avoid busy waiting
+            QtCore.QThread.msleep(1)  # 避免忙等
     def stop(self):
         """
-        Stop the thread and close the serial port.
+        停止线程读取循环。
         """
         self.running = False
 
 
 class MainWindow(QtWidgets.QWidget):
     """
-    MainWindow is a QWidget that contains the GUI for displaying ADC data.
-    It uses PyQtGraph to create real-time plots of the data.
+    主窗口类：用于显示 ADC 实时曲线。
+    基于 PyQtGraph 绘制 8 组 3 通道波形。
     """
     def __init__(self):
         super().__init__()
-        # Set up the global PyQtGraph appearance
+        # 设置 PyQtGraph 全局显示样式
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
         self.setWindowTitle("ADC Live Mode")
 
         self.max_len = 0
 
-        # Main vertical layout
+        # 主纵向布局
         main_layout = QtWidgets.QVBoxLayout(self)
-        # Top horizontal layout for legend and Reset button
+        # 顶部横向布局：图例 + 重置按钮
         top_layout = QtWidgets.QHBoxLayout()
         top_layout.addStretch()
-        # Add legend items for each channel.
+        # 为每个通道添加图例项
         for color, label in zip(trace_colors, trace_labels):
             legend_item = QtWidgets.QWidget()
             legend_layout = QtWidgets.QHBoxLayout(legend_item)
@@ -109,25 +117,25 @@ class MainWindow(QtWidgets.QWidget):
             legend_layout.addWidget(text_label)
             top_layout.addWidget(legend_item)
 
-        # Add a Reset All button to the same top layout.
+        # 在同一行加入“Reset All”按钮
         btn_reset = QtWidgets.QPushButton("Reset All")
         btn_reset.clicked.connect(self.reset_plots)
         top_layout.addWidget(btn_reset)
         top_layout.addStretch()
 
-        # Add the top layout (legend and button) to the main layout.
+        # 将顶部布局添加到主布局
         main_layout.addLayout(top_layout)
 
-        # Data storage: for 8 groups and 3 channels
+        # 数据缓存：8组 * 3通道
         self.max_points = 3000
         self.data = [[[ ] for _ in range(3)] for _ in range(8)]
 
-        # Create the plot widget.
+        # 创建绘图控件
         self.plot_widget = pg.GraphicsLayoutWidget(title="Live ADC Readings")
         self.plot_widget.resize(1200, 800)
         main_layout.addWidget(self.plot_widget)
 
-        # Create plots and curves.
+        # 创建分组子图与曲线对象
         self.plots = []
         self.curves = []
         self.pg_trace_colors = [pg.mkPen('r', width=2),
@@ -150,7 +158,7 @@ class MainWindow(QtWidgets.QWidget):
             if g % 2 == 1:
                 self.plot_widget.nextRow()
 
-        # Timer to update plots.
+        # 定时刷新绘图
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_plots)
         self.timer.start(50)
@@ -158,8 +166,9 @@ class MainWindow(QtWidgets.QWidget):
     @QtCore.pyqtSlot(np.ndarray)
     def on_new_data(self, arr_8x5):
         """
-        Slot to handle new data received from the serial port.
+        槽函数：处理串口线程送来的新数据。
         """
+        # arr_8x5: 8组 x 5字段；这里只取 3 路 ADC（Short/Long1/Long2）
         for g in range(8):
             self.data[g][0].append(arr_8x5[g][1])
             self.data[g][1].append(arr_8x5[g][2])
@@ -170,8 +179,9 @@ class MainWindow(QtWidgets.QWidget):
 
     def update_plots(self):
         """
-        Update the plots with the latest data.
+        使用当前缓存数据刷新曲线。
         """
+        # 定时器周期性刷新曲线；x 轴使用样本索引，y 轴为 ADC 值
         for g in range(8):
             for ch_idx in range(3):
                 d = self.data[g][ch_idx]
@@ -181,7 +191,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def reset_plots(self):
         """
-        Reset all plots and data storage.
+        清空所有曲线与缓存数据。
         """
         self.data = [[[ ] for _ in range(3)] for _ in range(8)]
         for g in range(8):
@@ -190,18 +200,18 @@ class MainWindow(QtWidgets.QWidget):
 
 def main():
     """
-    Main function to initialize the application and start the GUI.
-    It creates a SerialReaderThread to read data from the serial port
-    and connects it to the GUI.
+    程序入口：初始化 GUI 并启动串口读取线程。
+    将读取线程信号连接到窗口数据处理槽函数。
     """
-    # Clear any previous data from the serial port.
+    # 清空串口输入缓冲，避免历史残留数据影响显示
     ser.reset_input_buffer()
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow()
-    window.showFullScreen()  # Launch GUI in full screen.
+    window.showFullScreen()  # 全屏显示界面
     reader_thread = SerialReaderThread()
     reader_thread.newData.connect(window.on_new_data)
     reader_thread.start()
+    # 关闭应用时先停线程再退出，避免串口占用/崩溃
     app.aboutToQuit.connect(lambda: (reader_thread.stop(), reader_thread.wait()))
     sys.exit(app.exec_())
 
