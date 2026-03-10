@@ -32,7 +32,7 @@
 ## 2.1 数据帧协议（当前代码假设）
 
 - 固定帧长：`64` 字节
-- 每帧包含 `8` 组
+- 每帧包含 `8` 组，即八个发射接收模块
 - 每组 `8` 字节：
   - `byte0`: Group ID
   - `byte1-2`: Short（uint16，大端）
@@ -61,7 +61,7 @@ def parse_packet(data):
 说明：
 
 - 读取后做了 `2*ZERO_LEVEL - raw` 的反相映射。
-- `parsed_data[i]` 最终结构是 `[gid, short, long1, long2, emitter]`。
+- `parsed_data[i]` 最终结构是 `[gid, short, long1, long2, emitter]`。- Short：短源探距（你们默认按 0.6 cm 进  MBLL）。Long1 / Long2：长源探距（两路接收，默认都按 3.5 cm 进 MBLL），对应两个不同位置/通道的「长距」探测器。
 
 ## 2.3 关键代码段：采集写 CSV
 
@@ -78,13 +78,13 @@ def capture_data(csv_filename, stop_on_enter=True):
         parsed_data = parse_packet(data)
 ```
 
-输出文件：`all_groups.csv`
+输出文件：`all_groups.csv` 
 
 ---
 
-## 3. 预处理段（DataFrame 层）
+## 3. 预处理段（DataFrame 层），八个模块的三个值分别进行
 
-输入：`all_groups.csv`  
+输入：`all_groups.csv`  1 + 8×4 = 33 列
 输出：`interleaved_output.csv`
 
 ## 3.1 步骤 A：阈值滤波 `threshold_filter`
@@ -159,6 +159,7 @@ df_rms.loc[segment_idx, col] = rms_val
 
 - 按 `Emitter` 状态变化切段。（对应了 660/940 的交替时隙）
 - 每段对每个通道计算 RMS（均方根），并用该值回填整段。
+- 假若这段里有 5 个采样点，这一段的 G0_Short 这 5 行会被填成同一个数
 
 ### 默认参数
 
