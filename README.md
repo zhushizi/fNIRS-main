@@ -1,26 +1,45 @@
-# A Wearable Functional Near-Infrared Spectroscopy (fNIRS) based Brain Interface
+# fNIRS 上位机软件（Host PC Software）
 
-<div align="center">
-  <img src="https://github.com/user-attachments/assets/e845183c-7722-4132-92f5-48b59a016dfe" alt="Device Overview" width="400"/>
-</div>
+本仓库为 **fNIRS 上位机部分**：通过串口连接设备、接收 64 字节数据帧，完成采集、预处理与血氧反演（MBLL/CBSI）等流程。不包含下位机固件与硬件设计。
 
-## Project Overview
+## 功能概览
 
-This project introduces a low-cost, ergonomic functional Near-Infrared Spectroscopy (fNIRS) device designed for real-time brain activity monitoring. fNIRS is a non-invasive technique that uses near-infrared light to measure changes in blood oxygenation, providing insights into neural activity based on the modified Beer-Lambert Law.
+- **串口通信**：连接 USB 虚拟串口，按 64 字节固定帧接收 8 组 × (Short/Long1/Long2 + Emitter) 数据
+- **数据采集**：解析帧并写入 CSV（`all_groups.csv`）
+- **预处理**：阈值滤波、低通、分段 RMS、模式交错、时间轴重建
+- **后处理**：双波长配对、OD 转换、带通滤波、MBLL、CBSI，输出 HbO/HbR
+- **可视化**：实时曲线、静态/交互图表、3D 脑模型等（见 `software/`）
 
-While conventional fNIRS systems are expensive, bulky, and limited to clinical environments, this system is designed to be accessible, accurate, and user-friendly—ideal for education, personal health tracking, and portable research applications.
+## 快速开始
 
-### System Highlights
+1. **配置串口**  
+   编辑 `software/config.py`，将 `SERIAL_PORT` 设为本机 COM 口（如 Windows 下 `"COM3"`，macOS/Linux 下 `/dev/tty.usbmodem...`）。
 
-- 24 custom sensor modules supporting 24 detectors and 8 dual-wavelength LED emitters (660 nm & 990 nm)
-- Custom electrical control unit (ECU) built around a low-power STM32 microcontroller (STM32L476RET6) that interfaces with all sensor modules for synchronized control and data acquistion
-- Ergonomic mechanical design for secure, comfortable wear during extended sessions
-- Interactive Python-based GUI for live data visualization, serial communication, and module control
+2. **安装依赖**  
+   ```bash
+   cd software
+   pip install -r requirements.txt
+   ```
 
-### 下位机验证
-- 先改 software/config.py 的 SERIAL_PORT 为你电脑上的 COM 口（Windows 如 COM3）。
-- 跑 python adc_live.py 能看到 8 组曲线动态变化 = 板子数据链路通了。
-### 上位机验证
-- 再跑 python fNIRS_processing.py 验证能否采集并生成 all_groups.csv / processed_output.csv。
+3. **采集与处理**  
+   - 连接设备后运行：`python fNIRS_processing.py`，按提示采集并生成 `all_groups.csv`、`interleaved_output.csv`、`processed_output.csv`。
+   - 仅看实时曲线：`python adc_live.py`。
 
-一句话：先 adc_live.py 验硬件链路，再 fNIRS_processing.py 验处理链路。
+4. **无设备演示**  
+   可使用 `adc_mock_server.py` 等模拟数据（见 `software/README.md`）。
+
+## 目录结构
+
+```
+fNIRS-main/
+├── software/          # 上位机 Python 代码（串口、处理、可视化）
+│   ├── config.py      # 串口与采样参数
+│   ├── fNIRS_processing.py
+│   ├── adc_live.py
+│   ├── visualizer.py
+│   └── ...
+├── README.md
+└── ...
+```
+
+协议与处理链路详见 `software/fNIRS_processing_pipeline.md`。
