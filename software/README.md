@@ -1,179 +1,136 @@
-# fNIRS Software Design
+# fNIRS Single-Channel Software
 
-This software provides a graphical interface (GUI) for real-time collection, processing, and visualization of fNIRS (functional Near-Infrared Spectroscopy) data. It supports two main modes of operation:
+This directory contains the host-side software for the **single-channel** fNIRS workflow.  
+It targets the new **26-byte framed serial protocol** and assumes one physical channel, `S1_D1`, sampled under two wavelengths (`660nm` and `940nm`).
 
-1. **Live Readings Mode**  
-   In this mode, only ADC (Analog-to-Digital Converter) data is captured and displayed on live plots. This mode is used for continuous monitoring and is ideal for observing raw signal behavior in real-time.
+## Core Features
 
-2. **Record & Visualize Mode**  
-   In this mode, the system records data for a user-defined duration. The captured data is then taken through a series of post-processing steps (ex. interleaving sensor blocks, converting intensities to optical density, applying MBLL, and CBSI). Both ADC and mBLL (data processed by applying the Modified Beer-Lambert Law) readings are supported in this mode, and the final results are displayed on interactive graphs when processing is complete.
+- **Framed serial protocol**
+  - `0x55 0xAA` frame header
+  - fixed `26B` frame length
+  - checksum validation
+  - `0x03` ACK handling with retry support
 
-## Features
+- **Single-channel acquisition**
+  - one intensity value per data frame
+  - wavelength code and sensor id included in the payload
+  - raw capture stored in `all_groups.csv`
 
-- **Two Operating Modes**
-  - **Live Readings Mode (ADC Only):**  
-    - Captures raw ADC data in real time from the serial port.
-    - Displays interactive, real-time plots using PyQtGraph.
-  - **Record & Visualize Mode (ADC and mBLL):**  
-    - Records data for a specified duration.
-    - Applies multiple post-processing steps (ex. interleaving, MBLL, CBSI).
-    - Supports visualization of both raw ADC data and processed mBLL data using Plotly.
+- **Single-channel processing**
+  - threshold filtering
+  - low-pass filtering
+  - segment RMS by wavelength code
+  - 660/940 pairing
+  - MBLL + CBSI
 
-- **Data Capture and Processing**
-  - Communicates with hardware over a serial port.
-  - Logs raw ADC data as `all_groups.csv` in the `data/` folder.
-  - Saves processed results as `processed_output.csv`.
+- **Visualization**
+  - `adc_live.py`: live ADC plot for 660nm / 940nm
+  - `adc_animation.py`: replay raw CSV
+  - `mBLL_animation.py`: replay processed CSV
+  - `visualizer.py`: lightweight control dashboard
 
-- **Visualization Options**
-  - **Interactive Static Plots (Plotly):**  
-    - Supports both ADC and mBLL data.
-    - Eight separate plots (one per sensor group) for displaying data recorded in `.csv` files.
-    - Each plot includes its own legend and interactive mode bar (zoom, pan, full screen).
-  - **Live Animations (PyQtGraph)**  
-    - Supports ADC mode only.
-    - Eight separate plots (one per sensor group) for displaying live readings as them come in.
-  - **3D Brain Mesh**  
-    - Interactive model showing brain structure, sensor positions, and group mappings.
+## Protocol Summary
 
-- **Download Functionality:**
-  - Export raw or processed CSV data using a simple popup prompt.
+### Common Frame Layout
 
-- **User-Friendly Interface:**
-  - A web interface built with Bootstrap, jQuery, Plotly, and Socket.IO.
-  - Control panels for sensor group selection, MUX/emitter control, and mode selection.
+| Field | Size |
+|------|------|
+| Header | 2 bytes (`0x55 0xAA`) |
+| Length | 1 byte (`0x1A`) |
+| Type | 1 byte |
+| Payload | 21 bytes |
+| Checksum | 1 byte |
 
-- **Demo Mode:**
-  - A mock ADC server simulates data for testing or demonstrations.
-  - Skips real data processing to simplify setup.
+### Frame Types
 
+- `0x01`: command frame
+- `0x02`: data frame
+- `0x03`: ACK frame
 
-## Setup Instructions
+### Command Payload (`0x01`)
 
-1. **Clone the Repository:**
-   ```bash
-   git clone https://github.com/tonykim07/fNIRS.git
-   cd software
-   ```
+| Byte | Meaning |
+|------|---------|
+| 0 | start/stop (`0x00` stop, `0x01` start) |
+| 1 | intensity high byte |
+| 2 | intensity low byte |
+| 3-20 | reserved, currently `0x00` |
 
-2. **Set Up a Virtual Environment and Install Dependencies:**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate      # On Windows: venv\Scripts\activate
-   pip install -r requirements.txt 
-   ```
+### Data Payload (`0x02`)
 
-3. **Set COM Port (Serial Device):**
+| Byte | Meaning |
+|------|---------|
+| 0 | wavelength code (`0x00=660`, `0x01=940`) |
+| 1 | sensor id (`0x00` for current S1_D1 deployment) |
+| 2 | sampled value low byte |
+| 3 | sampled value high byte |
+| 4-19 | reserved |
+| 20 | reserved, currently fixed `0x00` |
 
-   - On Windows:
-   Open PowerShell and run:
-   ```bash
-   Get-WMIObject Win32_SerialPort
-   ```
-      Look for something like COM3, COM4, etc.
+Here, the payload byte `0` wavelength code is also the effective
+"emitter-state" meaning for the host side:
 
-   - On macOS/Linux:
-   ```bash
-   ls /dev/tty.*
-   ```
-      Look for something like /dev/tty.usbmodemXXXX or /dev/ttyUSB0.
+- `0x00` means the current sample belongs to `660nm`
+- `0x01` means the current sample belongs to `940nm`
 
-   **Update the COM port path in config.py:**
-   ```bash
-   # Update this line with your actual port
-   SERIAL_PORT = "COM3"       # Windows example
-   # or
-   SERIAL_PORT = "/dev/tty.usbmodem1234"   # macOS/Linux example
-   ```
-     
-4. **Running the System:**
+So downstream processing no longer depends on a separate emitter field.
 
-    ___Normal Mode (requires connection to serial port)___ 
+### ACK Handling
 
-    ```bash
-    python visualizer.py
-    ```
+- timeout: `10ms`
+- retries: `2`
 
-    ___Demo Mode___
-    ```bash
-    python visualizer.py demo
-    ```
-    Then open your browser at http://localhost:8050 to access the interface.
+## Configuration
 
-## Usage Overview
+Edit `config.py` before running:
 
-### Step 1: Choose Operating Mode
-- **Live Readings:** for real-time, unprocessed data (ADC Only).
-- **Record & Visualize:** to capture and process data for analysis (ADC and/or mBLL).
+- `SERIAL_PORT`
+- `BAUD_RATE`
+- `TIMEOUT`
+- `DEFAULT_INTENSITY_MA`
+- `SOURCE_DETECTOR_DISTANCE_CM`
 
-### Step 2: Start Data Capture / Recording
-- Click the **Start** button to begin data acquisition.
-  - In live mode, data is visualized in real time.
-  - In record mode, data is recorded for a fixed duration, and logged to .csv files.
+## Main Scripts
 
-### Step 3: Stop and Visualize (mBLL Mode)
-- Click **Stop and Plot** to end data capture.
-- When data capsture is stopped, download options and visualization buttons for rendering static plots and animations will be displayed.
+### `fNIRS_processing.py`
 
-### Step 4: Analyze & Export
-- **Static Plots:**  
-  Click to view interactive Plotly figures with zoom, pan, and full-screen capabilities.
-- **Animations:**  
-  Launch real-time animation windows for dynamic analysis.
-- **3D Brain Mesh:**  
-  Explore the interactive 3D brain mesh with sensor nodes and sensor group highlights.
-- **Download CSV Files:**  
-  Click **Download CSV** to prompt for a file name and download the raw or processed data.
+Captures raw frames, acknowledges incoming data frames, writes `all_groups.csv`, creates `interleaved_output.csv`, and computes `processed_output.csv`.
 
-## File Descriptions
+### `adc_live.py`
 
-#### 3D Brain Model 
+Starts the stream and displays 660nm / 940nm values live on one plot.
 
-- **aal.nii:**  
-  A NIfTI file containing anatomical brain data used to map sensor positions to brain regions.
+### `visualizer.py`
 
-- **BrainMesh_Ch2_smoothed.nv:**  
-  Contains smoothed brain mesh data for rendering a 3D brain surface.
+Runs a minimal Flask dashboard at `http://127.0.0.1:8050` for:
 
-#### ADC Mode
+- start/stop commands
+- intensity updates
+- latest packet inspection
+- ACK status feedback
 
-- **adc_animation.py:**  
-  A PyQtGraph-based script that reads ADC data from `data/all_groups.csv` and displays a full-screen real-time animation.
+Run demo mode with:
 
-- **adc_client.py:**  
-  A client application that uses SocketIO and PyQtGraph to receive and display live ADC data interactively.
+```bash
+python visualizer.py demo
+```
 
-- **adc_mock_server.py:**  
-  A mock ADC server that generates fake sensor data (using, for example, a triangle wave) for demo mode.
+## CSV Outputs
 
-#### mBLL Mode
+### `all_groups.csv`
 
-- **mBLL_animation.py:**  
-  A PyQtGraph script that reads processed data from `data/processed_output.csv` and displays a full-screen real-time animation of processed mBLL data.
+```text
+Time (s),SensorId,S1_D1,Wavelength
+```
 
-- **mBLL_client.py:**  
-  A real-time client that uses Socket.IO and PyQtGraph to display live processed (mBLL) data interactively.
+### `interleaved_output.csv`
 
-- **mBLL_mock_server.py:**  
-  Simulates mBLL data processing by generating dummy packets, processing them, and sending processed concentration data via Socket.IO in demo mode.
+```text
+Time (s),S1_D1_660,S1_D1_940
+```
 
-- **mBLL_server.py**  
-  Reads sensor data from the serial port, processes it using MBLL and CBSI (via NIRSimple), and emits the processed concentration values via Socket.IO.
+### `processed_output.csv`
 
-#### Others
-
-- **fNIRS_processing.py:**  
-  Processes raw ADC data by interleaving sensor blocks, converting intensities to optical density, applying MBLL and CBSI, and writes processed output to CSV files in `data/`.
-
-- **visualizer.py:**  
-  The main Flask/SocketIO server that integrates data capture, processing, interactive visualization (including static plots and animations), and control endpoints. It also supports demo mode behavior.
-
-- **index.html**  
-  The main web interface built with Bootstrap, Plotly, and jQuery. It provides a 3D brain mesh view, sensor group controls, and a mode selection panel for choosing between live ADC readings or record & visualize (ADC and/or mBLL) modes.
-
-#### Data
-
-- **/data Directory:**
-  - **all_groups.csv**  
-    CSV file that logs the raw ADC sensor data captured by the system.
-  - **processed_output.csv**  
-    CSV file that contains the processed fNIRS data (after applying MBLL, CBSI, etc.) used for visualization in record & visualize mode.
+```text
+Time,S1_D1_hbo,S1_D1_hbr
+```

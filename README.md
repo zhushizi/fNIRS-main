@@ -1,45 +1,76 @@
-# fNIRS 上位机软件（Host PC Software）
+# fNIRS 单通道上位机软件
 
-本仓库为 **fNIRS 上位机部分**：通过串口连接设备、接收 64 字节数据帧，完成采集、预处理与血氧反演（MBLL/CBSI）等流程。不包含下位机固件与硬件设计。
+本仓库现在只保留 **上位机软件部分**，并已切换到新的 **26B 单通道串口协议**。  
+软件通过串口与设备通信，接收单通道 `S1_D1` 的双波长数据（660nm / 940nm），完成采集、配对、MBLL 和 CBSI 处理，并输出 `hbo / hbr`。
 
-## 功能概览
+## 当前协议摘要
 
-- **串口通信**：连接 USB 虚拟串口，按 64 字节固定帧接收 8 组 × (Short/Long1/Long2 + Emitter) 数据
-- **数据采集**：解析帧并写入 CSV（`all_groups.csv`）
-- **预处理**：阈值滤波、低通、分段 RMS、模式交错、时间轴重建
-- **后处理**：双波长配对、OD 转换、带通滤波、MBLL、CBSI，输出 HbO/HbR
-- **可视化**：实时曲线、静态/交互图表、3D 脑模型等（见 `software/`）
+- **波特率**：`115200`
+- **帧头**：`0x55 0xAA`
+- **固定帧长**：`0x1A`（26 字节）
+- **帧类型**：
+  - `0x01`：指令帧（上位机 -> 下位机）
+  - `0x02`：数据帧（下位机 -> 上位机）
+  - `0x03`：应答帧（双向 ACK）
+- **payload**：`21B`
+- **校验**：从长度字节到 payload 末尾的累加和低字节
+- **ACK 规则**：10ms 超时，最多重发 2 次
+
+## 当前几何与算法假设
+
+- **物理通道**：单通道 `S1_D1`
+- **源探距离**：默认 `3.0 cm`，配置在 `software/config.py`
+- **波长编码**：
+  - `0x00 = 660nm`
+  - `0x01 = 940nm`
+- **术语约定**：
+  - 数据帧 `payload byte0` 的“波长编号”同时就是当前样本的 `emitter-state` 语义
+  - 上位机后续处理统一只看 `Wavelength`
+- **输出风格**：`processed_output.csv` 保持 `Time + {ChannelName}_{Type}` 样式
 
 ## 快速开始
 
-1. **配置串口**  
-   编辑 `software/config.py`，将 `SERIAL_PORT` 设为本机 COM 口（如 Windows 下 `"COM3"`，macOS/Linux 下 `/dev/tty.usbmodem...`）。
+1. 安装依赖
 
-2. **安装依赖**  
-   ```bash
-   cd software
-   pip install -r requirements.txt
-   ```
-
-3. **采集与处理**  
-   - 连接设备后运行：`python fNIRS_processing.py`，按提示采集并生成 `all_groups.csv`、`interleaved_output.csv`、`processed_output.csv`。
-   - 仅看实时曲线：`python adc_live.py`。
-
-4. **无设备演示**  
-   可使用 `adc_mock_server.py` 等模拟数据（见 `software/README.md`）。
-
-## 目录结构
-
-```
-fNIRS-main/
-├── software/          # 上位机 Python 代码（串口、处理、可视化）
-│   ├── config.py      # 串口与采样参数
-│   ├── fNIRS_processing.py
-│   ├── adc_live.py
-│   ├── visualizer.py
-│   └── ...
-├── README.md
-└── ...
+```bash
+cd software
+pip install -r requirements.txt
 ```
 
-协议与处理链路详见 `software/fNIRS_processing_pipeline.md`。
+2. 配置串口
+
+编辑 `software/config.py`：
+
+- `SERIAL_PORT`
+- `BAUD_RATE`
+- `SOURCE_DETECTOR_DISTANCE_CM`
+
+3. 运行方式
+
+- **采集 + 处理**：`python fNIRS_processing.py`
+- **实时 ADC 曲线**：`python adc_live.py`
+- **控制面板**：`python visualizer.py`
+- **演示模式控制面板**：`python visualizer.py demo`
+
+## 输出文件
+
+- `all_groups.csv`
+  - 原始单通道采集数据
+  - 列：`Time (s), SensorId, S1_D1, Wavelength`
+- `interleaved_output.csv`
+  - 660/940 配对后的中间结果
+  - 列：`Time (s), S1_D1_660, S1_D1_940`
+- `processed_output.csv`
+  - MBLL + CBSI 输出
+  - 列风格：`Time, S1_D1_hbo, S1_D1_hbr`
+
+## 主要文件
+
+- `software/config.py`：串口和协议配置
+- `software/protocol.py`：26B 协议收发、校验、ACK、重发
+- `software/fNIRS_processing.py`：采集、配对、单通道 MBLL
+- `software/adc_live.py`：单通道实时 ADC 显示
+- `software/visualizer.py`：轻量控制面板后端
+- `software/index.html`：轻量控制面板前端
+
+更详细的数据链路说明见 `software/fNIRS_processing_pipeline.md`。

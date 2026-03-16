@@ -1,219 +1,238 @@
 """
-adc_live.py
-==================
-该脚本从串口读取数据，并通过 PyQt5 + pyqtgraph 图形界面实时显示。
-用于可视化通过 USB 连接设备输出的 ADC 读数。
+单通道实时 ADC 曲线查看器。
+
+这个脚本的职责很单纯：
+1. 给下位机发启动命令
+2. 持续读取 0x02 数据帧
+3. 把 660nm / 940nm 分成两条曲线显示
 """
 
+from __future__ import annotations
+
 import sys
-import struct
-import numpy as np
-import serial
-from PyQt5 import QtWidgets, QtCore
+import time
+from collections import deque
+
 import pyqtgraph as pg
-from config import SERIAL_PORT, BAUD_RATE, TIMEOUT
+import serial
+from PyQt5 import QtCore, QtWidgets
 
-PACKET_SIZE = 64
+from config import (
+    ACK_TIMEOUT_SECONDS,
+    BAUD_RATE,
+    DEFAULT_INTENSITY_MA,
+    MAX_RETRIES,
+    SERIAL_PORT,
+    TIMEOUT,
+    WAVELENGTH_660_CODE,
+    WAVELENGTH_940_CODE,
+)
+from protocol import FrameReader, build_ack_frame, build_command_frame, parse_data_frame, send_frame_with_ack
 
-# 打开串口：参数来自 config.py（端口、波特率、超时）
-ser = serial.Serial(SERIAL_PORT, baudrate=BAUD_RATE, timeout=TIMEOUT)
 
-# 定义曲线颜色与图例标签。
-trace_colors = ["red", "green", "blue"]
-trace_labels = ["Channel 1", "Channel 2", "Channel 3"]
+def open_serial() -> serial.Serial:
+    """按 config.py 中的参数打开串口。"""
+    return serial.Serial(SERIAL_PORT, baudrate=BAUD_RATE, timeout=TIMEOUT)
 
-# 解析串口接收到的数据包。
-def parse_packet(data):
-    """
-    将输入数据包解析为结构化数组。
-    每个数据包包含 8 组数据，每组 5 个字段：
-    - 组 ID
-    - Short 值
-    - Long1 值
-    - Long2 值
-    - Emitter 值
-    返回形状为 (8, 5) 的二维 numpy 数组：
-    每一行对应一组，每一列对应一个字段。
-    """
-    parsed_data = np.zeros((8, 5), dtype=int)
-    for i in range(8):
-        # 每组固定 8 字节，因此第 i 组偏移量为 i*8
-        offset = i * 8
-        group_id = data[offset]
-        # 固件按大端序发送 16 位 ADC 值
-        raw_short = struct.unpack('>H', data[offset+1:offset+3])[0]
-        raw_long1 = struct.unpack('>H', data[offset+3:offset+5])[0]
-        raw_long2 = struct.unpack('>H', data[offset+5:offset+7])[0]
-        emitter   = data[offset+7]
-        # 输出格式：[组ID, Short, Long1, Long2, 发射器状态]
-        parsed_data[i] = [group_id, raw_short, raw_long1, raw_long2, emitter]
-    return parsed_data
 
 class SerialReaderThread(QtCore.QThread):
-    """
-    串口读取线程。
-    持续从串口读取字节流；当接收到完整数据包后，
-    发出包含解析结果的 Qt 信号。
-    """
-    newData = QtCore.pyqtSignal(np.ndarray)
-    def __init__(self, parent=None):
+    """后台串口读取线程，避免 GUI 主线程被串口阻塞。"""
+    newData = QtCore.pyqtSignal(float, int, int)
+
+    def __init__(self, ser: serial.Serial, parent=None):
         super().__init__(parent)
+        self.ser = ser
+        self.reader = FrameReader(ser)
         self.running = True
+        self.start_time = time.time()
+
+    def _emit_sample(self, sample):
+        """把协议层的 DataSample 转成 GUI 能直接消费的信号。"""
+        elapsed = time.time() - self.start_time
+        print(
+            "[adc_live] Data frame received:",
+            f"sensor={sample.sensor_id}",
+            f"wavelength_code=0x{sample.wavelength_code:02X}",
+            f"value={sample.value}",
+        )
+        self.newData.emit(elapsed, sample.wavelength_code, sample.value)
+
+    def _start_stream(self) -> bool:
+        """
+        启动采集。
+
+        优先等显式 ACK；如果 ACK 因时序问题晚到，但 0x02 数据已经开始流动，
+        也视为“采集已经启动成功”，避免线程直接退出。
+        """
+        command = build_command_frame(True, DEFAULT_INTENSITY_MA)
+        startup_timeout = max(ACK_TIMEOUT_SECONDS * 10, 0.2)
+
+        for attempt in range(MAX_RETRIES + 1):
+            print(f"[adc_live] Sending start command frame (attempt {attempt + 1})...")
+            self.ser.write(command)
+
+            deadline = time.time() + startup_timeout
+            while time.time() < deadline:
+                frame = self.reader.read_frame(timeout_seconds=min(TIMEOUT, max(0.01, deadline - time.time())))
+                if frame is None:
+                    continue
+                if frame.frame_type == 0x03:
+                    print("[adc_live] Start command ACK success. Begin reading data frames.")
+                    return True
+                if frame.frame_type == 0x02:
+                    # If data is already flowing, treat the stream as active even if
+                    # the explicit ACK was missed or arrived out of order.
+                    self.ser.write(build_ack_frame())
+                    sample = parse_data_frame(frame)
+                    print("[adc_live] Stream became active before explicit ACK.")
+                    self._emit_sample(sample)
+                    return True
+                print(f"[adc_live] Ignored startup frame type: 0x{frame.frame_type:02X}")
+
+        print("[adc_live] Start command ACK timeout. Reader thread exits.")
+        return False
+
     def run(self):
-        """
-        持续读取串口并拆分为完整数据包。
-        每解析出一帧数据就发信号给主线程。
-        """
-        read_buffer = b""
+        """线程主循环：先启动流，再持续读取数据帧。"""
+        started = self._start_stream()
+        if not started:
+            return
+
         while self.running:
-            # 一次多读一些字节，减少系统调用开销
-            chunk = ser.read(256)
-            if chunk:
-                read_buffer += chunk
-                # 只要缓冲区够 1 帧（64B）就持续拆包
-                while len(read_buffer) >= PACKET_SIZE:
-                    packet = read_buffer[:PACKET_SIZE]
-                    read_buffer = read_buffer[PACKET_SIZE:]
-                    arr_8x5 = parse_packet(packet)
-                    # 通过 Qt 信号把新数据发给主线程（线程安全）
-                    self.newData.emit(arr_8x5)
-            QtCore.QThread.msleep(1)  # 避免忙等
+            frame = self.reader.read_frame(timeout_seconds=TIMEOUT)
+            if frame is None:
+                continue
+            if frame.frame_type != 0x02:
+                print(f"[adc_live] Ignored frame type: 0x{frame.frame_type:02X}")
+                continue
+
+            # 对每个 0x02 数据帧都立即回 ACK，和下位机保持握手节奏。
+            self.ser.write(build_ack_frame())
+            sample = parse_data_frame(frame)
+            self._emit_sample(sample)
+
+        try:
+            print("[adc_live] Sending stop command frame...")
+            send_frame_with_ack(
+                self.ser,
+                self.reader,
+                build_command_frame(False, DEFAULT_INTENSITY_MA),
+            )
+        except Exception:
+            pass
+
     def stop(self):
-        """
-        停止线程读取循环。
-        """
         self.running = False
 
 
 class MainWindow(QtWidgets.QWidget):
-    """
-    主窗口类：用于显示 ADC 实时曲线。
-    基于 PyQtGraph 绘制 8 组 3 通道波形。
-    """
+    """简单的双曲线窗口：红色 660nm，绿色 940nm。"""
     def __init__(self):
         super().__init__()
-        # 设置 PyQtGraph 全局显示样式
-        pg.setConfigOption('background', 'w')
-        pg.setConfigOption('foreground', 'k')
-        self.setWindowTitle("ADC Live Mode")
+        pg.setConfigOption("background", "w")
+        pg.setConfigOption("foreground", "k")
+        self.setWindowTitle("Single-Channel ADC Live Mode")
 
-        self.max_len = 0
+        # 固定只显示最近 10 秒。
+        self.window_seconds = 10.0
+        self.max_points = 3000
+        self.data_660 = deque(maxlen=self.max_points)
+        self.data_940 = deque(maxlen=self.max_points)
+        self.time_660 = deque(maxlen=self.max_points)
+        self.time_940 = deque(maxlen=self.max_points)
 
-        # 主纵向布局
         main_layout = QtWidgets.QVBoxLayout(self)
-        # 顶部横向布局：图例 + 重置按钮
         top_layout = QtWidgets.QHBoxLayout()
         top_layout.addStretch()
-        # 为每个通道添加图例项
-        for color, label in zip(trace_colors, trace_labels):
-            legend_item = QtWidgets.QWidget()
-            legend_layout = QtWidgets.QHBoxLayout(legend_item)
-            legend_layout.setContentsMargins(0, 0, 0, 0)
+        for color, label in (("red", "660nm"), ("green", "940nm")):
+            item = QtWidgets.QWidget()
+            item_layout = QtWidgets.QHBoxLayout(item)
+            item_layout.setContentsMargins(0, 0, 0, 0)
             square = QtWidgets.QLabel()
             square.setFixedSize(15, 15)
             square.setStyleSheet(f"background-color: {color}; border: 1px solid black;")
             text_label = QtWidgets.QLabel(label)
-            legend_layout.addWidget(square)
-            legend_layout.addWidget(text_label)
-            top_layout.addWidget(legend_item)
-
-        # 在同一行加入“Reset All”按钮
-        btn_reset = QtWidgets.QPushButton("Reset All")
-        btn_reset.clicked.connect(self.reset_plots)
-        top_layout.addWidget(btn_reset)
+            item_layout.addWidget(square)
+            item_layout.addWidget(text_label)
+            top_layout.addWidget(item)
         top_layout.addStretch()
-
-        # 将顶部布局添加到主布局
         main_layout.addLayout(top_layout)
 
-        # 数据缓存：8组 * 3通道
-        self.max_points = 3000
-        self.data = [[[ ] for _ in range(3)] for _ in range(8)]
-
-        # 创建绘图控件
-        self.plot_widget = pg.GraphicsLayoutWidget(title="Live ADC Readings")
-        self.plot_widget.resize(1200, 800)
+        self.plot_widget = pg.PlotWidget(title="S1_D1 Live ADC Readings")
+        self.plot_widget.showGrid(x=True, y=True)
+        self.plot_widget.setLabel("bottom", "Time (s)")
+        self.plot_widget.setLabel("left", "ADC Value")
+        self.plot_widget.addLegend()
+        self.plot_widget.setXRange(0, self.window_seconds, padding=0)
+        self.curve_660 = self.plot_widget.plot(pen=pg.mkPen("r", width=2), name="660nm")
+        self.curve_940 = self.plot_widget.plot(pen=pg.mkPen("g", width=2), name="940nm")
         main_layout.addWidget(self.plot_widget)
 
-        # 创建分组子图与曲线对象
-        self.plots = []
-        self.curves = []
-        self.pg_trace_colors = [pg.mkPen('r', width=2),
-                                 pg.mkPen('g', width=2),
-                                 pg.mkPen('b', width=2)]
-        for g in range(8):
-            p = self.plot_widget.addPlot()
-            p.setTitle(f"Sensor Group {g+1}", size="16pt")
-            p.showGrid(x=True, y=True)
-            p.setLabel('bottom', 'Time (ms)')
-            p.setLabel('left', 'ADC Value')
-            p.setYRange(0, 4095, padding=0)
-            p.disableAutoRange()
-            group_curves = []
-            for ch_idx in range(3):
-                c = p.plot(pen=self.pg_trace_colors[ch_idx])
-                group_curves.append(c)
-            self.plots.append(p)
-            self.curves.append(group_curves)
-            if g % 2 == 1:
-                self.plot_widget.nextRow()
+        self.status_label = QtWidgets.QLabel("Waiting for data...")
+        main_layout.addWidget(self.status_label)
 
-        # 定时刷新绘图
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_plots)
         self.timer.start(50)
 
-    @QtCore.pyqtSlot(np.ndarray)
-    def on_new_data(self, arr_8x5):
-        """
-        槽函数：处理串口线程送来的新数据。
-        """
-        # arr_8x5: 8组 x 5字段；这里只取 3 路 ADC（Short/Long1/Long2）
-        for g in range(8):
-            self.data[g][0].append(arr_8x5[g][1])
-            self.data[g][1].append(arr_8x5[g][2])
-            self.data[g][2].append(arr_8x5[g][3])
-            for ch_idx in range(3):
-                if len(self.data[g][ch_idx]) > self.max_points:
-                    self.data[g][ch_idx].pop(0)
+    @QtCore.pyqtSlot(float, int, int)
+    def on_new_data(self, elapsed: float, wavelength_code: int, value: int):
+        """按波长把点分发到两条曲线各自的缓存里。"""
+        if wavelength_code == WAVELENGTH_660_CODE:
+            self.time_660.append(elapsed)
+            self.data_660.append(value)
+            wave_label = "660nm"
+        elif wavelength_code == WAVELENGTH_940_CODE:
+            self.time_940.append(elapsed)
+            self.data_940.append(value)
+            wave_label = "940nm"
+        else:
+            wave_label = f"Unknown({wavelength_code})"
+            print(f"[adc_live] Unknown wavelength code: 0x{wavelength_code:02X}")
+
+        self.status_label.setText(f"Latest: {wave_label} value={value}")
 
     def update_plots(self):
-        """
-        使用当前缓存数据刷新曲线。
-        """
-        # 定时器周期性刷新曲线；x 轴使用样本索引，y 轴为 ADC 值
-        for g in range(8):
-            for ch_idx in range(3):
-                d = self.data[g][ch_idx]
-                if d:
-                    self.curves[g][ch_idx].setData(range(len(d)), d)
-            self.plots[g].setYRange(0, 4095, padding=0)
+        """定时刷新曲线，并把 X 轴滚动到最近 10 秒窗口。"""
+        if self.data_660:
+            self.curve_660.setData(list(self.time_660), list(self.data_660))
+        if self.data_940:
+            self.curve_940.setData(list(self.time_940), list(self.data_940))
 
-    def reset_plots(self):
-        """
-        清空所有曲线与缓存数据。
-        """
-        self.data = [[[ ] for _ in range(3)] for _ in range(8)]
-        for g in range(8):
-            for ch_idx in range(3):
-                self.curves[g][ch_idx].setData([])
+        latest_time = 0.0
+        if self.time_660:
+            latest_time = max(latest_time, self.time_660[-1])
+        if self.time_940:
+            latest_time = max(latest_time, self.time_940[-1])
+
+        x_min = max(0.0, latest_time - self.window_seconds)
+        x_max = max(self.window_seconds, latest_time)
+        self.plot_widget.setXRange(x_min, x_max, padding=0)
+
 
 def main():
-    """
-    程序入口：初始化 GUI 并启动串口读取线程。
-    将读取线程信号连接到窗口数据处理槽函数。
-    """
-    # 清空串口输入缓冲，避免历史残留数据影响显示
+    """程序入口：创建窗口并启动串口线程。"""
+    print(f"[adc_live] Opening serial port {SERIAL_PORT} @ {BAUD_RATE} ...")
+    ser = open_serial()
     ser.reset_input_buffer()
+    print("[adc_live] Serial input buffer cleared.")
+
     app = QtWidgets.QApplication(sys.argv)
     window = MainWindow()
-    window.showFullScreen()  # 全屏显示界面
-    reader_thread = SerialReaderThread()
+    window.show()
+
+    reader_thread = SerialReaderThread(ser)
     reader_thread.newData.connect(window.on_new_data)
     reader_thread.start()
-    # 关闭应用时先停线程再退出，避免串口占用/崩溃
-    app.aboutToQuit.connect(lambda: (reader_thread.stop(), reader_thread.wait()))
+
+    def cleanup():
+        reader_thread.stop()
+        reader_thread.wait(2000)
+        ser.close()
+
+    app.aboutToQuit.connect(cleanup)
     sys.exit(app.exec_())
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

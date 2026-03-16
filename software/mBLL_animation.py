@@ -1,139 +1,83 @@
 """
-mBLL_animation.py
-==================
-This script visualizes mBLL data in real-time using PyQtGraph.
-It reads data from a CSV file and displays it in a GUI with multiple subplots.
+回放 processed_output.csv 中的单通道 MBLL 结果。
+
+这个脚本适合在离线场景下查看最终 HbO / HbR 曲线。
 """
 
-#!/usr/bin/env python
-import sys
+from __future__ import annotations
+
+import collections
 import os
 import signal
-import collections
+import sys
+
 import pandas as pd
-from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
+from PyQt5 import QtCore, QtWidgets
 
-# ------------------------------
-# Determine data folder
-# ------------------------------
-DEMO = any(arg.lower() == 'demo' for arg in sys.argv[1:])
-DATA_DIR = 'sample_data' if DEMO else '.'
-CSV_PATH = os.path.join(DATA_DIR, 'processed_output.csv')
 
-def signal_handler():
-    """
-    Graceful Exit Handler
-    """
-    print("Exiting gracefully...")
+# demo 模式下从 sample_data 读取样例文件，否则读取当前目录输出。
+DEMO = any(arg.lower() == "demo" for arg in sys.argv[1:])
+DATA_DIR = "sample_data" if DEMO else "."
+CSV_PATH = os.path.join(DATA_DIR, "processed_output.csv")
+
+
+def signal_handler(*_args):
+    """允许 Ctrl+C 时优雅退出图形界面。"""
     app.quit()
 
-# Register SIGINT handler (Ctrl+C)
+
 signal.signal(signal.SIGINT, signal_handler)
 
-# ------------------------------
-# PyQtGraph Configuration
-# ------------------------------
-pg.setConfigOption('antialias', True)
-pg.setConfigOption('background', 'w')
-pg.setConfigOption('foreground', 'k')
+pg.setConfigOption("antialias", True)
+pg.setConfigOption("background", "w")
+pg.setConfigOption("foreground", "k")
 
-# Data storage: 8 groups, 6 traces per group.
-data = [[collections.deque(maxlen=5000) for _ in range(6)] for _ in range(8)]
-
-# Load CSV data.
 df = pd.read_csv(CSV_PATH)
 n_rows = df.shape[0]
+value_columns = [col for col in df.columns if col != "Time"]
 
-# ------------------------------
-# Set Up PyQt Application & UI
-# ------------------------------
 app = QtWidgets.QApplication(sys.argv)
-
-# Create main window.
 main_window = QtWidgets.QWidget()
 main_layout = QtWidgets.QVBoxLayout(main_window)
 
-trace_colors = ["red", "lightcoral", "green", "lightgreen", "blue", "lightblue"]
-trace_labels = ["D1_hbo", "D1_hbr", "D2_hbo", "D2_hbr", "D3_hbo", "D3_hbr"]
+plot = pg.PlotWidget(title="Single-Channel mBLL Animation")
+plot.addLegend()
+plot.showGrid(x=True, y=True, alpha=0.3)
+plot.setLabel("bottom", "Time (s)")
+plot.setLabel("left", "Concentration")
+main_layout.addWidget(plot)
 
-top_layout = QtWidgets.QHBoxLayout()
-top_layout.addStretch()
-legend_layout = QtWidgets.QHBoxLayout()
-for color, label in zip(trace_colors, trace_labels):
-    square = QtWidgets.QLabel()
-    square.setFixedSize(15, 15)
-    square.setStyleSheet(f"background-color: {color}; border: 1px solid black;")
-    text_label = QtWidgets.QLabel(label)
-    item_layout = QtWidgets.QHBoxLayout()
-    item_layout.addWidget(square)
-    item_layout.addWidget(text_label)
-    item_widget = QtWidgets.QWidget()
-    item_widget.setLayout(item_layout)
-    legend_layout.addWidget(item_widget)
-legend_layout.addStretch()
-top_layout.addLayout(legend_layout)
-main_layout.addLayout(top_layout)
+colors = ["r", "g", "b", "m", "c", "y"]
+curves = []
+series = []
+times = collections.deque(maxlen=5000)
+for idx, column in enumerate(value_columns):
+    curves.append(plot.plot(pen=pg.mkPen(colors[idx % len(colors)], width=2), name=column))
+    series.append(collections.deque(maxlen=5000))
 
-# Create a GraphicsLayoutWidget for 8 subplots.
-win = pg.GraphicsLayoutWidget(title="Real-Time mBLL Data")
-win.resize(1200, 800)
-plots = []
-curves = []  # curves[group][trace]
-for group in range(8):
-    p = win.addPlot(title=f"Group {group+1}")
-    p.showGrid(x=True, y=True, alpha=0.3)
-    p.setLabel('bottom', 'Time (s)')
-    group_curves = []
-    for trace in range(6):
-        pen = pg.mkPen(color=trace_colors[trace], width=2)
-        curve = p.plot(pen=pen)
-        group_curves.append(curve)
-    plots.append(p)
-    curves.append(group_curves)
-    if group % 2 == 1:
-        win.nextRow()
-main_layout.addWidget(win)
-
-# ------------------------------
-# Streaming Simulation from CSV
-# ------------------------------
 CURRENT_INDEX = 0
 
-def update():
-    """
-    Update the plots with new data from the CSV file.
-    This function reads the next row from the CSV file and updates the plots.
-    """
-    global CURRENT_INDEX
-    if CURRENT_INDEX < n_rows:
-        row = df.iloc[CURRENT_INDEX]
-        for group in range(8):
-            start_idx = 1 + group * 6
-            group_values = []
-            for j in range(6):
-                group_values.append(row.iloc[start_idx + j])
-            # Append the values for each trace in this group.
-            for trace in range(6):
-                data[group][trace].append(group_values[trace])
-        CURRENT_INDEX += 1
 
-        # Update each subplot.
-        for group in range(8):
-            x = list(df["Time"].iloc[:len(data[group][0])])
-            for trace in range(6):
-                curves[group][trace].setData(x, list(data[group][trace]))
-    else:
-        # Once all rows are rendered, stop the timer and quit.
+def update():
+    """按行回放处理后的浓度结果。"""
+    global CURRENT_INDEX
+    if CURRENT_INDEX >= n_rows:
         timer.stop()
         app.quit()
+        return
+
+    row = df.iloc[CURRENT_INDEX]
+    times.append(float(row["Time"]))
+    for idx, column in enumerate(value_columns):
+        series[idx].append(float(row[column]))
+        curves[idx].setData(list(times), list(series[idx]))
+    CURRENT_INDEX += 1
+
 
 timer = QtCore.QTimer()
 timer.timeout.connect(update)
-timer.start(100)  # Update every 100 ms; adjust as needed.
+timer.start(100)
 
-# ------------------------------
-# Run the Application in Full Screen
-# ------------------------------
-main_window.showFullScreen()
+main_window.show()
 sys.exit(app.exec_())
