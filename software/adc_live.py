@@ -27,7 +27,7 @@ from config import (
     WAVELENGTH_660_CODE,
     WAVELENGTH_940_CODE,
 )
-from protocol import FrameReader, build_ack_frame, build_command_frame, parse_data_frame, send_frame_with_ack
+from protocol import FrameReader, build_command_frame, parse_data_frame, send_frame_with_ack
 
 
 def open_serial() -> serial.Serial:
@@ -82,7 +82,6 @@ class SerialReaderThread(QtCore.QThread):
                 if frame.frame_type == 0x02:
                     # If data is already flowing, treat the stream as active even if
                     # the explicit ACK was missed or arrived out of order.
-                    self.ser.write(build_ack_frame())
                     sample = parse_data_frame(frame)
                     print("[adc_live] Stream became active before explicit ACK.")
                     self._emit_sample(sample)
@@ -106,8 +105,6 @@ class SerialReaderThread(QtCore.QThread):
                 print(f"[adc_live] Ignored frame type: 0x{frame.frame_type:02X}")
                 continue
 
-            # 对每个 0x02 数据帧都立即回 ACK，和下位机保持握手节奏。
-            self.ser.write(build_ack_frame())
             sample = parse_data_frame(frame)
             self._emit_sample(sample)
 

@@ -41,7 +41,6 @@ from config import (
 )
 from protocol import (
     FrameReader,
-    build_ack_frame,
     build_command_frame,
     parse_data_frame,
     send_frame_with_ack,
@@ -365,7 +364,6 @@ def capture_data(
                 if frame.frame_type != 0x02:
                     continue
 
-                ser.write(build_ack_frame())
                 sample = parse_data_frame(frame)
                 elapsed_time = round(time.time() - start_time, 6)
                 writer.writerow(

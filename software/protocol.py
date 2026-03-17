@@ -179,8 +179,7 @@ def wait_for_ack(ser: serial.Serial, reader: FrameReader, timeout_seconds: float
     """
     等待 ACK。
 
-    如果等待过程中顺手收到了数据帧，会先回 ACK 给对端，
-    避免设备因为“自己的数据帧没被确认”而阻塞。
+    等待过程中若收到数据帧则直接丢弃，不再对数据帧回 ACK。
     """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -189,8 +188,7 @@ def wait_for_ack(ser: serial.Serial, reader: FrameReader, timeout_seconds: float
             return False
         if frame.frame_type == FRAME_TYPE_ACK:
             return True
-        if frame.frame_type == FRAME_TYPE_DATA:
-            ser.write(build_ack_frame())
+        # 收到数据帧不应答，继续等 ACK
     return False
 
 

@@ -32,7 +32,6 @@ from config import (
 )
 from protocol import (
     FrameReader,
-    build_ack_frame,
     build_command_frame,
     build_frame,
     parse_data_frame,
@@ -85,7 +84,7 @@ def serial_reader_loop() -> None:
 
     注意这里统一负责“读串口”：
     - 收到 ACK：只负责 set ack_event
-    - 收到 0x02：回 ACK 后缓存数据
+    - 收到 0x02：仅缓存数据，不对数据帧回 ACK
     这样可以避免多个线程同时 read 同一串口导致 ACK 竞争。
     """
     while not stop_reader.is_set():
@@ -117,8 +116,6 @@ def serial_reader_loop() -> None:
             if frame.frame_type != FRAME_TYPE_DATA:
                 print(f"[visualizer] RX frame type=0x{frame.frame_type:02X} raw={frame_to_hex(raw_frame)}")
                 continue
-            # 真实数据帧到来后，立刻回 ACK。
-            ser.write(build_ack_frame())
             sample = parse_data_frame(frame)
 
         _append_packet(

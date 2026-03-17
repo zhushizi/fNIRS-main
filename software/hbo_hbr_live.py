@@ -29,7 +29,7 @@ from config import (
     WAVELENGTH_660_CODE,
     WAVELENGTH_940_CODE,
 )
-from protocol import FrameReader, build_ack_frame, build_command_frame, parse_data_frame, send_frame_with_ack
+from protocol import FrameReader, build_command_frame, parse_data_frame, send_frame_with_ack
 
 # 用前若干秒的平均光强作为 OD 基线
 BASELINE_SECONDS = 5.0
@@ -80,7 +80,6 @@ class SerialReaderThread(QtCore.QThread):
                 if frame.frame_type == 0x03:
                     return True
                 if frame.frame_type == 0x02:
-                    self.ser.write(build_ack_frame())
                     self._emit(parse_data_frame(frame))
                     return True
             deadline = time.time() + max(ACK_TIMEOUT_SECONDS * 10, 0.2)
@@ -93,7 +92,6 @@ class SerialReaderThread(QtCore.QThread):
             frame = self.reader.read_frame(timeout_seconds=TIMEOUT)
             if frame is None or frame.frame_type != 0x02:
                 continue
-            self.ser.write(build_ack_frame())
             self._emit(parse_data_frame(frame))
         try:
             send_frame_with_ack(self.ser, self.reader, build_command_frame(False, DEFAULT_INTENSITY_MA))
