@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import csv
+import os
 import threading
 import time
+from datetime import datetime
 
 import nirsimple.preprocessing as nsp
 import nirsimple.processing as nproc
@@ -30,8 +32,6 @@ from config import (
     CHANNEL_NAME,
     DEFAULT_INTENSITY_MA,
     DEFAULT_STREAM_ENABLED,
-    INTERLEAVED_OUTPUT_CSV,
-    PROCESSED_OUTPUT_CSV,
     RAW_OUTPUT_CSV,
     SERIAL_PORT,
     SOURCE_DETECTOR_DISTANCE_CM,
@@ -391,11 +391,24 @@ def capture_data(
             stop_event.set()
 
 
-def run_pipeline() -> None:
-    """一键跑完整链路：采集 -> 预处理 -> 配对 -> MBLL -> CSV 输出。"""
-    capture_data(RAW_OUTPUT_CSV, stop_on_enter=True)
+# 三个结果表统一放在此目录下，每次运行占一个以时间命名的子文件夹
+RESULT_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result_table")
 
-    df = pd.read_csv(RAW_OUTPUT_CSV)
+
+def run_pipeline() -> None:
+    """一键跑完整链路：采集 -> 预处理 -> 配对 -> MBLL -> CSV 输出。三个表写入 result_table/<时间>/。"""
+    os.makedirs(RESULT_TABLE_DIR, exist_ok=True)
+    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_dir = os.path.join(RESULT_TABLE_DIR, run_id)
+    os.makedirs(output_dir, exist_ok=True)
+    raw_path = os.path.join(output_dir, "all_groups.csv")
+    interleaved_path = os.path.join(output_dir, "interleaved_output.csv")
+    processed_path = os.path.join(output_dir, "processed_output.csv")
+    print(f"本次结果将保存到: {output_dir}")
+
+    capture_data(csv_filename=raw_path, stop_on_enter=True)
+
+    df = pd.read_csv(raw_path)
     if df.empty or len(df) < 2:
         print("No enough raw rows captured; skipping processing.")
         return
@@ -412,9 +425,9 @@ def run_pipeline() -> None:
         print("No 660/940 block pairs were formed; skipping MBLL.")
         return
 
-    final_df.to_csv(INTERLEAVED_OUTPUT_CSV, index=False)
+    final_df.to_csv(interleaved_path, index=False)
     print(final_df.head(20))
-    process_csv_dataset(INTERLEAVED_OUTPUT_CSV, PROCESSED_OUTPUT_CSV)
+    process_csv_dataset(interleaved_path, processed_path)
 
 
 if __name__ == "__main__":
