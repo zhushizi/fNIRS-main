@@ -28,6 +28,13 @@ local SENSOR_ID = 0x00
 -- 模拟器发数据的默认时间间隔
 local DEFAULT_INTERVAL_MS = 20
 
+-- 每个波长阶段发送的点数（660 发满 5 个再切到 940，反之亦然）
+local POINTS_PER_WAVELENGTH = 5
+
+-- 采样值随机范围 [VALUE_MIN, VALUE_MAX]，单位 ADC 计数，避免超出 0..4095
+local VALUE_MIN = 800
+local VALUE_MAX = 3200
+
 ------------------------------------------------
 -- 运行状态
 ------------------------------------------------
@@ -35,7 +42,7 @@ local DEFAULT_INTERVAL_MS = 20
 local streaming = false
 local intensity_ma = 300
 local wavelength_code = WL_660
-local phase = 0
+local points_in_phase = 0   -- 当前波长阶段已发送的点数，满 POINTS_PER_WAVELENGTH 后切换波长
 local recv_buf = ""
 local interval_ms = DEFAULT_INTERVAL_MS
 
@@ -168,19 +175,15 @@ local function send_ack()
 end
 
 local function next_sample_value()
-    -- 用简化的正弦信号模拟采样值，便于上位机画图和跑算法。
-    local amplitude = math.max(50, math.min(intensity_ma, 300))
-    local base = 2000
-    local wave_offset = (wavelength_code == WL_660) and -80 or 80
-    local value = math.floor(base + wave_offset + amplitude * math.sin(phase))
+    -- 在 [VALUE_MIN, VALUE_MAX] 内随机生成 ADC 值，非正余弦。
+    local value = math.random(VALUE_MIN, VALUE_MAX)
     if value < 0 then value = 0 end
     if value > 4095 then value = 4095 end
-    phase = phase + 0.2
     return value
 end
 
 local function send_data_frame()
-    -- 构造一帧单通道数据，并在 660/940 两个波长之间交替发送。
+    -- 当前波长下发一帧数据；本阶段发满 POINTS_PER_WAVELENGTH 个点后切换到另一波长。
     local value = next_sample_value()
     local low = value % 0x100
     local high = math.floor(value / 0x100)
@@ -192,7 +195,12 @@ local function send_data_frame()
     }
     payload[21] = 0x00
     send_frame(TYPE_DATA, payload)
-    wavelength_code = (wavelength_code == WL_660) and WL_940 or WL_660
+
+    points_in_phase = points_in_phase + 1
+    if points_in_phase >= POINTS_PER_WAVELENGTH then
+        points_in_phase = 0
+        wavelength_code = (wavelength_code == WL_660) and WL_940 or WL_660
+    end
 end
 
 ------------------------------------------------
