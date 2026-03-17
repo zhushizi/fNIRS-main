@@ -52,6 +52,7 @@
                 <tr><th>波长编号</th><td id="latestWavelength" class="mono">-</td></tr>
                 <tr><th>传感器编号</th><td id="latestSensorId" class="mono">-</td></tr>
                 <tr><th>采集值</th><td id="latestValue" class="mono">-</td></tr>
+                <tr><th>实时采样率</th><td id="samplingRateHz" class="mono">-</td></tr>
               </tbody>
             </table>
           </div>
@@ -115,6 +116,8 @@
       document.getElementById("latestWavelength").textContent = latest ? wavelengthLabel(latest.wavelength_code) : "-";
       document.getElementById("latestSensorId").textContent = latest ? latest.sensor_id : "-";
       document.getElementById("latestValue").textContent = latest ? latest.value : "-";
+      const rateHz = data.sampling_rate_hz;
+      document.getElementById("samplingRateHz").textContent = rateHz != null ? rateHz + " Hz" : "-";
 
       const historyBody = document.getElementById("historyBody");
       historyBody.innerHTML = "";

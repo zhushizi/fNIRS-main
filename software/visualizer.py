@@ -49,6 +49,8 @@ stop_reader = threading.Event()
 ack_event = threading.Event()
 recent_packets = deque(maxlen=50)
 latest_packet = None
+# 用于计算实时采样率：最近若干帧的接收时间戳（仅数据帧）
+frame_timestamps = deque(maxlen=3000)
 control_state = {
     "stream_enabled": False,
     "intensity_ma": DEFAULT_INTENSITY_MA,
@@ -67,15 +69,31 @@ frame_reader = None
 
 
 def _append_packet(packet: dict) -> None:
-    """维护页面展示用的最近一帧和最近 50 帧历史。"""
+    """维护页面展示用的最近一帧和最近 50 帧历史，并记录时间戳用于采样率计算。"""
     global latest_packet
     latest_packet = packet
     recent_packets.append(packet)
+    frame_timestamps.append(time.time())
 
 
 def frame_to_hex(frame_bytes: bytes) -> str:
     """把二进制帧转成十六进制字符串，便于联调打印。"""
     return " ".join(f"{b:02X}" for b in frame_bytes)
+
+
+def get_sampling_rate_hz() -> float | None:
+    """
+    根据最近数据帧的时间戳计算实时采样率（Hz）。
+    需要至少 0.2 秒的时间跨度才返回数值，否则返回 None。
+    """
+    if len(frame_timestamps) < 2:
+        return None
+    t0 = frame_timestamps[0]
+    t1 = frame_timestamps[-1]
+    span = t1 - t0
+    if span < 0.2:
+        return None
+    return (len(frame_timestamps) - 1) / span
 
 
 def serial_reader_loop() -> None:
@@ -105,7 +123,8 @@ def serial_reader_loop() -> None:
             continue
 
         with serial_lock:
-            frame = frame_reader.read_frame(timeout_seconds=0.02)
+            # 短超时便于快速排空串口缓冲，提高可达到的采样率显示
+            frame = frame_reader.read_frame(timeout_seconds=0.002)
             if frame is None:
                 continue
             raw_frame = build_frame(frame.frame_type, frame.payload)
@@ -166,7 +185,8 @@ def serve_index():
 
 @app.route("/api/status")
 def api_status():
-    """前端轮询接口：返回当前控制状态和最近帧缓存。"""
+    """前端轮询接口：返回当前控制状态、最近帧缓存和实时采样率。"""
+    rate_hz = get_sampling_rate_hz()
     return jsonify(
         {
             "demo_mode": demo_mode,
@@ -175,6 +195,7 @@ def api_status():
             "control_state": control_state,
             "latest_packet": latest_packet,
             "recent_packets": list(recent_packets),
+            "sampling_rate_hz": round(rate_hz, 1) if rate_hz is not None else None,
         }
     )
 

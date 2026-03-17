@@ -25,8 +25,10 @@ local WL_660 = 0x00
 local WL_940 = 0x01
 local SENSOR_ID = 0x00
 
--- 模拟器发数据的默认时间间隔
-local DEFAULT_INTERVAL_MS = 20
+-- 每 WAKE_MS 毫秒醒来一次，连续发 BURST_FRAMES 帧。目标约 1000 Hz。
+-- 若平台把 sys.wait 放大（如 wait(10)≈1s），则加大 BURST 用较少唤醒凑够帧数。
+local WAKE_MS = 10
+local BURST_FRAMES = 100
 
 -- 每个波长阶段发送的点数（660 发满 5 个再切到 940，反之亦然）
 local POINTS_PER_WAVELENGTH = 5
@@ -44,7 +46,6 @@ local intensity_ma = 300
 local wavelength_code = WL_660
 local points_in_phase = 0   -- 当前波长阶段已发送的点数，满 POINTS_PER_WAVELENGTH 后切换波长
 local recv_buf = ""
-local interval_ms = DEFAULT_INTERVAL_MS
 
 ------------------------------------------------
 -- 工具函数
@@ -328,12 +329,14 @@ end
 ------------------------------------------------
 
 sys.taskInit(function()
-    -- 用任务循环模拟“设备持续采样并发数据”的行为。
+    -- 每 WAKE_MS 毫秒发 BURST_FRAMES 帧，避免 sys.wait(1) 被圆整为 100 ms 导致只有 10 Hz。
     log_info("sys", "single-channel slave simulator initialized")
     while true do
         if streaming then
-            send_data_frame()
+            for _ = 1, BURST_FRAMES do
+                send_data_frame()
+            end
         end
-        sys.wait(interval_ms)
+        sys.wait(WAKE_MS)
     end
 end)
