@@ -38,6 +38,7 @@ from config import (
     TIMEOUT,
     WAVELENGTH_660_CODE,
     WAVELENGTH_940_CODE,
+    WAVELENGTH_OFF_CODE,
 )
 from protocol import (
     FrameReader,
@@ -71,15 +72,15 @@ def threshold_filter(
     signal_col: str = CHANNEL_NAME,
     lower_threshold: int = 200,
     upper_threshold: int = 4000,
+    zero_level: int = 2050,
 ) -> pd.DataFrame:
-    """对单通道数值做简单阈值抑制，并用插值补回缺失点。"""
+    """对单通道数值做阈值抑制，超限值直接替换为 zero_level。"""
     filtered = df.copy()
     filtered[signal_col] = np.where(
         (df[signal_col] < lower_threshold) | (df[signal_col] > upper_threshold),
-        np.nan,
+        zero_level,
         df[signal_col],
     )
-    filtered[signal_col] = filtered[signal_col].interpolate(limit_direction="both")
     return filtered
 
 
@@ -409,6 +410,16 @@ def run_pipeline() -> None:
     df = pd.read_csv(raw_path)
     if df.empty or len(df) < 2:
         print("No enough raw rows captured; skipping processing.")
+        return
+
+    n_raw = len(df)
+    df = df[df["Wavelength"] != WAVELENGTH_OFF_CODE].reset_index(drop=True)
+    dropped = n_raw - len(df)
+    if dropped:
+        print(f"Dropped {dropped} raw row(s) with Wavelength=OFF (0x00); not used for 660/940 pairing.")
+
+    if df.empty or len(df) < 2:
+        print("No enough non-OFF samples after filtering; skipping processing.")
         return
 
     dt = df["Time (s)"].diff().mean()

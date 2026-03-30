@@ -26,6 +26,7 @@ from config import (
     TIMEOUT,
     WAVELENGTH_660_CODE,
     WAVELENGTH_940_CODE,
+    WAVELENGTH_OFF_CODE,
 )
 from protocol import FrameReader, build_command_frame, parse_data_frame, send_frame_with_ack
 
@@ -183,8 +184,10 @@ class MainWindow(QtWidgets.QWidget):
             self.time_940.append(elapsed)
             self.data_940.append(value)
             wave_label = "940nm"
+        elif wavelength_code == WAVELENGTH_OFF_CODE:
+            wave_label = "OFF"
         else:
-            wave_label = f"Unknown({wavelength_code})"
+            wave_label = f"Unknown(0x{wavelength_code:02X})"
             print(f"[adc_live] Unknown wavelength code: 0x{wavelength_code:02X}")
 
         self.status_label.setText(f"Latest: {wave_label} value={value}")

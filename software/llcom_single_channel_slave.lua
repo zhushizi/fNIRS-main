@@ -20,9 +20,9 @@ local TYPE_CMD  = 0x01
 local TYPE_DATA = 0x02
 local TYPE_ACK  = 0x03
 
--- 波长编码和当前单传感器编号
-local WL_660 = 0x00
+-- 波长编码和当前单传感器编号（与 software/config.py 一致：00=关，01=940，02=660）
 local WL_940 = 0x01
+local WL_660 = 0x02
 local SENSOR_ID = 0x00
 
 -- 每 WAKE_MS 毫秒醒来一次，连续发 BURST_FRAMES 帧。目标约 1000 Hz。

@@ -38,10 +38,13 @@ DEFAULT_STREAM_ENABLED = True
 CHANNEL_NAME = "S1_D1"
 SOURCE_DETECTOR_DISTANCE_CM = 3.0
 
-# 波长编码映射。
-# 这里的 byte0 同时也承担“当前样本属于哪个发射状态”的语义。
-WAVELENGTH_660_CODE = 0x00
+# 波长编码映射（数据帧 payload byte0）。
+# - 0x00：两路均未点亮（本样本不代表某一工作波长）
+# - 0x01：940nm
+# - 0x02：660nm
+WAVELENGTH_OFF_CODE = 0x00
 WAVELENGTH_940_CODE = 0x01
+WAVELENGTH_660_CODE = 0x02
 WAVELENGTH_BY_CODE = {
     WAVELENGTH_660_CODE: 660.0,
     WAVELENGTH_940_CODE: 940.0,

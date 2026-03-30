@@ -20,12 +20,13 @@
 
 - **物理通道**：单通道 `S1_D1`
 - **源探距离**：默认 `3.0 cm`，配置在 `software/config.py`
-- **波长编码**：
-  - `0x00 = 660nm`
-  - `0x01 = 940nm`
+- **波长编码**（数据帧 payload 首字节）：
+  - `0x00`：未点亮（不参与 660/940 配对）
+  - `0x01`：940nm
+  - `0x02`：660nm
 - **术语约定**：
-  - 数据帧 `payload byte0` 的“波长编号”同时就是当前样本的 `emitter-state` 语义
-  - 上位机后续处理统一只看 `Wavelength`
+  - 数据帧 `payload byte0` 表示当前样本对应的发射状态（含未点亮）；配对与 MBLL 前会丢弃 `0x00`
+  - 离线处理统一按 CSV 中的 `Wavelength` 列分段（仅保留 `0x01` / `0x02` 参与 660/940 成对）
 - **输出风格**：`processed_output.csv` 保持 `Time + {ChannelName}_{Type}` 样式
 
 ## 快速开始

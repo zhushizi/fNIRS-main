@@ -60,7 +60,7 @@ It targets the new **26-byte framed serial protocol** and assumes one physical c
 
 | Byte | Meaning |
 |------|---------|
-| 0 | wavelength code (`0x00=660`, `0x01=940`) |
+| 0 | wavelength code (`0x00=off`, `0x01=940nm`, `0x02=660nm`) |
 | 1 | sensor id (`0x00` for current S1_D1 deployment) |
 | 2 | sampled value low byte |
 | 3 | sampled value high byte |
@@ -70,10 +70,11 @@ It targets the new **26-byte framed serial protocol** and assumes one physical c
 Here, the payload byte `0` wavelength code is also the effective
 "emitter-state" meaning for the host side:
 
-- `0x00` means the current sample belongs to `660nm`
+- `0x00` means neither LED wavelength is active for this sample (`off`)
 - `0x01` means the current sample belongs to `940nm`
+- `0x02` means the current sample belongs to `660nm`
 
-So downstream processing no longer depends on a separate emitter field.
+`fNIRS_processing.py` drops `0x00` rows before 660/940 pairing. Other tools may still display off samples (e.g. live ADC).
 
 ### ACK Handling
 

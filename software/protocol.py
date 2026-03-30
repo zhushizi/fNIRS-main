@@ -27,6 +27,7 @@ from config import (
     FRAME_TYPE_DATA,
     MAX_RETRIES,
     WAVELENGTH_BY_CODE,
+    WAVELENGTH_OFF_CODE,
 )
 
 
@@ -41,7 +42,7 @@ class ParsedFrame:
 class DataSample:
     """把 0x02 数据帧再解释成更高层的单个采样点。"""
     wavelength_code: int
-    wavelength_nm: float
+    wavelength_nm: Optional[float]
     sensor_id: int
     value: int
 
@@ -80,8 +81,12 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
     """
     解析 0x02 数据帧。
 
-    当前协议约定：
-    - payload[0] = 波长编号
+    当前协议约定（payload byte0）：
+    - 0x00：未点亮
+    - 0x01：940nm
+    - 0x02：660nm
+
+    其余字段：
     - payload[1] = 传感器编号
     - payload[2:4] = 采样值（低字节在前）
     """
@@ -92,7 +97,10 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
     wavelength_code = payload[0]
     sensor_id = payload[1]
     value = int.from_bytes(payload[2:4], byteorder="little", signed=False)
-    wavelength_nm = WAVELENGTH_BY_CODE.get(wavelength_code, float(wavelength_code))
+    if wavelength_code == WAVELENGTH_OFF_CODE:
+        wavelength_nm: Optional[float] = None
+    else:
+        wavelength_nm = WAVELENGTH_BY_CODE.get(wavelength_code)
     return DataSample(
         wavelength_code=wavelength_code,
         wavelength_nm=wavelength_nm,
