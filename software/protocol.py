@@ -87,7 +87,7 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
 
     其余字段：
     - payload[1] = 传感器编号
-    - payload[2:4] = 采样值（低字节在前）
+    - payload[2:6] = 采样值（高字节在前，4 字节）
     """
     if frame.frame_type != FRAME_TYPE_DATA:
         raise ValueError("Expected a data frame.")
@@ -95,7 +95,7 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
     payload = frame.payload
     wavelength_code = payload[0]
     sensor_id = payload[1]
-    value = int.from_bytes(payload[2:4], byteorder="little", signed=False)
+    value = int.from_bytes(payload[2:6], byteorder="big", signed=False)
     if wavelength_code == WAVELENGTH_OFF_CODE:
         wavelength_nm: Optional[float] = None
     else:
