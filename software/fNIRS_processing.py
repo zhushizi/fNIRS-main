@@ -70,9 +70,9 @@ def _start_enter_listener(stop_event: threading.Event) -> threading.Thread:
 def threshold_filter(
     df: pd.DataFrame,
     signal_col: str = CHANNEL_NAME,
-    lower_threshold: int = 200,
-    upper_threshold: int = 4000,
-    zero_level: int = 2050,
+    lower_threshold: int = 50000,
+    upper_threshold: int = 300000,
+    zero_level: int = 170000,
 ) -> pd.DataFrame:
     """对单通道数值做阈值抑制，超限值直接替换为 zero_level。"""
     filtered = df.copy()
