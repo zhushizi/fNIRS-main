@@ -161,20 +161,14 @@ def send_command_with_ack(stream_enabled: bool, intensity_ma: int) -> bool:
     """
     向下位机发送启动/停止命令。
 
-    这里不自己读串口，而是等待后台线程收到 ACK 后 set 的事件，
-    避免“发送线程”和“接收线程”抢读同一个串口。
+    当前固件版本不返回 ACK，这里仅发送命令，不再等待 ack_event。
     """
     frame = build_command_frame(stream_enabled=stream_enabled, intensity_ma=intensity_ma)
-    for attempt in range(MAX_RETRIES + 1):
-        ack_event.clear()
-        with serial_lock:
-            print(f"[visualizer] TX command attempt={attempt + 1} raw={frame_to_hex(frame)}")
-            ser.write(frame)
-        if ack_event.wait(COMMAND_ACK_TIMEOUT_SECONDS):
-            print(f"[visualizer] Command ACK success on attempt {attempt + 1}")
-            return True
-        print(f"[visualizer] Command ACK wait timeout on attempt {attempt + 1}")
-    return False
+    with serial_lock:
+        print(f"[visualizer] TX command raw={frame_to_hex(frame)}")
+        ser.write(frame)
+    print("[visualizer] ACK check skipped for current firmware.")
+    return True
 
 
 @app.route("/")
@@ -206,7 +200,7 @@ def update_control_data():
     data = request.get_json(force=True)
     stream_enabled = bool(data.get("stream_enabled", control_state["stream_enabled"]))
     intensity_ma = int(data.get("intensity_ma", control_state["intensity_ma"]))
-    intensity_ma = max(0, min(intensity_ma, 0xFFFF))
+    intensity_ma = max(0, min(intensity_ma, 0xFF))
 
     control_state["stream_enabled"] = stream_enabled
     control_state["intensity_ma"] = intensity_ma

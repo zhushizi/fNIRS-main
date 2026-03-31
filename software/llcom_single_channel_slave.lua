@@ -42,7 +42,7 @@ local VALUE_MAX = 3200
 ------------------------------------------------
 
 local streaming = false
-local intensity_ma = 300
+local intensity_ma = 200
 local wavelength_code = WL_660
 local points_in_phase = 0   -- 当前波长阶段已发送的点数，满 POINTS_PER_WAVELENGTH 后切换波长
 local recv_buf = ""
@@ -250,14 +250,13 @@ end
 local function handle_command(payload)
     -- 命令帧当前只用到：启停 + 光强。
     local stream_enable = payload[1] or 0x00
-    local intensity_high = payload[2] or 0x00
-    local intensity_low = payload[3] or 0x00
+    local intensity_byte = payload[2] or 0x00
 
     -- 先更新状态，再回 ACK；停止时也会先停流再回 ACK。
     streaming = (stream_enable ~= 0x00)
-    intensity_ma = intensity_high * 0x100 + intensity_low
+    intensity_ma = intensity_byte
     if intensity_ma <= 0 then
-        intensity_ma = 300
+        intensity_ma = 200
     end
 
     log_info("frame", "command frame received", "streaming=", tostring(streaming), "intensity=", intensity_ma)

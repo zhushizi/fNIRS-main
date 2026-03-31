@@ -77,8 +77,6 @@ class SerialReaderThread(QtCore.QThread):
                 frame = self.reader.read_frame(timeout_seconds=min(TIMEOUT, max(0.01, deadline - time.time())))
                 if frame is None:
                     continue
-                if frame.frame_type == 0x03:
-                    return True
                 if frame.frame_type == 0x02:
                     self._emit(parse_data_frame(frame))
                     return True

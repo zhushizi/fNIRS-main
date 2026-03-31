@@ -58,11 +58,11 @@ payload 共 21 字节，目前使用：
 | 字节 | 含义 |
 |------|------|
 | 0 | 启停：`0x00` 停止，`0x01` 启动 |
-| 1 | 光强高字节 |
-| 2 | 光强低字节 |
+| 1 | 光强单字节：`0x00~0xFF` |
+| 2 | 保留，当前填 0 |
 | 3-20 | 保留，当前填 0 |
 
-默认光强：`0x012C`（300）
+默认光强：`0xC8`（200）
 
 ### 2.5 数据帧 `0x02`
 
@@ -233,7 +233,7 @@ Time,S1_D1_hbo,S1_D1_hbr
 - `BAUD_RATE = 115200`
 - `ACK_TIMEOUT_SECONDS = 0.01`
 - `MAX_RETRIES = 2`
-- `DEFAULT_INTENSITY_MA = 300`
+- `DEFAULT_INTENSITY_MA = 200`
 - `SOURCE_DETECTOR_DISTANCE_CM = 3.0`
 
 ---

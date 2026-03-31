@@ -62,8 +62,8 @@ class SerialReaderThread(QtCore.QThread):
         """
         启动采集。
 
-        优先等显式 ACK；如果 ACK 因时序问题晚到，但 0x02 数据已经开始流动，
-        也视为“采集已经启动成功”，避免线程直接退出。
+        当前固件版本不返回 ACK。
+        这里只检查是否开始收到 0x02 数据帧，收到即视为启动成功。
         """
         command = build_command_frame(True, DEFAULT_INTENSITY_MA)
         startup_timeout = max(ACK_TIMEOUT_SECONDS * 10, 0.2)
@@ -77,19 +77,14 @@ class SerialReaderThread(QtCore.QThread):
                 frame = self.reader.read_frame(timeout_seconds=min(TIMEOUT, max(0.01, deadline - time.time())))
                 if frame is None:
                     continue
-                if frame.frame_type == 0x03:
-                    print("[adc_live] Start command ACK success. Begin reading data frames.")
-                    return True
                 if frame.frame_type == 0x02:
-                    # If data is already flowing, treat the stream as active even if
-                    # the explicit ACK was missed or arrived out of order.
                     sample = parse_data_frame(frame)
-                    print("[adc_live] Stream became active before explicit ACK.")
+                    print("[adc_live] Stream became active.")
                     self._emit_sample(sample)
                     return True
-                print(f"[adc_live] Ignored startup frame type: 0x{frame.frame_type:02X}")
+                print(f"[adc_live] Ignored startup non-data frame type: 0x{frame.frame_type:02X}")
 
-        print("[adc_live] Start command ACK timeout. Reader thread exits.")
+        print("[adc_live] No data frame received after start command. Reader thread exits.")
         return False
 
     def run(self):

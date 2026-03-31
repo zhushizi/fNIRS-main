@@ -63,12 +63,11 @@ def build_frame(frame_type: int, payload: bytes) -> bytes:
 
 
 def build_command_frame(stream_enabled: bool, intensity_ma: int = DEFAULT_INTENSITY_MA) -> bytes:
-    """构造 0x01 命令帧。当前只使用 payload 前 3 个字节。"""
-    intensity = max(0, min(intensity_ma, 0xFFFF))
+    """构造 0x01 命令帧。当前使用 payload[0]=启停, payload[1]=单字节光强。"""
+    intensity = max(0, min(intensity_ma, 0xFF))
     payload = bytearray(FRAME_PAYLOAD_SIZE)
     payload[0] = 0x01 if stream_enabled else 0x00
-    payload[1] = (intensity >> 8) & 0xFF
-    payload[2] = intensity & 0xFF
+    payload[1] = intensity
     return build_frame(FRAME_TYPE_COMMAND, bytes(payload))
 
 
@@ -206,9 +205,8 @@ def send_frame_with_ack(
     frame: bytes,
     retries: int = MAX_RETRIES,
 ) -> bool:
-    """发送一帧并按配置进行 ACK 重试。"""
-    for _ in range(retries + 1):
-        ser.write(frame)
-        if wait_for_ack(ser, reader):
-            return True
-    return False
+    """发送一帧（当前固件不回 ACK，临时跳过 ACK 判断）。"""
+    # 兼容当前下位机版本：命令发送后不等待 0x03 ACK。
+    # 保留 reader/retries 参数是为了不破坏现有调用签名。
+    ser.write(frame)
+    return True

@@ -52,8 +52,8 @@ It targets the new **26-byte framed serial protocol** and assumes one physical c
 | Byte | Meaning |
 |------|---------|
 | 0 | start/stop (`0x00` stop, `0x01` start) |
-| 1 | intensity high byte |
-| 2 | intensity low byte |
+| 1 | intensity (`0x00`~`0xFF`) |
+| 2 | reserved, currently `0x00` |
 | 3-20 | reserved, currently `0x00` |
 
 ### Data Payload (`0x02`)

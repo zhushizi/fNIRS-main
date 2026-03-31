@@ -9,7 +9,7 @@
 """
 
 # 串口端口号。Windows 例如 "COM5"，Linux/macOS 可写成 /dev/ttyUSB0 之类。
-SERIAL_PORT = "COM5"
+SERIAL_PORT = "COM6"
 
 # 串口基础参数
 BAUD_RATE = 115200
@@ -31,7 +31,7 @@ ACK_TIMEOUT_SECONDS = 0.05
 MAX_RETRIES = 2
 
 # 默认下发的命令参数
-DEFAULT_INTENSITY_MA = 300
+DEFAULT_INTENSITY_MA = 200
 DEFAULT_STREAM_ENABLED = True
 
 # 当前软件按单物理通道处理：S1_D1

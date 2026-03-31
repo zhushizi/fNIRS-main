@@ -28,7 +28,7 @@
             </div>
             <div class="form-group">
               <label for="intensityMa">光强 / 电流值</label>
-              <input type="number" class="form-control mono" id="intensityMa" min="0" max="65535" value="300">
+              <input type="number" class="form-control mono" id="intensityMa" min="0" max="255" value="200">
             </div>
             <button class="btn btn-dark btn-block" id="sendButton">发送控制命令</button>
             <div class="mt-3">
@@ -105,10 +105,10 @@
       document.getElementById("intensityMa").value = data.control_state.intensity_ma;
 
       if (data.control_state.last_command_ok === true) {
-        ackStatus.textContent = "最近一次命令: ACK 成功";
+        ackStatus.textContent = "最近一次命令: 已发送";
         ackStatus.className = "badge badge-success status-badge";
       } else if (data.control_state.last_command_ok === false) {
-        ackStatus.textContent = "最近一次命令: ACK 超时";
+        ackStatus.textContent = "最近一次命令: 发送失败";
         ackStatus.className = "badge badge-danger status-badge";
       }
 
@@ -152,10 +152,10 @@
       const result = await response.json();
 
       if (result.status === "success") {
-        ackStatus.textContent = "命令发送成功，已收到 ACK";
+        ackStatus.textContent = "命令发送成功";
         ackStatus.className = "badge badge-success status-badge";
       } else {
-        ackStatus.textContent = "命令发送失败，ACK 超时";
+        ackStatus.textContent = "命令发送失败";
         ackStatus.className = "badge badge-danger status-badge";
       }
 
