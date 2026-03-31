@@ -36,6 +36,11 @@ def open_serial() -> serial.Serial:
     return serial.Serial(SERIAL_PORT, baudrate=BAUD_RATE, timeout=TIMEOUT)
 
 
+def frame_to_hex(frame_bytes: bytes) -> str:
+    """把二进制帧转成十六进制字符串，便于调试打印。"""
+    return " ".join(f"{b:02X}" for b in frame_bytes)
+
+
 class SerialReaderThread(QtCore.QThread):
     """后台串口读取线程，避免 GUI 主线程被串口阻塞。"""
     newData = QtCore.pyqtSignal(float, int, int)
@@ -70,6 +75,7 @@ class SerialReaderThread(QtCore.QThread):
 
         for attempt in range(MAX_RETRIES + 1):
             print(f"[adc_live] Sending start command frame (attempt {attempt + 1})...")
+            print(f"[adc_live] TX start raw={frame_to_hex(command)}")
             self.ser.write(command)
 
             deadline = time.time() + startup_timeout
@@ -91,7 +97,7 @@ class SerialReaderThread(QtCore.QThread):
         """线程主循环：先启动流，再持续读取数据帧。"""
         started = self._start_stream()
         if not started:
-            return
+            print("[adc_live] Start command sent (max attempts reached). Keep waiting for data frames...")
 
         while self.running:
             frame = self.reader.read_frame(timeout_seconds=TIMEOUT)
@@ -106,10 +112,12 @@ class SerialReaderThread(QtCore.QThread):
 
         try:
             print("[adc_live] Sending stop command frame...")
+            stop_command = build_command_frame(False, 0x00)
+            print(f"[adc_live] TX stop raw={frame_to_hex(stop_command)}")
             send_frame_with_ack(
                 self.ser,
                 self.reader,
-                build_command_frame(False, DEFAULT_INTENSITY_MA),
+                stop_command,
             )
         except Exception:
             pass

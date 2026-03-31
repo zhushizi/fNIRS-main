@@ -84,8 +84,9 @@ class SerialReaderThread(QtCore.QThread):
         return False
 
     def run(self):
-        if not self._start_stream():
-            return
+        started = self._start_stream()
+        if not started:
+            print("[hbo_hbr_live] Start command sent (max attempts reached). Keep waiting for data frames...")
         while self.running:
             frame = self.reader.read_frame(timeout_seconds=TIMEOUT)
             if frame is None or frame.frame_type != 0x02:
