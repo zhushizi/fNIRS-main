@@ -37,7 +37,7 @@ BASELINE_SECONDS = 5.0
 UPDATE_INTERVAL_S = 0.1
 # 绘图时间窗（秒）
 WINDOW_SECONDS = 60.0
-MBLL_AGE = 22
+MBLL_AGE = 27
 
 
 def open_serial() -> serial.Serial:
@@ -115,6 +115,14 @@ class MainWindow(QtWidgets.QWidget):
         self.baseline_660: list[float] = []
         self.baseline_940: list[float] = []
         self.last_mbll_time = 0.0
+        self.current_phase_wl: int | None = None
+        self.current_phase_vals: list[float] = []
+        self.current_phase_times: list[float] = []
+        self.latest_rms_660: float | None = None
+        self.latest_rms_940: float | None = None
+        self.latest_rms_time_660: float | None = None
+        self.latest_rms_time_940: float | None = None
+        self.last_pair_time = -1.0
 
         self.time_660 = deque(maxlen=5000)
         self.data_660 = deque(maxlen=5000)
@@ -147,32 +155,71 @@ class MainWindow(QtWidgets.QWidget):
     def on_new_data(self, elapsed: float, wavelength_code: int, value: int):
         if value <= 0:
             return
-        if wavelength_code == WAVELENGTH_660_CODE:
-            self.time_660.append(elapsed)
-            self.data_660.append(float(value))
-            if self.ref_660 is None:
-                self.baseline_660.append(float(value))
-        elif wavelength_code == WAVELENGTH_940_CODE:
-            self.time_940.append(elapsed)
-            self.data_940.append(float(value))
-            if self.ref_940 is None:
-                self.baseline_940.append(float(value))
+        if wavelength_code not in (WAVELENGTH_660_CODE, WAVELENGTH_940_CODE):
+            return
+
+        # 与离线 sliding_window_rms 一致：按波长连续段切段，段结束时用 RMS 代表该段。
+        if self.current_phase_wl is None:
+            self.current_phase_wl = wavelength_code
+        elif wavelength_code != self.current_phase_wl:
+            self._finalize_phase()
+            self.current_phase_wl = wavelength_code
+            self.current_phase_vals.clear()
+            self.current_phase_times.clear()
+
+        self.current_phase_vals.append(float(value))
+        self.current_phase_times.append(elapsed)
+
+    def _finalize_phase(self):
+        if self.current_phase_wl is None or not self.current_phase_vals:
+            return
+
+        phase_rms = float(np.sqrt(np.mean(np.square(np.asarray(self.current_phase_vals, dtype=float)))))
+        phase_time = float(np.mean(self.current_phase_times))
+
+        if self.current_phase_wl == WAVELENGTH_660_CODE:
+            self.latest_rms_660 = phase_rms
+            self.latest_rms_time_660 = phase_time
+            self.time_660.append(phase_time)
+            self.data_660.append(phase_rms)
+            if self.ref_660 is None and phase_time <= BASELINE_SECONDS:
+                self.baseline_660.append(phase_rms)
+        elif self.current_phase_wl == WAVELENGTH_940_CODE:
+            self.latest_rms_940 = phase_rms
+            self.latest_rms_time_940 = phase_time
+            self.time_940.append(phase_time)
+            self.data_940.append(phase_rms)
+            if self.ref_940 is None and phase_time <= BASELINE_SECONDS:
+                self.baseline_940.append(phase_rms)
 
         # 用串口时间戳判断：满 BASELINE_SECONDS 且有两路数据则固定基线
-        if self.ref_660 is None and elapsed >= BASELINE_SECONDS and self.baseline_660 and self.baseline_940:
+        if (
+            self.ref_660 is None
+            and self.ref_940 is None
+            and phase_time >= BASELINE_SECONDS
+            and self.baseline_660
+            and self.baseline_940
+        ):
             self.ref_660 = float(np.mean(self.baseline_660))
             self.ref_940 = float(np.mean(self.baseline_940))
             self.status.setText(f"基线就绪 ref_660={self.ref_660:.0f} ref_940={self.ref_940:.0f}")
 
-        if self.ref_660 is not None and self.ref_940 is not None:
-            if (elapsed - self.last_mbll_time) < UPDATE_INTERVAL_S:
+        if (
+            self.ref_660 is not None
+            and self.ref_940 is not None
+            and self.latest_rms_660 is not None
+            and self.latest_rms_940 is not None
+            and self.latest_rms_time_660 is not None
+            and self.latest_rms_time_940 is not None
+        ):
+            t = (self.latest_rms_time_660 + self.latest_rms_time_940) * 0.5
+            if t <= self.last_pair_time:
                 return
-            if not self.data_660 or not self.data_940:
+            if (t - self.last_mbll_time) < UPDATE_INTERVAL_S:
                 return
-            t_660, t_940 = self.time_660[-1], self.time_940[-1]
-            t = (t_660 + t_940) * 0.5
-            i_660 = self.data_660[-1]
-            i_940 = self.data_940[-1]
+
+            i_660 = self.latest_rms_660
+            i_940 = self.latest_rms_940
             i_660 = max(i_660, 1.0)
             i_940 = max(i_940, 1.0)
             delta_od_660 = -np.log10(i_660 / self.ref_660)
@@ -196,7 +243,8 @@ class MainWindow(QtWidgets.QWidget):
                 return
             hbo_val = float(flat[0])
             hbr_val = float(flat[1])
-            self.last_mbll_time = elapsed
+            self.last_mbll_time = t
+            self.last_pair_time = t
             self.time_hbo.append(t)
             self.hbo_vals.append(hbo_val)
             self.hbr_vals.append(hbr_val)

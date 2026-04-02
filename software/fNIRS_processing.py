@@ -171,10 +171,11 @@ def interleave_mode_blocks(
     while i < len(blocks) - 1:
         block1 = blocks[i]
         block2 = blocks[i + 1]
-        max_len = max(len(block1), len(block2))
-        for j in range(max_len):
-            row1 = block1.loc[j] if j < len(block1) else block1.loc[len(block1) - 1]
-            row2 = block2.loc[j] if j < len(block2) else block2.loc[len(block2) - 1]
+        # 截断对齐：只取两块都存在的样本，避免用末值补齐导致重复行/重复时间。
+        pair_len = min(len(block1), len(block2))
+        for j in range(pair_len):
+            row1 = block1.loc[j]
+            row2 = block2.loc[j]
             row_660, row_940 = _resolve_pair(row1, row2)
             rows.append(
                 {
@@ -425,7 +426,8 @@ def run_pipeline() -> None:
     dt = df["Time (s)"].diff().mean()
     fs = 1.0 / dt if pd.notna(dt) and dt > 0 else 1.0
 
-    df = threshold_filter(df)
+    # # 阈值截断
+    # df = threshold_filter(df)
     df = butter_lowpass_filter(df=df, cutoff_hz=1.0, fs=fs, order=4)
     df = sliding_window_rms(df=df)
 
