@@ -33,6 +33,7 @@ from config import (
     DEFAULT_INTENSITY_MA,
     DEFAULT_STREAM_ENABLED,
     RAW_OUTPUT_CSV,
+    SAMPLING_RATE_HZ,
     SERIAL_PORT,
     SOURCE_DETECTOR_DISTANCE_CM,
     TIMEOUT,
@@ -101,7 +102,7 @@ def butter_lowpass_filter(
         return filtered
 
     b, a = butter(order, cutoff_hz / nyquist, btype="low", analog=False)
-    padlen = min(len(df) - 1, 3 * (max(len(a), len(b)) - 1))
+    padlen = min(len(df) - 1, 3 * (max(len(a), len(b)) - 1)) # 计算滤波器长度
     if padlen <= 0:
         return filtered
     filtered[signal_col] = filtfilt(b, a, df[signal_col], padlen=padlen)
@@ -406,16 +407,19 @@ def run_pipeline() -> None:
     processed_path = os.path.join(output_dir, "processed_output.csv")
     print(f"本次结果将保存到: {output_dir}")
 
+    # 采集数据
     capture_data(csv_filename=raw_path, stop_on_enter=True)
 
+    # 读取数据
     df = pd.read_csv(raw_path)
     if df.empty or len(df) < 2:
         print("No enough raw rows captured; skipping processing.")
         return
 
+    # 过滤数据
     n_raw = len(df)
-    df = df[df["Wavelength"] != WAVELENGTH_OFF_CODE].reset_index(drop=True)
-    dropped = n_raw - len(df)
+    df = df[df["Wavelength"] != WAVELENGTH_OFF_CODE].reset_index(drop=True) # 去掉未点亮的数据
+    dropped = n_raw - len(df) # 计算去掉的数据量
     if dropped:
         print(f"Dropped {dropped} raw row(s) with Wavelength=OFF (0x00); not used for 660/940 pairing.")
 
@@ -424,20 +428,37 @@ def run_pipeline() -> None:
         return
 
     dt = df["Time (s)"].diff().mean()
-    fs = 1.0 / dt if pd.notna(dt) and dt > 0 else 1.0
+    fs = 1.0 / dt if pd.notna(dt) and dt > 0 else 1.0 # 计算采样率
 
     # # 阈值截断
     # df = threshold_filter(df)
+
+    # 低通滤波
     df = butter_lowpass_filter(df=df, cutoff_hz=1.0, fs=fs, order=4)
+
+    # 分段 RMS
     df = sliding_window_rms(df=df)
 
+    # 交错配对
     final_df = interleave_mode_blocks(df, mode_col="Wavelength")
     if final_df.empty:
         print("No 660/940 block pairs were formed; skipping MBLL.")
         return
 
+    # 重建等间隔时间戳，避免采集抖动影响后续基于 fs 的滤波。
+    increment = 1.0 / SAMPLING_RATE_HZ if SAMPLING_RATE_HZ > 0 else 0.001
+    if "Time (s)" in final_df.columns:
+        final_df = final_df.drop(columns=["Time (s)"])
+    final_df.insert(0, "Time (s)", [i * increment for i in range(len(final_df))])
+
+    # 统一保留6位小数，减少浮点表示伪差。
+    final_df["Time (s)"] = final_df["Time (s)"].round(6)
+
+    # 写入文件
     final_df.to_csv(interleaved_path, index=False)
     print(final_df.head(20))
+
+    # 计算最终的 HbO/HbR
     process_csv_dataset(interleaved_path, processed_path)
 
 

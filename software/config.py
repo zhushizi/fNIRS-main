@@ -14,6 +14,8 @@ SERIAL_PORT = "COM6"
 # 串口基础参数
 BAUD_RATE = 115200
 TIMEOUT = 0.05
+# 设备标称采样率（Hz），用于重建等间隔时间戳。
+SAMPLING_RATE_HZ = 250.0
 
 # 26B 协议固定帧格式
 FRAME_HEADER = bytes((0x55, 0xAA))

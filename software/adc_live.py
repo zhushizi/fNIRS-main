@@ -4,7 +4,7 @@
 这个脚本的职责很单纯：
 1. 给下位机发启动命令
 2. 持续读取 0x02 数据帧
-3. 把 660nm / 940nm 分成两条曲线显示
+3. 把 660nm / 940nm 分成两条曲线显示（时域 + 频域 FFT 幅度谱）
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import sys
 import time
 from collections import deque
 
+import numpy as np
 import pyqtgraph as pg
 import serial
 from PyQt5 import QtCore, QtWidgets
@@ -169,12 +170,60 @@ class MainWindow(QtWidgets.QWidget):
         self.curve_940 = self.plot_widget.plot(pen=pg.mkPen("g", width=2), name="940nm")
         main_layout.addWidget(self.plot_widget)
 
+        # 频域：对当前时间窗内的序列做 rFFT（按各自时间戳估计采样率）
+        self.fft_min_samples = 64
+        self.spectrum_widget = pg.PlotWidget(title="ADC Spectrum (FFT magnitude)")
+        self.spectrum_widget.showGrid(x=True, y=True)
+        self.spectrum_widget.setLabel("bottom", "Frequency (Hz)")
+        self.spectrum_widget.setLabel("left", "Magnitude")
+        self.spectrum_widget.addLegend()
+        self.spectrum_curve_660 = self.spectrum_widget.plot(
+            pen=pg.mkPen("r", width=2), name="660nm"
+        )
+        self.spectrum_curve_940 = self.spectrum_widget.plot(
+            pen=pg.mkPen("g", width=2), name="940nm"
+        )
+        main_layout.addWidget(self.spectrum_widget)
+
         self.status_label = QtWidgets.QLabel("Waiting for data...")
         main_layout.addWidget(self.status_label)
 
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_plots)
         self.timer.start(50)
+
+    @staticmethod
+    def _spectrum_from_timeseries(times, values, min_samples: int):
+        """
+        由非均匀时间戳估计平均采样间隔，对去直流后的序列加 Hann 窗后做 rFFT。
+        返回 (freq_hz, magnitude) ；样本不足或无效时返回 (None, None)。
+        """
+        if len(times) < min_samples or len(values) < min_samples:
+            return None, None
+        t = np.asarray(times, dtype=float)
+        y = np.asarray(values, dtype=float)
+        n = min(len(t), len(y))
+        t, y = t[-n:], y[-n:]
+        dt = np.diff(t)
+        if dt.size == 0:
+            return None, None
+        mean_dt = float(np.mean(dt))
+        if mean_dt <= 0 or not np.isfinite(mean_dt):
+            return None, None
+        fs = 1.0 / mean_dt
+        y = y - np.mean(y)
+        win = np.hanning(len(y))
+        y_w = y * win
+        spec = np.fft.rfft(y_w)
+        freq = np.fft.rfftfreq(len(y), d=1.0 / fs)
+        # 单边谱幅度归一化（与窗能量无关的直观量级：除以 n，非 DC/Nyquist 乘 2）
+        mag = np.abs(spec)
+        if len(mag) > 0:
+            mag = mag * (2.0 / len(y))
+            mag[0] *= 0.5
+            if len(mag) > 1 and len(y) % 2 == 0:
+                mag[-1] *= 0.5
+        return freq, mag
 
     @QtCore.pyqtSlot(float, int, int)
     def on_new_data(self, elapsed: float, wavelength_code: int, value: int):
@@ -211,6 +260,21 @@ class MainWindow(QtWidgets.QWidget):
         x_min = max(0.0, latest_time - self.window_seconds)
         x_max = max(self.window_seconds, latest_time)
         self.plot_widget.setXRange(x_min, x_max, padding=0)
+
+        f660, m660 = self._spectrum_from_timeseries(
+            self.time_660, self.data_660, self.fft_min_samples
+        )
+        f940, m940 = self._spectrum_from_timeseries(
+            self.time_940, self.data_940, self.fft_min_samples
+        )
+        if f660 is not None and m660 is not None:
+            self.spectrum_curve_660.setData(f660, m660)
+        else:
+            self.spectrum_curve_660.clear()
+        if f940 is not None and m940 is not None:
+            self.spectrum_curve_940.setData(f940, m940)
+        else:
+            self.spectrum_curve_940.clear()
 
 
 def main():
