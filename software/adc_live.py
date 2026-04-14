@@ -17,6 +17,7 @@ import numpy as np
 import pyqtgraph as pg
 import serial
 from PyQt5 import QtCore, QtWidgets
+from scipy.signal import butter, filtfilt, sosfiltfilt
 
 from config import (
     ACK_TIMEOUT_SECONDS,
@@ -133,7 +134,7 @@ class MainWindow(QtWidgets.QWidget):
         super().__init__()
         pg.setConfigOption("background", "w")
         pg.setConfigOption("foreground", "k")
-        self.setWindowTitle("Single-Channel ADC Live Mode")
+        self.setWindowTitle("单通道 ADC 实时监视")
 
         # 固定只显示最近 10 秒。
         self.window_seconds = 10.0
@@ -160,10 +161,73 @@ class MainWindow(QtWidgets.QWidget):
         top_layout.addStretch()
         main_layout.addLayout(top_layout)
 
-        self.plot_widget = pg.PlotWidget(title="S1_D1 Live ADC Readings")
+        # 滤波器控制区：None / Lowpass / Bandpass / Threshold
+        filter_layout = QtWidgets.QGridLayout()
+        filter_layout.setHorizontalSpacing(8)
+        filter_layout.setVerticalSpacing(6)
+
+        self.filter_mode_combo = QtWidgets.QComboBox()
+        self.filter_mode_combo.addItems(["None", "Lowpass", "Bandpass", "Threshold"])
+        filter_layout.addWidget(QtWidgets.QLabel("滤波模式"), 0, 0)
+        filter_layout.addWidget(self.filter_mode_combo, 0, 1)
+
+        self.lowpass_cutoff_spin = QtWidgets.QDoubleSpinBox()
+        self.lowpass_cutoff_spin.setRange(0.01, 1000.0)
+        self.lowpass_cutoff_spin.setDecimals(3)
+        self.lowpass_cutoff_spin.setValue(1.0)
+        self.lowpass_cutoff_spin.setSuffix(" Hz")
+        filter_layout.addWidget(QtWidgets.QLabel("低通截止"), 0, 2)
+        filter_layout.addWidget(self.lowpass_cutoff_spin, 0, 3)
+
+        self.band_low_spin = QtWidgets.QDoubleSpinBox()
+        self.band_low_spin.setRange(0.001, 1000.0)
+        self.band_low_spin.setDecimals(3)
+        self.band_low_spin.setValue(0.05)
+        self.band_low_spin.setSuffix(" Hz")
+        filter_layout.addWidget(QtWidgets.QLabel("带通下限"), 0, 4)
+        filter_layout.addWidget(self.band_low_spin, 0, 5)
+
+        self.band_high_spin = QtWidgets.QDoubleSpinBox()
+        self.band_high_spin.setRange(0.001, 1000.0)
+        self.band_high_spin.setDecimals(3)
+        self.band_high_spin.setValue(0.1)
+        self.band_high_spin.setSuffix(" Hz")
+        filter_layout.addWidget(QtWidgets.QLabel("带通上限"), 0, 6)
+        filter_layout.addWidget(self.band_high_spin, 0, 7)
+
+        self.filter_order_spin = QtWidgets.QSpinBox()
+        self.filter_order_spin.setRange(1, 12)
+        self.filter_order_spin.setValue(4)
+        filter_layout.addWidget(QtWidgets.QLabel("阶数"), 0, 8)
+        filter_layout.addWidget(self.filter_order_spin, 0, 9)
+
+        self.th_lower_spin = QtWidgets.QDoubleSpinBox()
+        self.th_lower_spin.setRange(-1e9, 1e9)
+        self.th_lower_spin.setDecimals(1)
+        self.th_lower_spin.setValue(50000.0)
+        filter_layout.addWidget(QtWidgets.QLabel("阈值下限"), 1, 0)
+        filter_layout.addWidget(self.th_lower_spin, 1, 1)
+
+        self.th_upper_spin = QtWidgets.QDoubleSpinBox()
+        self.th_upper_spin.setRange(-1e9, 1e9)
+        self.th_upper_spin.setDecimals(1)
+        self.th_upper_spin.setValue(300000.0)
+        filter_layout.addWidget(QtWidgets.QLabel("阈值上限"), 1, 2)
+        filter_layout.addWidget(self.th_upper_spin, 1, 3)
+
+        self.th_replacement_spin = QtWidgets.QDoubleSpinBox()
+        self.th_replacement_spin.setRange(-1e9, 1e9)
+        self.th_replacement_spin.setDecimals(1)
+        self.th_replacement_spin.setValue(170000.0)
+        filter_layout.addWidget(QtWidgets.QLabel("替换值"), 1, 4)
+        filter_layout.addWidget(self.th_replacement_spin, 1, 5)
+
+        main_layout.addLayout(filter_layout)
+
+        self.plot_widget = pg.PlotWidget(title="S1_D1 ADC 实时波形")
         self.plot_widget.showGrid(x=True, y=True)
-        self.plot_widget.setLabel("bottom", "Time (s)")
-        self.plot_widget.setLabel("left", "ADC Value")
+        self.plot_widget.setLabel("bottom", "时间 (s)")
+        self.plot_widget.setLabel("left", "ADC 数值")
         self.plot_widget.addLegend()
         self.plot_widget.setXRange(0, self.window_seconds, padding=0)
         self.curve_660 = self.plot_widget.plot(pen=pg.mkPen("r", width=2), name="660nm")
@@ -172,10 +236,10 @@ class MainWindow(QtWidgets.QWidget):
 
         # 频域：对当前时间窗内的序列做 rFFT（按各自时间戳估计采样率）
         self.fft_min_samples = 64
-        self.spectrum_widget = pg.PlotWidget(title="ADC Spectrum (FFT magnitude)")
+        self.spectrum_widget = pg.PlotWidget(title="ADC 频谱（FFT 幅值）")
         self.spectrum_widget.showGrid(x=True, y=True)
-        self.spectrum_widget.setLabel("bottom", "Frequency (Hz)")
-        self.spectrum_widget.setLabel("left", "Magnitude")
+        self.spectrum_widget.setLabel("bottom", "频率 (Hz)")
+        self.spectrum_widget.setLabel("left", "幅值")
         self.spectrum_widget.addLegend()
         self.spectrum_curve_660 = self.spectrum_widget.plot(
             pen=pg.mkPen("r", width=2), name="660nm"
@@ -185,7 +249,7 @@ class MainWindow(QtWidgets.QWidget):
         )
         main_layout.addWidget(self.spectrum_widget)
 
-        self.status_label = QtWidgets.QLabel("Waiting for data...")
+        self.status_label = QtWidgets.QLabel("等待数据...")
         main_layout.addWidget(self.status_label)
 
         self.timer = QtCore.QTimer()
@@ -225,6 +289,76 @@ class MainWindow(QtWidgets.QWidget):
                 mag[-1] *= 0.5
         return freq, mag
 
+    @staticmethod
+    def _estimate_fs(times: np.ndarray) -> float | None:
+        if len(times) < 2:
+            return None
+        dt = np.diff(times)
+        if dt.size == 0:
+            return None
+        mean_dt = float(np.mean(dt))
+        if mean_dt <= 0 or not np.isfinite(mean_dt):
+            return None
+        return 1.0 / mean_dt
+
+    def _apply_filter(self, times, values):
+        mode = self.filter_mode_combo.currentText()
+        y = np.asarray(values, dtype=float)
+        if y.size == 0:
+            return y
+        if mode == "None":
+            return y
+
+        if mode == "Threshold":
+            lower = float(self.th_lower_spin.value())
+            upper = float(self.th_upper_spin.value())
+            replacement = float(self.th_replacement_spin.value())
+            if lower > upper:
+                lower, upper = upper, lower
+            return np.where((y < lower) | (y > upper), replacement, y)
+
+        t = np.asarray(times, dtype=float)
+        fs = self._estimate_fs(t)
+        if fs is None:
+            return y
+        nyquist = 0.5 * fs
+        order = int(self.filter_order_spin.value())
+        min_len = max(16, 3 * (order + 1) + 1)
+        if y.size < min_len:
+            return y
+
+        try:
+            if mode == "Lowpass":
+                cutoff = float(self.lowpass_cutoff_spin.value())
+                if cutoff <= 0 or cutoff >= nyquist:
+                    return y
+                b, a = butter(order, cutoff / nyquist, btype="low", analog=False)
+                padlen = min(y.size - 1, 3 * (max(len(a), len(b)) - 1))
+                if padlen <= 0:
+                    return y
+                return filtfilt(b, a, y, padlen=padlen)
+
+            if mode == "Bandpass":
+                lowcut = float(self.band_low_spin.value())
+                highcut = float(self.band_high_spin.value())
+                if lowcut > highcut:
+                    lowcut, highcut = highcut, lowcut
+                if lowcut <= 0 or highcut >= nyquist or lowcut >= highcut:
+                    return y
+                sos = butter(
+                    order,
+                    [lowcut / nyquist, highcut / nyquist],
+                    btype="band",
+                    output="sos",
+                )
+                padlen = min(y.size - 1, 3 * (order + 1))
+                if padlen <= 0:
+                    return y
+                return sosfiltfilt(sos, y, padtype="odd", padlen=padlen)
+        except Exception as exc:
+            print(f"[adc_live] Filter failed ({mode}): {exc}")
+        return y
+
     @QtCore.pyqtSlot(float, int, int)
     def on_new_data(self, elapsed: float, wavelength_code: int, value: int):
         """按波长把点分发到两条曲线各自的缓存里。"""
@@ -242,14 +376,18 @@ class MainWindow(QtWidgets.QWidget):
             wave_label = f"Unknown(0x{wavelength_code:02X})"
             print(f"[adc_live] Unknown wavelength code: 0x{wavelength_code:02X}")
 
-        self.status_label.setText(f"Latest: {wave_label} value={value}")
+        self.status_label.setText(f"最新数据：{wave_label} 数值={value}")
 
     def update_plots(self):
         """定时刷新曲线，并把 X 轴滚动到最近 10 秒窗口。"""
         if self.data_660:
-            self.curve_660.setData(list(self.time_660), list(self.data_660))
+            t660 = list(self.time_660)
+            y660 = self._apply_filter(t660, list(self.data_660))
+            self.curve_660.setData(t660, y660)
         if self.data_940:
-            self.curve_940.setData(list(self.time_940), list(self.data_940))
+            t940 = list(self.time_940)
+            y940 = self._apply_filter(t940, list(self.data_940))
+            self.curve_940.setData(t940, y940)
 
         latest_time = 0.0
         if self.time_660:
@@ -261,11 +399,13 @@ class MainWindow(QtWidgets.QWidget):
         x_max = max(self.window_seconds, latest_time)
         self.plot_widget.setXRange(x_min, x_max, padding=0)
 
+        y660_fft = self._apply_filter(list(self.time_660), list(self.data_660)) if self.data_660 else []
+        y940_fft = self._apply_filter(list(self.time_940), list(self.data_940)) if self.data_940 else []
         f660, m660 = self._spectrum_from_timeseries(
-            self.time_660, self.data_660, self.fft_min_samples
+            self.time_660, y660_fft, self.fft_min_samples
         )
         f940, m940 = self._spectrum_from_timeseries(
-            self.time_940, self.data_940, self.fft_min_samples
+            self.time_940, y940_fft, self.fft_min_samples
         )
         if f660 is not None and m660 is not None:
             self.spectrum_curve_660.setData(f660, m660)
@@ -275,6 +415,15 @@ class MainWindow(QtWidgets.QWidget):
             self.spectrum_curve_940.setData(f940, m940)
         else:
             self.spectrum_curve_940.clear()
+
+        mode_map = {
+            "None": "不滤波",
+            "Lowpass": "低通",
+            "Bandpass": "带通",
+            "Threshold": "阈值",
+        }
+        mode_cn = mode_map.get(self.filter_mode_combo.currentText(), self.filter_mode_combo.currentText())
+        self.status_label.setText(f"滤波模式={mode_cn} | 当前窗口={self.window_seconds:.1f}s")
 
 
 def main():
