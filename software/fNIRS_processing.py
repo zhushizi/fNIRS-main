@@ -33,7 +33,6 @@ from config import (
     DEFAULT_INTENSITY_MA,
     DEFAULT_STREAM_ENABLED,
     RAW_OUTPUT_CSV,
-    SAMPLING_RATE_HZ,
     SERIAL_PORT,
     SOURCE_DETECTOR_DISTANCE_CM,
     TIMEOUT,
@@ -116,14 +115,18 @@ def sliding_window_rms(
     remove_dc: bool = False,
 ) -> pd.DataFrame:
     """
-    按波长切段，并把每一段的样本压成一个 RMS 代表值。
+    按波长切段，并把每一段压成一行 RMS 代表值。
 
-    这样后续在做 660/940 配对时，每一段都代表一个稳定的波长时隙。
+    这样后续在做 660/940 配对时，每个波长块只保留一个物理有效样本，
+    避免把同一块里的重复 RMS 再展开成多行。
     """
-    df_rms = df.copy()
+    if df.empty:
+        return df.copy()
+
     wavelength_reference = df[wavelength_col].values
     change_points = np.where(np.diff(wavelength_reference) != 0)[0] + 1
     segments = np.split(np.arange(len(df)), change_points)
+    rows = []
 
     for segment in segments:
         if len(segment) == 0:
@@ -133,9 +136,13 @@ def sliding_window_rms(
         if remove_dc:
             segment_data = segment_data - segment_data.mean()
         rms_val = float(np.sqrt(np.mean(np.square(segment_data))))
-        df_rms.loc[segment_idx, signal_col] = rms_val
+        rep_row = df.loc[segment_idx[0]].copy()
+        rep_row[signal_col] = rms_val
+        if "Time (s)" in df.columns:
+            rep_row["Time (s)"] = float(df.loc[segment_idx, "Time (s)"].mean())
+        rows.append(rep_row)
 
-    return df_rms
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def _resolve_pair(first_row: pd.Series, second_row: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -156,35 +163,28 @@ def interleave_mode_blocks(
     mode_col: str = "Wavelength",
 ) -> pd.DataFrame:
     """
-    将按波长切出来的连续块重新组织成“每行一对 660/940”。
+    将按波长块压缩后的数据重新组织成“每行一对 660/940”。
 
     输出后每一行都可以直接喂给单通道 MBLL。
     """
-    working = df.copy()
-    working["group"] = (working[mode_col] != working[mode_col].shift()).cumsum()
-
-    blocks = []
-    for _, block_df in working.groupby("group"):
-        blocks.append(block_df.drop(columns="group").reset_index(drop=True))
-
+    working = df.reset_index(drop=True)
     rows = []
     i = 0
-    while i < len(blocks) - 1:
-        block1 = blocks[i]
-        block2 = blocks[i + 1]
-        # 截断对齐：只取两块都存在的样本，避免用末值补齐导致重复行/重复时间。
-        pair_len = min(len(block1), len(block2))
-        for j in range(pair_len):
-            row1 = block1.loc[j]
-            row2 = block2.loc[j]
-            row_660, row_940 = _resolve_pair(row1, row2)
-            rows.append(
-                {
-                    "Time (s)": float(row_660["Time (s)"]),
-                    f"{CHANNEL_NAME}_660": float(row_660[signal_col]),
-                    f"{CHANNEL_NAME}_940": float(row_940[signal_col]),
-                }
-            )
+    while i < len(working) - 1:
+        row1 = working.loc[i]
+        row2 = working.loc[i + 1]
+        if int(row1[mode_col]) == int(row2[mode_col]):
+            i += 1
+            continue
+        row_660, row_940 = _resolve_pair(row1, row2)
+        pair_time = float(np.mean([row1["Time (s)"], row2["Time (s)"]]))
+        rows.append(
+            {
+                "Time (s)": pair_time,
+                f"{CHANNEL_NAME}_660": float(row_660[signal_col]),
+                f"{CHANNEL_NAME}_940": float(row_940[signal_col]),
+            }
+        )
         i += 2
 
     return pd.DataFrame(rows)
@@ -445,8 +445,11 @@ def run_pipeline() -> None:
         print("No 660/940 block pairs were formed; skipping MBLL.")
         return
 
-    # 重建等间隔时间戳，避免采集抖动影响后续基于 fs 的滤波。
-    increment = 1.0 / SAMPLING_RATE_HZ if SAMPLING_RATE_HZ > 0 else 0.001
+    # 按配对后的真实平均间隔重建等间隔时间戳，避免采集抖动影响后续基于 fs 的滤波。
+    pair_times = final_df["Time (s)"].to_numpy(dtype=float)
+    pair_dt = np.diff(pair_times)
+    valid_pair_dt = pair_dt[np.isfinite(pair_dt) & (pair_dt > 0)]
+    increment = float(np.mean(valid_pair_dt)) if valid_pair_dt.size else 0.001
     if "Time (s)" in final_df.columns:
         final_df = final_df.drop(columns=["Time (s)"])
     final_df.insert(0, "Time (s)", [i * increment for i in range(len(final_df))])
