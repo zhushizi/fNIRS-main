@@ -123,10 +123,10 @@ def sliding_window_rms(
     if df.empty:
         return df.copy()
 
-    wavelength_reference = df[wavelength_col].values
-    change_points = np.where(np.diff(wavelength_reference) != 0)[0] + 1
-    segments = np.split(np.arange(len(df)), change_points)
-    rows = []
+    wavelength_reference = df[wavelength_col].values # 波长编号序列
+    change_points = np.where(np.diff(wavelength_reference) != 0)[0] + 1 # 找到波长变化点
+    segments = np.split(np.arange(len(df)), change_points) # 按波长变化点分割数据
+    rows = [] # 存储每一段数据的 RMS 代表值
 
     for segment in segments:
         if len(segment) == 0:
@@ -281,6 +281,7 @@ def process_csv_dataset(
 
     dt = np.mean(np.diff(times))
     fs = 1.0 / dt if dt > 0 else 1.0
+    # 带通滤波
     delta_od_filt = smart_bandpass(delta_od, fs, lowcut=bp_low, highcut=bp_high, order=bp_order)
 
     delta_c, new_ch_names, new_ch_types = nsp.mbll(
@@ -295,6 +296,7 @@ def process_csv_dataset(
     # CBSI 用于进一步抑制生理伪差，改善 HbO/HbR 的相关性。
     delta_c_corr, corr_ch_names, corr_ch_types = nproc.cbsi(delta_c, new_ch_names, new_ch_types)
 
+    # 写入文件
     processed_headers = [f"{name}_{ctype}" for name, ctype in zip(corr_ch_names, corr_ch_types)]
     header_out = ["Time"] + processed_headers
 

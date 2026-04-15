@@ -17,7 +17,7 @@ import numpy as np
 import pyqtgraph as pg
 import serial
 from PyQt5 import QtCore, QtWidgets
-from scipy.signal import butter, filtfilt, sosfiltfilt
+from scipy.signal import butter, lfilter, sosfilt
 
 from config import (
     ACK_TIMEOUT_SECONDS,
@@ -333,10 +333,7 @@ class MainWindow(QtWidgets.QWidget):
                 if cutoff <= 0 or cutoff >= nyquist:
                     return y
                 b, a = butter(order, cutoff / nyquist, btype="low", analog=False)
-                padlen = min(y.size - 1, 3 * (max(len(a), len(b)) - 1))
-                if padlen <= 0:
-                    return y
-                return filtfilt(b, a, y, padlen=padlen)
+                return lfilter(b, a, y)
 
             if mode == "Bandpass":
                 lowcut = float(self.band_low_spin.value())
@@ -351,10 +348,7 @@ class MainWindow(QtWidgets.QWidget):
                     btype="band",
                     output="sos",
                 )
-                padlen = min(y.size - 1, 3 * (order + 1))
-                if padlen <= 0:
-                    return y
-                return sosfiltfilt(sos, y, padtype="odd", padlen=padlen)
+                return sosfilt(sos, y)
         except Exception as exc:
             print(f"[adc_live] Filter failed ({mode}): {exc}")
         return y
