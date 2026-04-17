@@ -251,8 +251,8 @@ def process_csv_dataset(
     age: int = 22,
     source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
     molar_ext_coeff_table: str = "wray",
-    bp_low: float = 0.05,
-    bp_high: float = 0.1,
+    bp_low: float = 0.2,
+    bp_high: float = 0.9,
     bp_order: int = 4,
 ) -> None:
     """从配对后的 CSV 计算最终的 HbO/HbR。"""
@@ -330,14 +330,14 @@ def capture_data(
     2. 解析波长/传感器/采样值
     3. 记录到 all_groups.csv
     """
-    ser = open_serial()
-    reader = FrameReader(ser)
-    stop_event = threading.Event()
-    listener = _start_enter_listener(stop_event) if stop_on_enter else None
+    ser = open_serial() # 打开串口
+    reader = FrameReader(ser) # 创建帧读取器
+    stop_event = threading.Event() 
+    listener = _start_enter_listener(stop_event) if stop_on_enter else None # 创建监听器
 
     try:
-        ser.reset_input_buffer()
-        started = send_frame_with_ack(
+        ser.reset_input_buffer() # 清空串口接收缓冲区里的残留数据
+        started = send_frame_with_ack( # 发送启动命令
             ser,
             reader,
             build_command_frame(DEFAULT_STREAM_ENABLED, intensity_ma),
@@ -429,8 +429,9 @@ def run_pipeline() -> None:
         print("No enough non-OFF samples after filtering; skipping processing.")
         return
 
-    dt = df["Time (s)"].diff().mean()
+    dt = df["Time (s)"].diff().mean() # 计算时间戳的差值的平均值
     fs = 1.0 / dt if pd.notna(dt) and dt > 0 else 1.0 # 计算采样率
+    print(f"采样率: {fs} Hz")
 
     # # 阈值截断
     # df = threshold_filter(df)

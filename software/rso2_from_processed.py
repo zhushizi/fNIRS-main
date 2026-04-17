@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_INPUT = Path("software/result_table/2026-04-15_08-49-59/processed_output.csv")
+DEFAULT_INPUT = Path("software/result_table/2026-04-16_15-17-15/processed_output.csv")
 
 
 def _pick_column(columns: list[str], keyword: str) -> str:
@@ -22,8 +22,8 @@ def _pick_column(columns: list[str], keyword: str) -> str:
 def compute_rso2_table(
     input_csv: Path,
     output_csv: Path | None = None,
-    baseline_start_s: float = 0.0,
-    baseline_end_s: float = 15.0,
+    baseline_start_s: float = 120.0,
+    baseline_end_s: float = 150.0,
     baseline_hbt_uM: float = 80.0,
     baseline_rso2_pct: float = 65.0,
 ) -> Path:
@@ -119,8 +119,8 @@ def main() -> None:
         default=None,
         help="输出 rSO2 CSV 路径，默认与输入同目录下的 rso2_output.csv",
     )
-    parser.add_argument("--baseline-start", type=float, default=0.0, help="基线起始时间（秒）")
-    parser.add_argument("--baseline-end", type=float, default=15.0, help="基线结束时间（秒）")
+    parser.add_argument("--baseline-start", type=float, default=120.0, help="基线起始时间（秒）")
+    parser.add_argument("--baseline-end", type=float, default=150.0, help="基线结束时间（秒）")
     parser.add_argument("--baseline-hbt", type=float, default=80.0, help="固定基线 HbT（uM）")
     parser.add_argument("--baseline-rso2", type=float, default=65.0, help="固定基线 rSO2（%%）")
     args = parser.parse_args()

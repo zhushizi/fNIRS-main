@@ -2,7 +2,7 @@
 单通道实时 HbO / HbR 曲线查看器。
 
 从串口持续读取 660/940 光强，用前几秒建立基线，再对每个 660–940 对做 OD 与 MBLL，
-将得到的 HbO、HbR 实时画在坐标图上。不做带通和 CBSI，曲线会比离线 processed_output 更抖。
+将得到的 HbO、HbR 实时画在坐标图上。带通使用 0.05-0.2 Hz；不做 CBSI。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import nirsimple.preprocessing as nsp
 import pyqtgraph as pg
 import serial
 from PyQt5 import QtCore, QtWidgets
+from scipy.signal import butter, resample_poly, sosfiltfilt
 
 from config import (
     ACK_TIMEOUT_SECONDS,
@@ -38,6 +39,56 @@ UPDATE_INTERVAL_S = 0.1
 # 绘图时间窗（秒）
 WINDOW_SECONDS = 60.0
 MBLL_AGE = 27
+BP_LOW_HZ = 0.05
+BP_HIGH_HZ = 0.5
+BP_ORDER = 4
+BP_TARGET_FS = 20.0
+
+
+def butter_bandpass_sos(lowcut: float, highcut: float, fs: float, order: int = 4):
+    """构造带通滤波器的 SOS 形式。"""
+    nyq = 0.5 * fs
+    if nyq <= 0 or lowcut >= highcut or highcut >= nyq:
+        return None
+    return butter(order, [lowcut / nyq, highcut / nyq], btype="band", output="sos")
+
+
+def smart_bandpass(
+    data: np.ndarray,
+    fs: float,
+    lowcut: float = BP_LOW_HZ,
+    highcut: float = BP_HIGH_HZ,
+    order: int = BP_ORDER,
+    target_fs: float = BP_TARGET_FS,
+) -> np.ndarray:
+    """
+    对 OD 数据做稳健带通。
+
+    当采样率过高时，先降采样再滤波，最后升采样回来，
+    可以减少数值不稳定和不必要的计算量。
+    """
+    if data.shape[1] < max(16, 3 * (order + 1) + 1):
+        return data
+
+    if fs > target_fs + 1:
+        decim = int(round(fs / target_fs))
+        fs_ds = fs / decim
+        data_ds = resample_poly(data, up=1, down=decim, axis=1)
+    else:
+        decim, fs_ds, data_ds = 1, fs, data
+
+    sos = butter_bandpass_sos(lowcut, highcut, fs_ds, order)
+    if sos is None or data_ds.shape[1] < max(16, 3 * (order + 1) + 1):
+        return data
+
+    padlen = min(data_ds.shape[1] - 1, 3 * (order + 1))
+    if padlen <= 0:
+        return data
+
+    data_bp = sosfiltfilt(sos, data_ds, axis=1, padtype="odd", padlen=padlen)
+    if decim > 1:
+        data_bp = resample_poly(data_bp, up=decim, down=1, axis=1)
+    return data_bp
 
 
 def open_serial() -> serial.Serial:
@@ -132,6 +183,9 @@ class MainWindow(QtWidgets.QWidget):
         self.time_hbo = deque(maxlen=3000)
         self.hbo_vals = deque(maxlen=3000)
         self.hbr_vals = deque(maxlen=3000)
+        self.time_od = deque(maxlen=3000)
+        self.od_660_vals = deque(maxlen=3000)
+        self.od_940_vals = deque(maxlen=3000)
 
         layout = QtWidgets.QVBoxLayout(self)
         self.plot = pg.PlotWidget(title="HbO / HbR 实时")
@@ -224,7 +278,27 @@ class MainWindow(QtWidgets.QWidget):
             i_940 = max(i_940, 1.0)
             delta_od_660 = -np.log10(i_660 / self.ref_660)
             delta_od_940 = -np.log10(i_940 / self.ref_940)
-            delta_od = np.array([[delta_od_660], [delta_od_940]], dtype=float)
+            self.time_od.append(t)
+            self.od_660_vals.append(delta_od_660)
+            self.od_940_vals.append(delta_od_940)
+
+            delta_od_hist = np.vstack(
+                [
+                    np.asarray(self.od_660_vals, dtype=float),
+                    np.asarray(self.od_940_vals, dtype=float),
+                ]
+            )
+            od_times = np.asarray(self.time_od, dtype=float)
+            dt = np.median(np.diff(od_times)) if od_times.size >= 2 else np.nan
+            fs = 1.0 / dt if np.isfinite(dt) and dt > 0 else 1.0
+            delta_od_filt = smart_bandpass(
+                delta_od_hist,
+                fs,
+                lowcut=BP_LOW_HZ,
+                highcut=BP_HIGH_HZ,
+                order=BP_ORDER,
+            )
+            delta_od = delta_od_filt[:, -1:].astype(float, copy=False)
             ch_names, ch_wls, ch_dpfs, ch_distances = _channel_info()
             try:
                 delta_c, names, types = nsp.mbll(
