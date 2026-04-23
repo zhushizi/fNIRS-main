@@ -230,6 +230,69 @@ def plot_array(delta_c_corr,corr_ch_types):
     plt.show()
     plt.close()
 
+
+def plot_blood_oxygen_content(
+    delta_c: np.ndarray,
+    ch_types: list[str],
+    times: np.ndarray,
+    baseline_start_s: float = 30.0,
+    baseline_end_s: float = 60.0,
+    baseline_hbt_uM: float = 80.0,
+    baseline_rso2_pct: float = 65.0,
+):
+    """参考 rso2_from_processed.py，用固定基线估算并绘制 rSO2。"""
+    lowered = [str(t).lower() for t in ch_types]
+    hbo_idx = next((i for i, t in enumerate(lowered) if "hbo" in t), None)
+    hbr_idx = next((i for i, t in enumerate(lowered) if "hbr" in t), None)
+    if hbo_idx is None or hbr_idx is None:
+        print(f"未找到 HbO/HbR 通道，跳过 rSO2 绘图。当前通道: {ch_types}")
+        return
+
+    delta_hbo = np.asarray(delta_c[hbo_idx], dtype=float)
+    delta_hbr = np.asarray(delta_c[hbr_idx], dtype=float)
+    times = np.asarray(times, dtype=float)
+    n = min(len(times), len(delta_hbo), len(delta_hbr))
+    if n == 0:
+        print("rSO2 绘图数据为空，跳过。")
+        return
+    times = times[:n]
+    delta_hbo = delta_hbo[:n]
+    delta_hbr = delta_hbr[:n]
+
+    baseline_mask = (times >= baseline_start_s) & (times <= baseline_end_s)
+    if not np.any(baseline_mask):
+        print(
+            f"在 {baseline_start_s:.1f}s~{baseline_end_s:.1f}s 内没有基线样本，"
+            "跳过 rSO2 绘图。"
+        )
+        return
+
+    baseline_hbt_M = baseline_hbt_uM * 1e-6
+    baseline_hbo_abs_M = baseline_hbt_M * (baseline_rso2_pct / 100.0)
+    baseline_hbr_abs_M = baseline_hbt_M - baseline_hbo_abs_M
+
+    baseline_delta_hbo_mean = float(np.mean(delta_hbo[baseline_mask]))
+    baseline_delta_hbr_mean = float(np.mean(delta_hbr[baseline_mask]))
+    hbo_abs_M = baseline_hbo_abs_M + (delta_hbo - baseline_delta_hbo_mean)
+    hbr_abs_M = baseline_hbr_abs_M + (delta_hbr - baseline_delta_hbr_mean)
+    hbo_abs_M = np.maximum(hbo_abs_M, 0.0)
+    hbr_abs_M = np.maximum(hbr_abs_M, 0.0)
+    hbt_abs_M = hbo_abs_M + hbr_abs_M
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rso2_pct = np.where(hbt_abs_M > 0, 100.0 * hbo_abs_M / hbt_abs_M, np.nan)
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(times, rso2_pct, linewidth=1.2, label="rSO2")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Blood Oxygen Content (%)")
+    plt.title("rSO2 (Estimated from HbO/HbR)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
 # 兼容“直接运行脚本”场景，确保能导入项目根目录下的 software 包。
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -238,7 +301,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from config import WAVELENGTH_OFF_CODE, CHANNEL_NAME
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-raw_csv_path = SCRIPT_DIR / 'result_table' / '2026-04-22_16-47-14' / 'all_groups.csv'
+raw_csv_path = SCRIPT_DIR / 'result_table' / '2026-04-23_19-57-29' / 'all_groups.csv'
 
 df = pd.read_csv(raw_csv_path)
 
@@ -304,4 +367,9 @@ delta_c, new_ch_names, new_ch_types = nsp.mbll(
 # CBSI 用于进一步抑制生理伪差，改善 HbO/HbR 的相关性。
 # delta_c_corr, corr_ch_names, corr_ch_types = nproc.cbsi(delta_c, new_ch_names, new_ch_types)
 plot_array(delta_c,new_ch_types)
+plot_blood_oxygen_content(
+    delta_c=delta_c,
+    ch_types=new_ch_types,
+    times=df_w1["Time (s)"].to_numpy(dtype=float),
+)
 

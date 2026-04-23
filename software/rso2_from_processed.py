@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_INPUT = Path("software/result_table/2026-04-16_15-17-15/processed_output.csv")
+DEFAULT_INPUT = Path("software/result_table/2026-04-22_16-47-14/processed_output.csv")
 
 
 def _pick_column(columns: list[str], keyword: str) -> str:
