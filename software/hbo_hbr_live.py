@@ -1,8 +1,9 @@
 """
 单通道实时 HbO / HbR 曲线查看器。
 
-从串口持续读取 660/940 光强，用前几秒建立基线，再对每个 660–940 对做 OD 与 MBLL，
-将得到的 HbO、HbR 实时画在坐标图上。带通使用 0.05-0.2 Hz；不做 CBSI。
+从串口持续读取双波长光强（协议码 0x01 / 0x02），用前几秒建立基线，再对每个波长对做 OD 与 MBLL，
+将得到的 HbO、HbR 实时画在坐标图上。MBLL 波长与 data_analysis.py 一致：860 nm + 660 nm；
+OD 矩阵行顺序与 data_analysis 相同（Wavelength=1 在上，Wavelength=2 在下）。带通 0.05–0.5 Hz；不做 CBSI。
 """
 
 from __future__ import annotations
@@ -24,6 +25,9 @@ from config import (
     CHANNEL_NAME,
     DEFAULT_INTENSITY_MA,
     MAX_RETRIES,
+    MBLL_DEFAULT_AGE,
+    MBLL_WAVELENGTH_WL1_NM,
+    MBLL_WAVELENGTH_WL2_NM,
     SERIAL_PORT,
     SOURCE_DETECTOR_DISTANCE_CM,
     TIMEOUT,
@@ -38,7 +42,6 @@ BASELINE_SECONDS = 5.0
 UPDATE_INTERVAL_S = 0.1
 # 绘图时间窗（秒）
 WINDOW_SECONDS = 60.0
-MBLL_AGE = 27
 BP_LOW_HZ = 0.05
 BP_HIGH_HZ = 0.5
 BP_ORDER = 4
@@ -96,10 +99,13 @@ def open_serial() -> serial.Serial:
 
 
 def _channel_info():
-    """单通道双波长的通道名、波长、DPF、源探距离，与 fNIRS_processing 一致。"""
+    """单通道双波长的通道名、波长、DPF、源探距离，与 data_analysis._channel_info 一致。"""
     ch_names = [CHANNEL_NAME, CHANNEL_NAME]
-    ch_wls = [660.0, 940.0]
-    ch_dpfs = [nsp.get_dpf(660.0, MBLL_AGE), nsp.get_dpf(940.0, MBLL_AGE)]
+    ch_wls = [MBLL_WAVELENGTH_WL1_NM, MBLL_WAVELENGTH_WL2_NM]
+    ch_dpfs = [
+        nsp.get_dpf(MBLL_WAVELENGTH_WL1_NM, MBLL_DEFAULT_AGE),
+        nsp.get_dpf(MBLL_WAVELENGTH_WL2_NM, MBLL_DEFAULT_AGE),
+    ]
     ch_distances = [SOURCE_DETECTOR_DISTANCE_CM, SOURCE_DETECTOR_DISTANCE_CM]
     return ch_names, ch_wls, ch_dpfs, ch_distances
 
@@ -153,7 +159,7 @@ class SerialReaderThread(QtCore.QThread):
 
 
 class MainWindow(QtWidgets.QWidget):
-    """实时 HbO / HbR 坐标图。前几秒仅收数据建基线，之后每收到新 660–940 对就更新一条 MBLL 点。"""
+    """实时 HbO / HbR 坐标图。前几秒仅收数据建基线，之后每收到新双波长对就更新一条 MBLL 点。"""
     def __init__(self):
         super().__init__()
         pg.setConfigOption("background", "w")
@@ -161,31 +167,33 @@ class MainWindow(QtWidgets.QWidget):
         self.setWindowTitle("S1_D1 HbO / HbR 实时")
 
         self.start_time = time.time()
+        # 协议码 0x02=660 nm；0x01 在 MBLL 中按 data_analysis 使用 860 nm
         self.ref_660: float | None = None
-        self.ref_940: float | None = None
+        self.ref_wl1: float | None = None
         self.baseline_660: list[float] = []
-        self.baseline_940: list[float] = []
+        self.baseline_wl1: list[float] = []
         self.last_mbll_time = 0.0
         self.current_phase_wl: int | None = None
         self.current_phase_vals: list[float] = []
         self.current_phase_times: list[float] = []
         self.latest_rms_660: float | None = None
-        self.latest_rms_940: float | None = None
+        self.latest_rms_wl1: float | None = None
         self.latest_rms_time_660: float | None = None
-        self.latest_rms_time_940: float | None = None
+        self.latest_rms_time_wl1: float | None = None
         self.last_pair_time = -1.0
 
         self.time_660 = deque(maxlen=5000)
         self.data_660 = deque(maxlen=5000)
-        self.time_940 = deque(maxlen=5000)
-        self.data_940 = deque(maxlen=5000)
+        self.time_wl1 = deque(maxlen=5000)
+        self.data_wl1 = deque(maxlen=5000)
 
         self.time_hbo = deque(maxlen=3000)
         self.hbo_vals = deque(maxlen=3000)
         self.hbr_vals = deque(maxlen=3000)
         self.time_od = deque(maxlen=3000)
+        # 行顺序与 data_analysis samples vstack 一致：wl1(0x01) 在上，660(0x02) 在下
+        self.od_wl1_vals = deque(maxlen=3000)
         self.od_660_vals = deque(maxlen=3000)
-        self.od_940_vals = deque(maxlen=3000)
 
         layout = QtWidgets.QVBoxLayout(self)
         self.plot = pg.PlotWidget(title="HbO / HbR 实时")
@@ -239,53 +247,54 @@ class MainWindow(QtWidgets.QWidget):
             if self.ref_660 is None and phase_time <= BASELINE_SECONDS:
                 self.baseline_660.append(phase_rms)
         elif self.current_phase_wl == WAVELENGTH_940_CODE:
-            self.latest_rms_940 = phase_rms
-            self.latest_rms_time_940 = phase_time
-            self.time_940.append(phase_time)
-            self.data_940.append(phase_rms)
-            if self.ref_940 is None and phase_time <= BASELINE_SECONDS:
-                self.baseline_940.append(phase_rms)
+            self.latest_rms_wl1 = phase_rms
+            self.latest_rms_time_wl1 = phase_time
+            self.time_wl1.append(phase_time)
+            self.data_wl1.append(phase_rms)
+            if self.ref_wl1 is None and phase_time <= BASELINE_SECONDS:
+                self.baseline_wl1.append(phase_rms)
 
         # 用串口时间戳判断：满 BASELINE_SECONDS 且有两路数据则固定基线
         if (
             self.ref_660 is None
-            and self.ref_940 is None
+            and self.ref_wl1 is None
             and phase_time >= BASELINE_SECONDS
             and self.baseline_660
-            and self.baseline_940
+            and self.baseline_wl1
         ):
             self.ref_660 = float(np.mean(self.baseline_660))
-            self.ref_940 = float(np.mean(self.baseline_940))
-            self.status.setText(f"基线就绪 ref_660={self.ref_660:.0f} ref_940={self.ref_940:.0f}")
+            self.ref_wl1 = float(np.mean(self.baseline_wl1))
+            self.status.setText(
+                f"基线就绪 ref_660={self.ref_660:.0f} "
+                f"ref_wl1({int(MBLL_WAVELENGTH_WL1_NM)}nm)={self.ref_wl1:.0f}"
+            )
 
         if (
             self.ref_660 is not None
-            and self.ref_940 is not None
+            and self.ref_wl1 is not None
             and self.latest_rms_660 is not None
-            and self.latest_rms_940 is not None
+            and self.latest_rms_wl1 is not None
             and self.latest_rms_time_660 is not None
-            and self.latest_rms_time_940 is not None
+            and self.latest_rms_time_wl1 is not None
         ):
-            t = (self.latest_rms_time_660 + self.latest_rms_time_940) * 0.5
+            t = (self.latest_rms_time_660 + self.latest_rms_time_wl1) * 0.5
             if t <= self.last_pair_time:
                 return
             if (t - self.last_mbll_time) < UPDATE_INTERVAL_S:
                 return
 
-            i_660 = self.latest_rms_660
-            i_940 = self.latest_rms_940
-            i_660 = max(i_660, 1.0)
-            i_940 = max(i_940, 1.0)
+            i_660 = max(self.latest_rms_660, 1.0)
+            i_wl1 = max(self.latest_rms_wl1, 1.0)
             delta_od_660 = -np.log10(i_660 / self.ref_660)
-            delta_od_940 = -np.log10(i_940 / self.ref_940)
+            delta_od_wl1 = -np.log10(i_wl1 / self.ref_wl1)
             self.time_od.append(t)
+            self.od_wl1_vals.append(delta_od_wl1)
             self.od_660_vals.append(delta_od_660)
-            self.od_940_vals.append(delta_od_940)
 
             delta_od_hist = np.vstack(
                 [
+                    np.asarray(self.od_wl1_vals, dtype=float),
                     np.asarray(self.od_660_vals, dtype=float),
-                    np.asarray(self.od_940_vals, dtype=float),
                 ]
             )
             od_times = np.asarray(self.time_od, dtype=float)

@@ -8,6 +8,14 @@ import nirsimple.preprocessing as nsp
 import nirsimple.processing as nproc
 from scipy.signal import butter, filtfilt, resample_poly, sosfiltfilt
 
+from config import (
+    CHANNEL_NAME,
+    MBLL_DEFAULT_AGE,
+    MBLL_WAVELENGTH_WL1_NM,
+    MBLL_WAVELENGTH_WL2_NM,
+    WAVELENGTH_OFF_CODE,
+)
+
 def plot_curves(df: pd.DataFrame, title_suffix: str = ""):
     # 按 Wavelength 分组：1 和 2 分别组成数组。
     df_w1 = df[df["Wavelength"] == 1].reset_index(drop=True)
@@ -35,8 +43,16 @@ def plot_curves(df: pd.DataFrame, title_suffix: str = ""):
 
         # --- 子图1：时域波形 ---
         ax1 = axes[0]
-        ax1.plot(wavelength_1_array, label=f"Wavelength=1 (860nm, fs={fs_w1:.1f}Hz)", linewidth=1.0)
-        ax1.plot(wavelength_2_array, label=f"Wavelength=2 (660nm, fs={fs_w2:.1f}Hz)", linewidth=1.0)
+        ax1.plot(
+            wavelength_1_array,
+            label=f"Wavelength=1 ({int(MBLL_WAVELENGTH_WL1_NM)}nm MBLL, fs={fs_w1:.1f}Hz)",
+            linewidth=1.0,
+        )
+        ax1.plot(
+            wavelength_2_array,
+            label=f"Wavelength=2 ({int(MBLL_WAVELENGTH_WL2_NM)}nm, fs={fs_w2:.1f}Hz)",
+            linewidth=1.0,
+        )
         ax1.set_xlabel("Sample Index")
         ax1.set_ylabel("S1_D1")
         # ax1.set_ylim(0, 20e6)
@@ -61,8 +77,8 @@ def plot_curves(df: pd.DataFrame, title_suffix: str = ""):
                 amp1[1:-1] *= 2
                 amp2[1:-1] *= 2
 
-            ax2.plot(f1, amp1, label=f"Wavelength=1 (860nm)", linewidth=1.0)
-            ax2.plot(f2, amp2, label=f"Wavelength=2 (660nm)", linewidth=1.0)
+            ax2.plot(f1, amp1, label=f"Wavelength=1 ({int(MBLL_WAVELENGTH_WL1_NM)}nm)", linewidth=1.0)
+            ax2.plot(f2, amp2, label=f"Wavelength=2 ({int(MBLL_WAVELENGTH_WL2_NM)}nm)", linewidth=1.0)
             ax2.set_xlabel("Frequency (Hz)")
             ax2.set_ylabel("Amplitude")
             ax2.set_title(f"S1_D1 FFT Spectrum{suffix}")
@@ -162,10 +178,13 @@ def sliding_window_rms(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(result_rows, columns=["Time (s)", "SensorId", "S1_D1", "Wavelength"])
 
 def _channel_info():
-    """单通道双波长的通道名、波长、DPF、源探距离，与 fNIRS_processing 一致。"""
+    """单通道双波长的通道名、波长、DPF、源探距离（见 config.MBLL_WAVELENGTH_*）。"""
     ch_names = [CHANNEL_NAME, CHANNEL_NAME]
-    ch_wls = [860.0,660.0 ]
-    ch_dpfs = [nsp.get_dpf(860.0, 27), nsp.get_dpf(660.0, 27)]
+    ch_wls = [MBLL_WAVELENGTH_WL1_NM, MBLL_WAVELENGTH_WL2_NM]
+    ch_dpfs = [
+        nsp.get_dpf(MBLL_WAVELENGTH_WL1_NM, MBLL_DEFAULT_AGE),
+        nsp.get_dpf(MBLL_WAVELENGTH_WL2_NM, MBLL_DEFAULT_AGE),
+    ]
     ch_distances = [3.0, 3.0]
     return ch_names, ch_wls, ch_dpfs, ch_distances
 
@@ -297,8 +316,6 @@ def plot_blood_oxygen_content(
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from config import WAVELENGTH_OFF_CODE, CHANNEL_NAME
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 raw_csv_path = SCRIPT_DIR / 'result_table' / '2026-04-23_19-57-29' / 'all_groups.csv'

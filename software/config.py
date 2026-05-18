@@ -56,6 +56,12 @@ CODE_BY_WAVELENGTH = {
     940.0: WAVELENGTH_940_CODE,
 }
 
+# MBLL 反演波长（与 data_analysis.py 一致）。
+# CSV/协议 Wavelength=1（0x01）→ 第一行光强；Wavelength=2（0x02）→ 第二行光强。
+MBLL_WAVELENGTH_WL1_NM = 860.0
+MBLL_WAVELENGTH_WL2_NM = 660.0
+MBLL_DEFAULT_AGE = 27
+
 # 当前只有一个传感器模块，因此编号固定为 0x00。
 # 后续如果扩展到多传感器，可从这里统一调整。
 DEFAULT_SENSOR_ID = 0x00

@@ -5,8 +5,8 @@
 1. 通过 26B 协议采集原始单通道数据
 2. 写入 all_groups.csv
 3. 对单通道信号做阈值/低通/RMS 预处理
-4. 按 660/940 波长配对
-5. 计算 OD -> MBLL -> CBSI
+4. 按协议双波长（0x01/0x02）配对，列名仍为 _940/_660
+5. 计算 OD -> MBLL（860/660 nm）-> CBSI
 6. 输出 processed_output.csv
 """
 
@@ -32,6 +32,9 @@ from config import (
     CHANNEL_NAME,
     DEFAULT_INTENSITY_MA,
     DEFAULT_STREAM_ENABLED,
+    MBLL_DEFAULT_AGE,
+    MBLL_WAVELENGTH_WL1_NM,
+    MBLL_WAVELENGTH_WL2_NM,
     RAW_OUTPUT_CSV,
     SERIAL_PORT,
     SOURCE_DETECTOR_DISTANCE_CM,
@@ -117,7 +120,7 @@ def sliding_window_rms(
     """
     按波长切段，并把每一段压成一行 RMS 代表值。
 
-    这样后续在做 660/940 配对时，每个波长块只保留一个物理有效样本，
+    这样后续在做双波长配对时，每个波长块只保留一个物理有效样本，
     避免把同一块里的重复 RMS 再展开成多行。
     """
     if df.empty:
@@ -163,9 +166,9 @@ def interleave_mode_blocks(
     mode_col: str = "Wavelength",
 ) -> pd.DataFrame:
     """
-    将按波长块压缩后的数据重新组织成“每行一对 660/940”。
+    将按波长块压缩后的数据重新组织成“每行一对 0x01/0x02”（列名 _940/_660）。
 
-    输出后每一行都可以直接喂给单通道 MBLL。
+    输出后每一行按 data_analysis 顺序喂给 MBLL：第 0 行 _940→860 nm，第 1 行 _660→660 nm。
     """
     working = df.reset_index(drop=True)
     rows = []
@@ -236,11 +239,17 @@ def smart_bandpass(
     return data_bp
 
 
-def build_channel_info(age: int, source_detector_distance_cm: float):
-    """构造单通道 MBLL 所需的通道名、波长、DPF 与源探距离。"""
+def build_channel_info(
+    age: int = MBLL_DEFAULT_AGE,
+    source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
+):
+    """构造单通道 MBLL 所需的通道名、波长、DPF 与源探距离（与 data_analysis 一致）。"""
     channel_names = [CHANNEL_NAME, CHANNEL_NAME]
-    ch_wls = [660.0, 940.0]
-    ch_dpfs = [nsp.get_dpf(660.0, age), nsp.get_dpf(940.0, age)]
+    ch_wls = [MBLL_WAVELENGTH_WL1_NM, MBLL_WAVELENGTH_WL2_NM]
+    ch_dpfs = [
+        nsp.get_dpf(MBLL_WAVELENGTH_WL1_NM, age),
+        nsp.get_dpf(MBLL_WAVELENGTH_WL2_NM, age),
+    ]
     ch_distances = [source_detector_distance_cm, source_detector_distance_cm]
     return channel_names, ch_wls, ch_dpfs, ch_distances
 
@@ -248,7 +257,7 @@ def build_channel_info(age: int, source_detector_distance_cm: float):
 def process_csv_dataset(
     input_csv: str,
     output_csv: str,
-    age: int = 22,
+    age: int = MBLL_DEFAULT_AGE,
     source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
     molar_ext_coeff_table: str = "wray",
     bp_low: float = 0.2,
@@ -264,14 +273,14 @@ def process_csv_dataset(
 
     times = df["Time (s)"].to_numpy(dtype=float)
     if len(times) < 2:
-        print("Need at least one 660/940 pair to run MBLL.")
+        print("Need at least one dual-wavelength pair to run MBLL.")
         return
 
-    # 两行波长信号按 (2, N) 组织成双波长样本矩阵。
+    # 与 data_analysis samples 一致：WL1(0x01,_940 列) 在上，WL2(0x02,_660 列) 在下。
     samples = np.vstack(
         [
-            df[f"{CHANNEL_NAME}_660"].to_numpy(dtype=float),
             df[f"{CHANNEL_NAME}_940"].to_numpy(dtype=float),
+            df[f"{CHANNEL_NAME}_660"].to_numpy(dtype=float),
         ]
     )
 
@@ -424,7 +433,7 @@ def run_pipeline() -> None:
     df = df[df["Wavelength"] != WAVELENGTH_OFF_CODE].reset_index(drop=True) # 去掉未点亮的数据
     dropped = n_raw - len(df) # 计算去掉的数据量
     if dropped:
-        print(f"Dropped {dropped} raw row(s) with Wavelength=OFF (0x00); not used for 660/940 pairing.")
+        print(f"Dropped {dropped} raw row(s) with Wavelength=OFF (0x00); not used for dual-wavelength pairing.")
 
     if df.empty or len(df) < 2:
         print("No enough non-OFF samples after filtering; skipping processing.")
@@ -446,7 +455,7 @@ def run_pipeline() -> None:
     # 交错配对
     final_df = interleave_mode_blocks(df, mode_col="Wavelength")
     if final_df.empty:
-        print("No 660/940 block pairs were formed; skipping MBLL.")
+        print("No dual-wavelength block pairs were formed; skipping MBLL.")
         return
 
     # 按配对后的真实平均间隔重建等间隔时间戳，避免采集抖动影响后续基于 fs 的滤波。
