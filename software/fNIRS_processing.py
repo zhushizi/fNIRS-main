@@ -5,8 +5,8 @@
 1. 通过 26B 协议采集原始单通道数据
 2. 写入 all_groups.csv
 3. 对单通道信号做阈值/低通/RMS 预处理
-4. 按协议双波长（0x01/0x02）配对，列名仍为 _940/_660
-5. 计算 OD -> MBLL（860/660 nm）-> CBSI
+4. 按 config.WAVELENGTH_CHANNELS 聚合成多列光强
+5. 计算 OD -> MBLL -> CBSI
 6. 输出 processed_output.csv
 """
 
@@ -36,16 +36,16 @@ from config import (
     CHANNEL_NAME,
     DEFAULT_INTENSITY_MA,
     DEFAULT_STREAM_ENABLED,
+    INTENSITY_COLUMNS,
     MBLL_DEFAULT_AGE,
-    MBLL_WAVELENGTH_WL1_NM,
-    MBLL_WAVELENGTH_WL2_NM,
     RAW_OUTPUT_CSV,
     SERIAL_PORT,
     SOURCE_DETECTOR_DISTANCE_CM,
     TIMEOUT,
-    WAVELENGTH_660_CODE,
-    WAVELENGTH_940_CODE,
+    WAVELENGTH_CHANNELS,
     WAVELENGTH_OFF_CODE,
+    mbll_wavelengths_nm,
+    wavelength_channel_by_code,
 )
 from protocol import (
     FrameReader,
@@ -152,49 +152,48 @@ def sliding_window_rms(
     return pd.DataFrame(rows).reset_index(drop=True)
 
 
-def _resolve_pair(first_row: pd.Series, second_row: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """确保返回顺序始终是 (660 行, 940 行)。"""
-    first_wave = int(first_row["Wavelength"])
-    second_wave = int(second_row["Wavelength"])
-    if first_wave == WAVELENGTH_660_CODE and second_wave == WAVELENGTH_940_CODE:
-        return first_row, second_row
-    if first_wave == WAVELENGTH_940_CODE and second_wave == WAVELENGTH_660_CODE:
-        return second_row, first_row
-
-    return first_row, second_row
-
-
-def interleave_mode_blocks(
+def aggregate_wavelength_cycles(
     df: pd.DataFrame,
     signal_col: str = CHANNEL_NAME,
     mode_col: str = "Wavelength",
 ) -> pd.DataFrame:
     """
-    将按波长块压缩后的数据重新组织成“每行一对 0x01/0x02”（列名 _940/_660）。
+    将 RMS 后的多波长段合并为一行：每种活跃波长一列（列名见 config）。
 
-    输出后每一行按 data_analysis 顺序喂给 MBLL：第 0 行 _940→860 nm，第 1 行 _660→660 nm。
+    在时序上每凑齐 WAVELENGTH_CHANNELS 中的全部协议码即输出一行；
+    与具体交错顺序无关，便于扩展到 3 路及以上波长。
     """
-    working = df.reset_index(drop=True)
-    rows = []
-    i = 0
-    while i < len(working) - 1:
-        row1 = working.loc[i]
-        row2 = working.loc[i + 1]
-        if int(row1[mode_col]) == int(row2[mode_col]):
-            i += 1
+    n_wl = len(WAVELENGTH_CHANNELS)
+    required_codes = {ch.code for ch in WAVELENGTH_CHANNELS}
+    pending: dict[int, pd.Series] = {}
+    rows: list[dict[str, float]] = []
+
+    def flush_pending() -> None:
+        if set(pending.keys()) != required_codes:
+            return
+        times = [float(pending[ch.code]["Time (s)"]) for ch in WAVELENGTH_CHANNELS]
+        out: dict[str, float] = {"Time (s)": float(np.mean(times))}
+        for ch in WAVELENGTH_CHANNELS:
+            out[ch.intensity_column] = float(pending[ch.code][signal_col])
+        rows.append(out)
+        pending.clear()
+
+    for _, row in df.reset_index(drop=True).iterrows():
+        code = int(row[mode_col])
+        if wavelength_channel_by_code(code) is None:
             continue
-        row_660, row_940 = _resolve_pair(row1, row2)
-        pair_time = float(np.mean([row1["Time (s)"], row2["Time (s)"]]))
-        rows.append(
-            {
-                "Time (s)": pair_time,
-                f"{CHANNEL_NAME}_660": float(row_660[signal_col]),
-                f"{CHANNEL_NAME}_940": float(row_940[signal_col]),
-            }
-        )
-        i += 2
+        pending[code] = row
+        if len(pending) == n_wl:
+            flush_pending()
 
     return pd.DataFrame(rows)
+
+
+def stack_intensities_for_mbll(df: pd.DataFrame) -> np.ndarray:
+    """按 WAVELENGTH_CHANNELS 顺序堆叠为 (n_wavelengths, n_timepoints)。"""
+    return np.vstack(
+        [df[ch.intensity_column].to_numpy(dtype=float) for ch in WAVELENGTH_CHANNELS]
+    )
 
 
 def butter_bandpass_sos(lowcut: float, highcut: float, fs: float, order: int = 4):
@@ -247,14 +246,11 @@ def build_channel_info(
     age: int = MBLL_DEFAULT_AGE,
     source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
 ):
-    """构造单通道 MBLL 所需的通道名、波长、DPF 与源探距离（与 data_analysis 一致）。"""
-    channel_names = [CHANNEL_NAME, CHANNEL_NAME]
-    ch_wls = [MBLL_WAVELENGTH_WL1_NM, MBLL_WAVELENGTH_WL2_NM]
-    ch_dpfs = [
-        nsp.get_dpf(MBLL_WAVELENGTH_WL1_NM, age),
-        nsp.get_dpf(MBLL_WAVELENGTH_WL2_NM, age),
-    ]
-    ch_distances = [source_detector_distance_cm, source_detector_distance_cm]
+    """构造单通道 MBLL 所需的通道名、波长、DPF 与源探距离。"""
+    ch_wls = mbll_wavelengths_nm()
+    channel_names = [CHANNEL_NAME] * len(ch_wls)
+    ch_dpfs = [nsp.get_dpf(wl, age) for wl in ch_wls]
+    ch_distances = [source_detector_distance_cm] * len(ch_wls)
     return channel_names, ch_wls, ch_dpfs, ch_distances
 
 
@@ -270,23 +266,17 @@ def process_csv_dataset(
 ) -> None:
     """从配对后的 CSV 计算最终的 HbO/HbR。"""
     df = pd.read_csv(input_csv)
-    required_cols = ["Time (s)", f"{CHANNEL_NAME}_660", f"{CHANNEL_NAME}_940"]
+    required_cols = ["Time (s)", *INTENSITY_COLUMNS]
     if df.empty or any(col not in df.columns for col in required_cols):
         print("Insufficient or invalid interleaved data for processing.")
         return
 
     times = df["Time (s)"].to_numpy(dtype=float)
     if len(times) < 2:
-        print("Need at least one dual-wavelength pair to run MBLL.")
+        print("Need at least two time samples to run MBLL.")
         return
 
-    # 与 data_analysis samples 一致：WL1(0x01,_940 列) 在上，WL2(0x02,_660 列) 在下。
-    samples = np.vstack(
-        [
-            df[f"{CHANNEL_NAME}_940"].to_numpy(dtype=float),
-            df[f"{CHANNEL_NAME}_660"].to_numpy(dtype=float),
-        ]
-    )
+    samples = stack_intensities_for_mbll(df)
 
     channel_names, ch_wls, ch_dpfs, ch_distances = build_channel_info(age, source_detector_distance_cm)
     # 先把光强转成 OD，再做带通和 MBLL。
@@ -456,10 +446,10 @@ def run_pipeline() -> None:
     # 分段 RMS
     df = sliding_window_rms(df=df)
 
-    # 交错配对
-    final_df = interleave_mode_blocks(df, mode_col="Wavelength")
+    # 多波长周期聚合（列名由 config.WAVELENGTH_CHANNELS 决定）
+    final_df = aggregate_wavelength_cycles(df, mode_col="Wavelength")
     if final_df.empty:
-        print("No dual-wavelength block pairs were formed; skipping MBLL.")
+        print("No complete wavelength cycles were formed; skipping MBLL.")
         return
 
     # 按配对后的真实平均间隔重建等间隔时间戳，避免采集抖动影响后续基于 fs 的滤波。
