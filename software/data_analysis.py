@@ -9,6 +9,10 @@ import nirsimple.processing as nproc
 from scipy.signal import butter, filtfilt, resample_poly, sosfiltfilt
 
 from config import (
+    BP_HIGH_HZ,
+    BP_LOW_HZ,
+    BP_ORDER,
+    BP_TARGET_FS_HZ,
     CHANNEL_NAME,
     MBLL_DEFAULT_AGE,
     MBLL_WAVELENGTH_WL1_NM,
@@ -196,8 +200,8 @@ def butter_bandpass_sos(lowcut, highcut, fs, order=4):
     return sos
 
 def smart_bandpass(data, fs,
-                   lowcut=0.05, highcut=0.1, order=4,
-                   target_fs=20.0):
+                   lowcut=BP_LOW_HZ, highcut=BP_HIGH_HZ, order=BP_ORDER,
+                   target_fs=BP_TARGET_FS_HZ):
     """
     Zero-phase band-pass along *time* axis.
     `data` shape: (n_channels, n_timepoints)
@@ -370,7 +374,7 @@ b, a = butter(4, 1.0/(0.5*split_fs), btype='low', analog=False)
 samples = filtfilt(b, a, samples, axis=1)
 plot_array(samples,['Wavelength=1','Wavelength=2'])
 delta_od = nsp.intensities_to_od_changes(samples)
-delta_od_filt = smart_bandpass(delta_od, split_fs, lowcut=0.01, highcut=0.1, order=4)
+delta_od_filt = smart_bandpass(delta_od, split_fs)
 ch_names, ch_wls, ch_dpfs, ch_distances = _channel_info()
 delta_c, new_ch_names, new_ch_types = nsp.mbll(
         delta_od_filt,

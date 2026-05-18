@@ -62,6 +62,12 @@ MBLL_WAVELENGTH_WL1_NM = 860.0
 MBLL_WAVELENGTH_WL2_NM = 660.0
 MBLL_DEFAULT_AGE = 27
 
+# OD 带通（与 data_analysis.py 中 smart_bandpass 调用一致）
+BP_LOW_HZ = 0.01
+BP_HIGH_HZ = 0.1
+BP_ORDER = 4
+BP_TARGET_FS_HZ = 20.0
+
 # 当前只有一个传感器模块，因此编号固定为 0x00。
 # 后续如果扩展到多传感器，可从这里统一调整。
 DEFAULT_SENSOR_ID = 0x00

@@ -29,6 +29,10 @@ from tabulate import tabulate
 from config import (
     ACK_TIMEOUT_SECONDS,
     BAUD_RATE,
+    BP_HIGH_HZ,
+    BP_LOW_HZ,
+    BP_ORDER,
+    BP_TARGET_FS_HZ,
     CHANNEL_NAME,
     DEFAULT_INTENSITY_MA,
     DEFAULT_STREAM_ENABLED,
@@ -204,10 +208,10 @@ def butter_bandpass_sos(lowcut: float, highcut: float, fs: float, order: int = 4
 def smart_bandpass(
     data: np.ndarray,
     fs: float,
-    lowcut: float = 0.05,
-    highcut: float = 0.1,
-    order: int = 4,
-    target_fs: float = 20.0,
+    lowcut: float = BP_LOW_HZ,
+    highcut: float = BP_HIGH_HZ,
+    order: int = BP_ORDER,
+    target_fs: float = BP_TARGET_FS_HZ,
 ) -> np.ndarray:
     """
     对 OD 数据做稳健带通。
@@ -260,9 +264,9 @@ def process_csv_dataset(
     age: int = MBLL_DEFAULT_AGE,
     source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
     molar_ext_coeff_table: str = "wray",
-    bp_low: float = 0.2,
-    bp_high: float = 0.9,
-    bp_order: int = 4,
+    bp_low: float = BP_LOW_HZ,
+    bp_high: float = BP_HIGH_HZ,
+    bp_order: int = BP_ORDER,
 ) -> None:
     """从配对后的 CSV 计算最终的 HbO/HbR。"""
     df = pd.read_csv(input_csv)
