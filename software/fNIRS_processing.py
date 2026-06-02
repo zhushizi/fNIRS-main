@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
 import os
 import threading
@@ -36,6 +37,7 @@ from config import (
     CHANNEL_NAME,
     DEFAULT_INTENSITY_MA,
     DEFAULT_STREAM_ENABLED,
+    HOST_TCP_DEFAULT_PORT,
     INTENSITY_COLUMNS,
     MBLL_DEFAULT_AGE,
     RAW_OUTPUT_CSV,
@@ -53,11 +55,15 @@ from protocol import (
     parse_data_frame,
     send_frame_with_ack,
 )
+from host_tcp_protocol import HostTcpSerialBridge
 
 
-def open_serial() -> serial.Serial:
+AnalysisResult = dict[str, object]
+
+
+def open_serial(serial_port: str = SERIAL_PORT) -> serial.Serial:
     """按配置打开串口。"""
-    return serial.Serial(SERIAL_PORT, baudrate=BAUD_RATE, timeout=TIMEOUT)
+    return serial.Serial(serial_port, baudrate=BAUD_RATE, timeout=TIMEOUT)
 
 
 def _start_enter_listener(stop_event: threading.Event) -> threading.Thread:
@@ -263,18 +269,20 @@ def process_csv_dataset(
     bp_low: float = BP_LOW_HZ,
     bp_high: float = BP_HIGH_HZ,
     bp_order: int = BP_ORDER,
-) -> None:
+) -> AnalysisResult:
     """从配对后的 CSV 计算最终的 HbO/HbR。"""
     df = pd.read_csv(input_csv)
     required_cols = ["Time (s)", *INTENSITY_COLUMNS]
     if df.empty or any(col not in df.columns for col in required_cols):
-        print("Insufficient or invalid interleaved data for processing.")
-        return
+        message = "Insufficient or invalid interleaved data for processing."
+        print(message)
+        return {"ok": False, "message": message}
 
     times = df["Time (s)"].to_numpy(dtype=float)
     if len(times) < 2:
-        print("Need at least two time samples to run MBLL.")
-        return
+        message = "Need at least two time samples to run MBLL."
+        print(message)
+        return {"ok": False, "message": message}
 
     samples = stack_intensities_for_mbll(df)
 
@@ -318,6 +326,64 @@ def process_csv_dataset(
     print(f"Post-processing complete. Output saved to '{output_csv}'.")
     print("\nExample: Processed concentrations at the final time sample:")
     print(tabulate(table_data, headers=["Channel", "Type", "Concentration"]))
+    return summarize_processed_concentrations(delta_c_corr, corr_ch_types)
+
+
+def summarize_processed_concentrations(
+    delta_c_corr: np.ndarray,
+    channel_types: list[str],
+) -> AnalysisResult:
+    """为安卓端测试显示提取本次 HbO/HbR 平均值。"""
+    hbo_values = []
+    hbr_values = []
+    for idx, channel_type in enumerate(channel_types):
+        normalized = str(channel_type).lower()
+        if "hbo" in normalized:
+            hbo_values.append(delta_c_corr[idx])
+        elif "hbr" in normalized:
+            hbr_values.append(delta_c_corr[idx])
+
+    if not hbo_values or not hbr_values:
+        return {
+            "ok": False,
+            "message": f"Cannot identify HbO/HbR columns from channel types: {channel_types}",
+        }
+
+    hbo = np.concatenate(hbo_values)
+    hbr = np.concatenate(hbr_values)
+    hbo = hbo[np.isfinite(hbo)]
+    hbr = hbr[np.isfinite(hbr)]
+    if hbo.size == 0 or hbr.size == 0:
+        return {"ok": False, "message": "HbO/HbR result contains no finite values."}
+
+    return {
+        "ok": True,
+        "mean_hbo": float(np.mean(hbo)),
+        "mean_hbr": float(np.mean(hbr)),
+        "sample_count": int(min(hbo.size, hbr.size)),
+    }
+
+
+def send_analysis_result_to_android(
+    bridge: HostTcpSerialBridge | None,
+    result: AnalysisResult,
+) -> None:
+    """把本次分析摘要回传给安卓；非 TCP 模式不做任何事。"""
+    if bridge is None:
+        return
+    mean_hbo = result.get("mean_hbo")
+    mean_hbr = result.get("mean_hbr")
+    message = result.get("message")
+    try:
+        bridge.send_analysis_result(
+            ok=bool(result.get("ok")),
+            mean_hbo=float(mean_hbo) if isinstance(mean_hbo, (int, float)) else None,
+            mean_hbr=float(mean_hbr) if isinstance(mean_hbr, (int, float)) else None,
+            sample_count=int(result.get("sample_count", 0)),
+            message=str(message) if message is not None else None,
+        )
+    except Exception as exc:
+        print(f"Failed to send analysis_result to Android: {exc}")
 
 
 def capture_data(
@@ -325,7 +391,10 @@ def capture_data(
     stop_on_enter: bool = True,
     duration_seconds: float | None = None,
     intensity_ma: int = DEFAULT_INTENSITY_MA,
-) -> None:
+    serial_port: str = SERIAL_PORT,
+    tcp_port: int | None = None,
+    tcp_debug: bool = False,
+) -> HostTcpSerialBridge | None:
     """
     采集单通道原始数据并写 CSV。
 
@@ -334,22 +403,31 @@ def capture_data(
     2. 解析波长/传感器/采样值
     3. 记录到 all_groups.csv
     """
-    ser = open_serial() # 打开串口
+    tcp_mode = tcp_port is not None
+    if not tcp_mode:
+        ser = open_serial(serial_port) # 打开串口
+        print(f"Using direct serial mode on {serial_port}.")
+    else:
+        ser = HostTcpSerialBridge(port=tcp_port, timeout=TIMEOUT, debug=tcp_debug)
+        print(f"Using Android TCP bridge mode on port {tcp_port}.")
     reader = FrameReader(ser) # 创建帧读取器
     stop_event = threading.Event() 
     listener = _start_enter_listener(stop_event) if stop_on_enter else None # 创建监听器
 
     try:
         ser.reset_input_buffer() # 清空串口接收缓冲区里的残留数据
-        started = send_frame_with_ack( # 发送启动命令
-            ser,
-            reader,
-            build_command_frame(DEFAULT_STREAM_ENABLED, intensity_ma),
-        )
-        if not started:
-            raise RuntimeError(
-                f"Failed to start stream: no ACK within {ACK_TIMEOUT_SECONDS * 1000:.0f} ms."
+        if not tcp_mode:
+            started = send_frame_with_ack( # 发送启动命令
+                ser,
+                reader,
+                build_command_frame(DEFAULT_STREAM_ENABLED, intensity_ma),
             )
+            if not started:
+                raise RuntimeError(
+                    f"Failed to start stream: no ACK within {ACK_TIMEOUT_SECONDS * 1000:.0f} ms."
+                )
+        else:
+            print("TCP passive mode: Android controls UART start/stop; waiting for serial_data.")
 
         with open(csv_filename, mode="w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
@@ -369,6 +447,12 @@ def capture_data(
 
                 frame = reader.read_frame(timeout_seconds=TIMEOUT)
                 if frame is None:
+                    if tcp_mode and getattr(ser, "capture_finished", False):
+                        print("Android requested capture finish; starting analysis.")
+                        break
+                    if getattr(ser, "closed", False) or not getattr(ser, "is_open", True):
+                        print("Capture transport closed.")
+                        break
                     continue
                 if frame.frame_type != 0x02:
                     continue
@@ -389,20 +473,26 @@ def capture_data(
                     f"wl={int(sample.wavelength_code)} sensor={int(sample.sensor_id)}"
                 )
     finally:
-        try:
-            send_frame_with_ack(ser, reader, build_command_frame(False, intensity_ma))
-        except Exception:
-            pass
-        ser.close()
+        if not tcp_mode:
+            try:
+                send_frame_with_ack(ser, reader, build_command_frame(False, intensity_ma))
+            except Exception:
+                pass
+            ser.close()
         if listener is not None and listener.is_alive():
             stop_event.set()
+    return ser if tcp_mode else None
 
 
 # 三个结果表统一放在此目录下，每次运行占一个以时间命名的子文件夹
 RESULT_TABLE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result_table")
 
 
-def run_pipeline() -> None:
+def run_pipeline(
+    serial_port: str = SERIAL_PORT,
+    tcp_port: int | None = None,
+    tcp_debug: bool = False,
+) -> None:
     """一键跑完整链路：采集 -> 预处理 -> 配对 -> MBLL -> CSV 输出。三个表写入 result_table/<时间>/。"""
     os.makedirs(RESULT_TABLE_DIR, exist_ok=True)
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -412,65 +502,125 @@ def run_pipeline() -> None:
     interleaved_path = os.path.join(output_dir, "interleaved_output.csv")
     processed_path = os.path.join(output_dir, "processed_output.csv")
     print(f"本次结果将保存到: {output_dir}")
+    tcp_bridge: HostTcpSerialBridge | None = None
 
-    # 采集数据
-    capture_data(csv_filename=raw_path, stop_on_enter=True)
+    try:
+        # 采集数据
+        tcp_bridge = capture_data(
+            csv_filename=raw_path,
+            stop_on_enter=(tcp_port is None),
+            serial_port=serial_port,
+            tcp_port=tcp_port,
+            tcp_debug=tcp_debug,
+        )
 
-    # 读取数据
-    df = pd.read_csv(raw_path)
-    if df.empty or len(df) < 2:
-        print("No enough raw rows captured; skipping processing.")
-        return
+        # 读取数据
+        df = pd.read_csv(raw_path)
+        if df.empty or len(df) < 2:
+            result = {"ok": False, "message": "No enough raw rows captured; skipping processing."}
+            print(result["message"])
+            send_analysis_result_to_android(tcp_bridge, result)
+            return
 
-    # 过滤数据
-    n_raw = len(df)
-    df = df[df["Wavelength"] != WAVELENGTH_OFF_CODE].reset_index(drop=True) # 去掉未点亮的数据
-    dropped = n_raw - len(df) # 计算去掉的数据量
-    if dropped:
-        print(f"Dropped {dropped} raw row(s) with Wavelength=OFF (0x00); not used for dual-wavelength pairing.")
+        # 过滤数据
+        n_raw = len(df)
+        df = df[df["Wavelength"] != WAVELENGTH_OFF_CODE].reset_index(drop=True) # 去掉未点亮的数据
+        dropped = n_raw - len(df) # 计算去掉的数据量
+        if dropped:
+            print(f"Dropped {dropped} raw row(s) with Wavelength=OFF (0x00); not used for dual-wavelength pairing.")
 
-    if df.empty or len(df) < 2:
-        print("No enough non-OFF samples after filtering; skipping processing.")
-        return
+        if df.empty or len(df) < 2:
+            result = {"ok": False, "message": "No enough non-OFF samples after filtering; skipping processing."}
+            print(result["message"])
+            send_analysis_result_to_android(tcp_bridge, result)
+            return
 
-    dt = df["Time (s)"].diff().mean() # 计算时间戳的差值的平均值
-    fs = 1.0 / dt if pd.notna(dt) and dt > 0 else 1.0 # 计算采样率
-    print(f"采样率: {fs} Hz")
+        dt = df["Time (s)"].diff().mean() # 计算时间戳的差值的平均值
+        fs = 1.0 / dt if pd.notna(dt) and dt > 0 else 1.0 # 计算采样率
+        print(f"采样率: {fs} Hz")
 
-    # # 阈值截断
-    # df = threshold_filter(df)
+        # # 阈值截断
+        # df = threshold_filter(df)
 
-    # 低通滤波
-    df = butter_lowpass_filter(df=df, cutoff_hz=1.0, fs=fs, order=4)
+        # 低通滤波
+        df = butter_lowpass_filter(df=df, cutoff_hz=1.0, fs=fs, order=4)
 
-    # 分段 RMS
-    df = sliding_window_rms(df=df)
+        # 分段 RMS
+        df = sliding_window_rms(df=df)
 
-    # 多波长周期聚合（列名由 config.WAVELENGTH_CHANNELS 决定）
-    final_df = aggregate_wavelength_cycles(df, mode_col="Wavelength")
-    if final_df.empty:
-        print("No complete wavelength cycles were formed; skipping MBLL.")
-        return
+        # 多波长周期聚合（列名由 config.WAVELENGTH_CHANNELS 决定）
+        final_df = aggregate_wavelength_cycles(df, mode_col="Wavelength")
+        if final_df.empty:
+            result = {"ok": False, "message": "No complete wavelength cycles were formed; skipping MBLL."}
+            print(result["message"])
+            send_analysis_result_to_android(tcp_bridge, result)
+            return
 
-    # 按配对后的真实平均间隔重建等间隔时间戳，避免采集抖动影响后续基于 fs 的滤波。
-    pair_times = final_df["Time (s)"].to_numpy(dtype=float)
-    pair_dt = np.diff(pair_times)
-    valid_pair_dt = pair_dt[np.isfinite(pair_dt) & (pair_dt > 0)]
-    increment = float(np.mean(valid_pair_dt)) if valid_pair_dt.size else 0.001
-    if "Time (s)" in final_df.columns:
-        final_df = final_df.drop(columns=["Time (s)"])
-    final_df.insert(0, "Time (s)", [i * increment for i in range(len(final_df))])
+        # 按配对后的真实平均间隔重建等间隔时间戳，避免采集抖动影响后续基于 fs 的滤波。
+        pair_times = final_df["Time (s)"].to_numpy(dtype=float)
+        pair_dt = np.diff(pair_times)
+        valid_pair_dt = pair_dt[np.isfinite(pair_dt) & (pair_dt > 0)]
+        increment = float(np.mean(valid_pair_dt)) if valid_pair_dt.size else 0.001
+        if "Time (s)" in final_df.columns:
+            final_df = final_df.drop(columns=["Time (s)"])
+        final_df.insert(0, "Time (s)", [i * increment for i in range(len(final_df))])
 
-    # 统一保留6位小数，减少浮点表示伪差。
-    final_df["Time (s)"] = final_df["Time (s)"].round(6)
+        # 统一保留6位小数，减少浮点表示伪差。
+        final_df["Time (s)"] = final_df["Time (s)"].round(6)
 
-    # 写入文件
-    final_df.to_csv(interleaved_path, index=False)
-    print(final_df.head(20))
+        # 写入文件
+        final_df.to_csv(interleaved_path, index=False)
+        print(final_df.head(20))
 
-    # 计算最终的 HbO/HbR
-    process_csv_dataset(interleaved_path, processed_path)
+        # 计算最终的 HbO/HbR
+        result = process_csv_dataset(interleaved_path, processed_path)
+        send_analysis_result_to_android(tcp_bridge, result)
+    finally:
+        if tcp_bridge is not None:
+            tcp_bridge.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run fNIRS capture and processing pipeline.")
+    parser.add_argument(
+        "-port",
+        "--port",
+        dest="serial_port",
+        nargs="?",
+        const=SERIAL_PORT,
+        default=SERIAL_PORT,
+        help=(
+            "Use the existing direct serial path. Optionally pass a serial port, "
+            f"for example -port COM6. Default: {SERIAL_PORT}."
+        ),
+    )
+    parser.add_argument(
+        "-tcp_port",
+        "--tcp_port",
+        type=int,
+        nargs="?",
+        const=HOST_TCP_DEFAULT_PORT,
+        default=None,
+        help=(
+            "Use Android Host TCP Protocol bridge mode on this listening port. "
+            f"Recommended/default protocol port: {HOST_TCP_DEFAULT_PORT}."
+        ),
+    )
+    parser.add_argument(
+        "--tcp_debug",
+        action="store_true",
+        help="Print TCP protocol rx/tx logs (type/seq/byte_len) in bridge mode.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    args = parse_args()
+    try:
+        run_pipeline(
+            serial_port=args.serial_port,
+            tcp_port=args.tcp_port,
+            tcp_debug=args.tcp_debug,
+        )
+    except KeyboardInterrupt:
+        print("\nStopped by user.")

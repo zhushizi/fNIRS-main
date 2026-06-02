@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional
-
-import serial
+from typing import Any, Optional
 
 from config import (
     ACK_TIMEOUT_SECONDS,
@@ -109,7 +107,7 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
 
 
 class FrameReader:
-    def __init__(self, ser: serial.Serial):
+    def __init__(self, ser: Any):
         # buffer 用来承接“串口是字节流而不是天然按帧到来”这个事实。
         self.ser = ser
         self.buffer = bytearray()
@@ -182,7 +180,7 @@ class FrameReader:
                 return None
 
 
-def wait_for_ack(ser: serial.Serial, reader: FrameReader, timeout_seconds: float = ACK_TIMEOUT_SECONDS) -> bool:
+def wait_for_ack(ser: Any, reader: FrameReader, timeout_seconds: float = ACK_TIMEOUT_SECONDS) -> bool:
     """
     等待 ACK。
 
@@ -200,7 +198,7 @@ def wait_for_ack(ser: serial.Serial, reader: FrameReader, timeout_seconds: float
 
 
 def send_frame_with_ack(
-    ser: serial.Serial,
+    ser: Any,
     reader: FrameReader,
     frame: bytes,
     retries: int = MAX_RETRIES,

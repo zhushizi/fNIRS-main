@@ -21,6 +21,12 @@ TIMEOUT = 0.05
 # 设备标称采样率（Hz），用于重建等间隔时间戳。
 SAMPLING_RATE_HZ = 250.0
 
+# 安卓 Host TCP Protocol 参数。解码端作为 TCP Server，安卓主动连接。
+HOST_TCP_LISTEN_HOST = "0.0.0.0"
+HOST_TCP_DEFAULT_PORT = 9000
+HOST_TCP_PROTOCOL_VERSION = 1
+HOST_TCP_MAX_BODY_BYTES = 4 * 1024 * 1024
+
 # 26B 协议固定帧格式
 FRAME_HEADER = bytes((0x55, 0xAA))
 FRAME_LENGTH = 0x1A
@@ -47,7 +53,7 @@ SOURCE_DETECTOR_DISTANCE_CM = 3.0
 WAVELENGTH_OFF_CODE = 0x00
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class WavelengthChannel:
     """
     单路活跃波长。
