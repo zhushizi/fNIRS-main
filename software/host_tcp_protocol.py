@@ -151,6 +151,36 @@ class HostTcpSerialBridge:
             body["message"] = message
         self._send_message("analysis_result", body)
 
+    def send_live_analysis_batch(
+        self,
+        times: list[float],
+        hbo: list[float],
+        hbr: list[float],
+        window_start_s: float,
+        window_end_s: float,
+        ok: bool = True,
+        message: str | None = None,
+    ) -> None:
+        """Send one online HbO/HbR batch for Android-side plotting."""
+        body: dict[str, Any] = {
+            "ok": ok,
+            "sample_count": min(len(times), len(hbo), len(hbr)),
+            "unit": "a.u.",
+        }
+        if ok:
+            body.update(
+                {
+                    "times": times,
+                    "hbo": hbo,
+                    "hbr": hbr,
+                    "window_start_s": window_start_s,
+                    "window_end_s": window_end_s,
+                }
+            )
+        if message:
+            body["message"] = message
+        self._send_message("live_analysis_batch", body)
+
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq

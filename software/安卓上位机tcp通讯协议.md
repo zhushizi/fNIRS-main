@@ -26,8 +26,9 @@
 1. 串口只由安卓打开，PC 不直接访问 UART。
 2. 安卓本地负责启流/停流，PC 不下发串口启停命令。
 3. 安卓把串口读到的原始字节块通过 `serial_data` 发给 PC。
-4. 安卓发送 `bye` 表示本次数据流结束；PC 回 `bye_ack` 后开始分析。
-5. PC 分析完成后发送 `analysis_result`，携带本次 HbO/HbR 平均值用于测试显示。
+4. PC 在接收 `serial_data` 过程中可周期性发送 `live_analysis_batch`，携带一批 HbO/HbR 曲线点用于实时绘图。
+5. 安卓发送 `bye` 表示本次数据流结束；PC 回 `bye_ack` 后做最终汇总分析。
+6. PC 最终分析完成后发送 `analysis_result`，携带本次 HbO/HbR 平均值用于测试显示。
 
 ---
 
@@ -181,7 +182,50 @@ PC 收到 `bye` 后立即回复，表示已经结束采集循环并即将开始�
 }
 ```
 
-### 5.6 `analysis_result`（PC -> 安卓）
+### 5.6 `live_analysis_batch`（PC -> 安卓）
+
+PC 在采集过程中周期性发送在线分析结果。该消息用于安卓端实时曲线绘图；每批只包含上次回传后新增的点。
+
+| `body` 字段 | 类型 | 必填 | 说明 |
+|-------------|------|------|------|
+| `ok` | bool | 是 | 是否成功生成本批在线结果 |
+| `times` | number[] | 成功时是 | 曲线点时间，单位秒，相对本次采集开始 |
+| `hbo` | number[] | 成功时是 | 与 `times` 对齐的 HbO 序列 |
+| `hbr` | number[] | 成功时是 | 与 `times` 对齐的 HbR 序列 |
+| `sample_count` | int | 是 | 本批点数 |
+| `window_start_s` | number | 成功时是 | 本次滑动窗口起始时间 |
+| `window_end_s` | number | 成功时是 | 本次滑动窗口结束时间 |
+| `unit` | string | 成功时是 | 当前为 `a.u.` |
+| `message` | string | 否 | 失败或调试说明 |
+
+成功示例：
+
+```json
+{
+  "ver": 1,
+  "type": "live_analysis_batch",
+  "seq": 3,
+  "ts_ms": 1717234569000,
+  "body": {
+    "ok": true,
+    "times": [30.125, 31.126, 32.127],
+    "hbo": [0.0000012, 0.0000014, 0.0000015],
+    "hbr": [-0.0000004, -0.0000005, -0.0000006],
+    "sample_count": 3,
+    "window_start_s": 2.125,
+    "window_end_s": 32.127,
+    "unit": "a.u."
+  }
+}
+```
+
+说明：
+
+- 在线算法使用滑动窗口，前期数据不足时 PC 可能暂时不发送本消息。
+- 安卓端可按 `times[i] / hbo[i] / hbr[i]` 直接追加到曲线。
+- 最终准确结果仍以 `analysis_result` 和 `processed_output.csv` 为准。
+
+### 5.7 `analysis_result`（PC -> 安卓）
 
 PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值。
 
@@ -217,7 +261,7 @@ PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值�
 }
 ```
 
-### 5.7 `heartbeat`（双向，可选）
+### 5.8 `heartbeat`（双向，可选）
 
 ```json
 {
@@ -228,7 +272,7 @@ PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值�
 }
 ```
 
-### 5.8 `error`（双向）
+### 5.9 `error`（双向）
 
 ```json
 {
@@ -279,7 +323,8 @@ sequenceDiagram
     loop 采集
         DEV->>AND: UART 0x02 数据帧
         AND->>PC: serial_data(payload_b64)
-        PC->>PC: 缓冲 + 26B 解帧 + 写 CSV
+        PC->>PC: 缓冲 + 26B 解帧 + 写 CSV + 在线窗口分析
+        PC-->>AND: live_analysis_batch(times, hbo, hbr)
     end
     AND->>DEV: UI 停流，UART 写 26B 停流命令
     AND->>PC: bye(reason=user_stop)
@@ -298,6 +343,7 @@ sequenceDiagram
 - [ ] 连接后发送 `hello`
 - [ ] 收到 `hello_ack.ok=true` 后允许 UI 启流
 - [ ] 串口 `read()` 到的原始字节用 `serial_data.payload_b64` 上报
+- [ ] 采集过程中接收 `live_analysis_batch` 并追加绘图
 - [ ] UI 停流后发送 `bye`
 - [ ] 接收 `bye_ack`
 - [ ] 接收并显示 `analysis_result`
@@ -309,6 +355,7 @@ PC：
 - [ ] 长度头拆包 + JSON 解析
 - [ ] `hello` -> `hello_ack`
 - [ ] `serial_data` -> 缓冲 -> 26B 解帧 -> CSV
+- [ ] 采集过程中周期性发送 `live_analysis_batch`
 - [ ] `bye` -> `bye_ack` -> 结束采集 -> 后处理
 - [ ] 后处理完成 -> `analysis_result`
 - [ ] 非法包回 `error`
@@ -321,3 +368,4 @@ PC：
 |------|------|
 | 2026-06-01 | 初稿 |
 | 2026-06-02 | 精简为安卓主导启停：`hello` / `serial_data` / `bye` / `analysis_result` |
+| 2026-06-03 | 增加在线曲线回传：`live_analysis_batch` |

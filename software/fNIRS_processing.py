@@ -17,6 +17,7 @@ import csv
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import nirsimple.preprocessing as nsp
@@ -60,6 +61,11 @@ from host_tcp_protocol import HostTcpSerialBridge
 
 AnalysisResult = dict[str, object]
 
+ONLINE_WINDOW_SECONDS = 30.0
+ONLINE_UPDATE_INTERVAL_SECONDS = 1.0
+ONLINE_BUFFER_RETENTION_SECONDS = ONLINE_WINDOW_SECONDS * 2.0
+ONLINE_MIN_INTERLEAVED_POINTS = max(16, 3 * (BP_ORDER + 1) + 1)
+
 
 def open_serial(serial_port: str = SERIAL_PORT) -> serial.Serial:
     """按配置打开串口。"""
@@ -78,6 +84,42 @@ def _start_enter_listener(stop_event: threading.Event) -> threading.Thread:
     thread = threading.Thread(target=_wait_for_enter, daemon=True)
     thread.start()
     return thread
+
+
+class OnlineSampleBuffer:
+    """Thread-safe raw sample buffer used by the online analyzer."""
+
+    def __init__(self, retention_seconds: float = ONLINE_BUFFER_RETENTION_SECONDS) -> None:
+        self.retention_seconds = retention_seconds
+        self._rows: deque[tuple[float, int, float, int]] = deque()
+        self._lock = threading.Lock()
+
+    def append(
+        self,
+        elapsed_time: float,
+        sensor_id: int,
+        value: float,
+        wavelength_code: int,
+    ) -> None:
+        with self._lock:
+            self._rows.append((elapsed_time, sensor_id, value, wavelength_code))
+            cutoff = elapsed_time - self.retention_seconds
+            while self._rows and self._rows[0][0] < cutoff:
+                self._rows.popleft()
+
+    def snapshot_recent(self, window_seconds: float) -> pd.DataFrame:
+        with self._lock:
+            if not self._rows:
+                rows: list[tuple[float, int, float, int]] = []
+            else:
+                latest_time = self._rows[-1][0]
+                cutoff = latest_time - window_seconds
+                rows = [row for row in self._rows if row[0] >= cutoff]
+
+        return pd.DataFrame(
+            rows,
+            columns=["Time (s)", "SensorId", CHANNEL_NAME, "Wavelength"],
+        )
 
 
 def threshold_filter(
@@ -200,6 +242,117 @@ def stack_intensities_for_mbll(df: pd.DataFrame) -> np.ndarray:
     return np.vstack(
         [df[ch.intensity_column].to_numpy(dtype=float) for ch in WAVELENGTH_CHANNELS]
     )
+
+
+def prepare_interleaved_dataframe(
+    raw_df: pd.DataFrame,
+    *,
+    start_at_zero: bool,
+) -> pd.DataFrame:
+    """Run the shared raw->interleaved preprocessing path."""
+    if raw_df.empty or len(raw_df) < 2:
+        return pd.DataFrame(columns=["Time (s)", *INTENSITY_COLUMNS])
+
+    df = raw_df.copy()
+    df = df[df["Wavelength"] != WAVELENGTH_OFF_CODE].reset_index(drop=True)
+    if df.empty or len(df) < 2:
+        return pd.DataFrame(columns=["Time (s)", *INTENSITY_COLUMNS])
+
+    dt = df["Time (s)"].diff().mean()
+    fs = 1.0 / dt if pd.notna(dt) and dt > 0 else 1.0
+
+    df = butter_lowpass_filter(df=df, cutoff_hz=1.0, fs=fs, order=4)
+    df = sliding_window_rms(df=df)
+    final_df = aggregate_wavelength_cycles(df, mode_col="Wavelength")
+    if final_df.empty:
+        return final_df
+
+    pair_times = final_df["Time (s)"].to_numpy(dtype=float)
+    pair_dt = np.diff(pair_times)
+    valid_pair_dt = pair_dt[np.isfinite(pair_dt) & (pair_dt > 0)]
+    increment = float(np.mean(valid_pair_dt)) if valid_pair_dt.size else 0.001
+    first_time = 0.0 if start_at_zero else float(pair_times[0])
+    final_df = final_df.drop(columns=["Time (s)"])
+    final_df.insert(0, "Time (s)", [first_time + i * increment for i in range(len(final_df))])
+    final_df["Time (s)"] = final_df["Time (s)"].round(6)
+    return final_df
+
+
+def extract_hbo_hbr_series(
+    delta_c_corr: np.ndarray,
+    channel_types: list[str],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Extract one HbO and one HbR series, averaging duplicate channel types."""
+    hbo_indices: list[int] = []
+    hbr_indices: list[int] = []
+    for idx, channel_type in enumerate(channel_types):
+        normalized = str(channel_type).lower()
+        if "hbo" in normalized:
+            hbo_indices.append(idx)
+        elif "hbr" in normalized:
+            hbr_indices.append(idx)
+
+    if not hbo_indices or not hbr_indices:
+        return None
+    hbo = np.mean(delta_c_corr[hbo_indices, :], axis=0)
+    hbr = np.mean(delta_c_corr[hbr_indices, :], axis=0)
+    return hbo, hbr
+
+
+def calculate_concentration_series(
+    interleaved_df: pd.DataFrame,
+    age: int = MBLL_DEFAULT_AGE,
+    source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
+    molar_ext_coeff_table: str = "wray",
+    bp_low: float = BP_LOW_HZ,
+    bp_high: float = BP_HIGH_HZ,
+    bp_order: int = BP_ORDER,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Calculate HbO/HbR time series from an interleaved intensity dataframe."""
+    required_cols = ["Time (s)", *INTENSITY_COLUMNS]
+    if interleaved_df.empty or any(col not in interleaved_df.columns for col in required_cols):
+        return None
+
+    times = interleaved_df["Time (s)"].to_numpy(dtype=float)
+    if len(times) < 2:
+        return None
+
+    samples = stack_intensities_for_mbll(interleaved_df)
+    channel_names, ch_wls, ch_dpfs, ch_distances = build_channel_info(
+        age,
+        source_detector_distance_cm,
+    )
+    delta_od = nsp.intensities_to_od_changes(samples)
+
+    dt = np.mean(np.diff(times))
+    fs = 1.0 / dt if dt > 0 else 1.0
+    delta_od_filt = smart_bandpass(delta_od, fs, lowcut=bp_low, highcut=bp_high, order=bp_order)
+
+    delta_c, new_ch_names, new_ch_types = nsp.mbll(
+        delta_od_filt,
+        channel_names,
+        ch_wls,
+        ch_dpfs,
+        ch_distances,
+        unit="cm",
+        table=molar_ext_coeff_table,
+    )
+    delta_c_corr, _corr_ch_names, corr_ch_types = nproc.cbsi(delta_c, new_ch_names, new_ch_types)
+    series = extract_hbo_hbr_series(delta_c_corr, corr_ch_types)
+    if series is None:
+        return None
+
+    hbo, hbr = series
+    n_cols = min(len(times), len(hbo), len(hbr))
+    if n_cols == 0:
+        return None
+    times = times[:n_cols]
+    hbo = hbo[:n_cols]
+    hbr = hbr[:n_cols]
+    finite_mask = np.isfinite(times) & np.isfinite(hbo) & np.isfinite(hbr)
+    if not np.any(finite_mask):
+        return None
+    return times[finite_mask], hbo[finite_mask], hbr[finite_mask]
 
 
 def butter_bandpass_sos(lowcut: float, highcut: float, fs: float, order: int = 4):
@@ -386,6 +539,81 @@ def send_analysis_result_to_android(
         print(f"Failed to send analysis_result to Android: {exc}")
 
 
+class OnlineAnalysisWorker:
+    """Background worker that streams sliding-window HbO/HbR batches to Android."""
+
+    def __init__(
+        self,
+        buffer: OnlineSampleBuffer,
+        bridge: HostTcpSerialBridge,
+        window_seconds: float = ONLINE_WINDOW_SECONDS,
+        update_interval_seconds: float = ONLINE_UPDATE_INTERVAL_SECONDS,
+    ) -> None:
+        self.buffer = buffer
+        self.bridge = bridge
+        self.window_seconds = window_seconds
+        self.update_interval_seconds = update_interval_seconds
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.last_sent_time = -float("inf")
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=max(1.0, self.update_interval_seconds * 2.0))
+
+    def _run(self) -> None:
+        print(
+            "Online analysis enabled: "
+            f"window={self.window_seconds:.1f}s interval={self.update_interval_seconds:.1f}s."
+        )
+        while not self.stop_event.wait(self.update_interval_seconds):
+            if getattr(self.bridge, "closed", False):
+                break
+            try:
+                self._analyze_and_send_once()
+            except Exception as exc:
+                print(f"Online analysis skipped one batch: {exc}")
+
+    def _analyze_and_send_once(self) -> None:
+        raw_df = self.buffer.snapshot_recent(self.window_seconds)
+        if raw_df.empty:
+            return
+        window_span = float(raw_df["Time (s)"].iloc[-1] - raw_df["Time (s)"].iloc[0])
+        min_window_span = max(0.0, self.window_seconds - self.update_interval_seconds * 0.5)
+        if window_span < min_window_span:
+            return
+
+        interleaved_df = prepare_interleaved_dataframe(raw_df, start_at_zero=False)
+        if interleaved_df.empty or len(interleaved_df) < ONLINE_MIN_INTERLEAVED_POINTS:
+            return
+
+        series = calculate_concentration_series(interleaved_df)
+        if series is None:
+            return
+        times, hbo, hbr = series
+
+        new_mask = times > self.last_sent_time + 1e-9
+        if not np.any(new_mask):
+            return
+
+        times_new = times[new_mask]
+        hbo_new = hbo[new_mask]
+        hbr_new = hbr[new_mask]
+        self.last_sent_time = float(times_new[-1])
+        self.bridge.send_live_analysis_batch(
+            times=[float(x) for x in times_new],
+            hbo=[float(x) for x in hbo_new],
+            hbr=[float(x) for x in hbr_new],
+            window_start_s=float(interleaved_df["Time (s)"].iloc[0]),
+            window_end_s=float(interleaved_df["Time (s)"].iloc[-1]),
+            ok=True,
+        )
+
+
 def capture_data(
     csv_filename: str = RAW_OUTPUT_CSV,
     stop_on_enter: bool = True,
@@ -394,6 +622,7 @@ def capture_data(
     serial_port: str = SERIAL_PORT,
     tcp_port: int | None = None,
     tcp_debug: bool = False,
+    online_analysis_enabled: bool = True,
 ) -> HostTcpSerialBridge | None:
     """
     采集单通道原始数据并写 CSV。
@@ -413,6 +642,12 @@ def capture_data(
     reader = FrameReader(ser) # 创建帧读取器
     stop_event = threading.Event() 
     listener = _start_enter_listener(stop_event) if stop_on_enter else None # 创建监听器
+    online_buffer: OnlineSampleBuffer | None = None
+    online_worker: OnlineAnalysisWorker | None = None
+    if tcp_mode and online_analysis_enabled:
+        online_buffer = OnlineSampleBuffer()
+        online_worker = OnlineAnalysisWorker(online_buffer, ser)
+        online_worker.start()
 
     try:
         ser.reset_input_buffer() # 清空串口接收缓冲区里的残留数据
@@ -459,6 +694,13 @@ def capture_data(
 
                 sample = parse_data_frame(frame)
                 elapsed_time = round(time.time() - start_time, 6)
+                if online_buffer is not None:
+                    online_buffer.append(
+                        elapsed_time,
+                        sample.sensor_id,
+                        sample.value,
+                        sample.wavelength_code,
+                    )
                 writer.writerow(
                     [
                         elapsed_time,
@@ -473,6 +715,8 @@ def capture_data(
                     f"wl={int(sample.wavelength_code)} sensor={int(sample.sensor_id)}"
                 )
     finally:
+        if online_worker is not None:
+            online_worker.stop()
         if not tcp_mode:
             try:
                 send_frame_with_ack(ser, reader, build_command_frame(False, intensity_ma))

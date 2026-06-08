@@ -322,7 +322,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-raw_csv_path = SCRIPT_DIR / 'result_table' / '2026-04-23_19-57-29' / 'all_groups.csv'
+raw_csv_path = SCRIPT_DIR / 'result_table' / '2026-06-02_19-55-51' / 'all_groups.csv'
 
 df = pd.read_csv(raw_csv_path)
 
