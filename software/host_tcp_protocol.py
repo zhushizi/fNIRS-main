@@ -53,15 +53,15 @@ class HostTcpSerialBridge:
         self._send_lock = threading.Lock()
         self._client_sock: socket.socket | None = None
 
-        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_sock.bind((self.host, self.port))
-        self._server_sock.listen(1)
-        self._server_sock.settimeout(0.5)
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # 创建一个TCP/IP套接字
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # 设置套接字选项，允许重用地址
+        self._server_sock.bind((self.host, self.port)) # 绑定套接字到地址和端口
+        self._server_sock.listen(1) # 开始监听连接
+        self._server_sock.settimeout(0.5) # 设置套接字超时时间
 
-        print(f"Waiting for Android TCP client on {self.host}:{self.port} ...")
+        print(f"Waiting for Android TCP client on {self.host}:{self.port} ...") # 打印等待Android客户端连接的信息
         try:
-            self._client_sock, client_addr = self._accept_client()
+            self._client_sock, client_addr = self._accept_client() # 接受客户端连接
         except KeyboardInterrupt:
             self._server_sock.close()
             raise
@@ -161,7 +161,7 @@ class HostTcpSerialBridge:
         ok: bool = True,
         message: str | None = None,
     ) -> None:
-        """Send one online HbO/HbR batch for Android-side plotting."""
+        """为安卓端绘图发送一组在线含氧血红蛋白 / 还原血红蛋白批次数据。"""
         body: dict[str, Any] = {
             "ok": ok,
             "sample_count": min(len(times), len(hbo), len(hbr)),
