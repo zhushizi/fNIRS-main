@@ -26,7 +26,7 @@
 1. 串口只由安卓打开，PC 不直接访问 UART。
 2. 安卓本地负责启流/停流，PC 不下发串口启停命令。
 3. 安卓把串口读到的原始字节块通过 `serial_data` 发给 PC。
-4. PC 在接收 `serial_data` 过程中可周期性发送 `live_analysis_batch`，携带一批 HbO/HbR 曲线点用于实时绘图。
+4. PC 在接收 `serial_data` 过程中可周期性发送 `live_analysis_batch`，携带一批 HbO/HbR/rSO2 曲线点用于实时绘图。
 5. 安卓发送 `bye` 表示本次数据流结束；PC 回 `bye_ack` 后做最终汇总分析。
 6. PC 最终分析完成后发送 `analysis_result`，携带本次 HbO/HbR 平均值用于测试显示。
 
@@ -190,15 +190,27 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 |-------------|------|------|------|
 | `ok` | bool | 是 | 是否成功生成本批在线结果 |
 | `times` | number[] | 成功时是 | 曲线点时间，单位秒，相对本次采集开始 |
-| `hbo` | number[] | 成功时是 | 与 `times` 对齐的 HbO 序列 |
-| `hbr` | number[] | 成功时是 | 与 `times` 对齐的 HbR 序列 |
-| `sample_count` | int | 是 | 本批点数 |
+| `hbo` | number[] | 成功时是 | 与 `times` 对齐的 HbO 序列（浓度变化量，a.u.） |
+| `hbr` | number[] | 成功时是 | 与 `times` 对齐的 HbR 序列（浓度变化量，a.u.） |
+| `rso2` | number[] \| null[] | 否 | 与 `times` 对齐的 rSO2（%）；基线未建立时不出现本字段 |
+| `baseline_ready` | bool | 是 | 基线时段是否已有足够样本可估算 rSO2 |
+| `latest_rso2_pct` | number | 否 | 本批最后一个有效 rSO2（%），便于大屏数字显示 |
+| `baseline_rso2_pct` | number | 否 | 算法假设的基线 rSO2（%），当前默认 `65.0` |
+| `sample_count` | int | 是 | 本批点数（含 `rso2` 时取 times/hbo/hbr/rso2 最短长度） |
 | `window_start_s` | number | 成功时是 | 本次滑动窗口起始时间 |
 | `window_end_s` | number | 成功时是 | 本次滑动窗口结束时间 |
-| `unit` | string | 成功时是 | 当前为 `a.u.` |
+| `unit` | string | 成功时是 | HbO/HbR 单位为 `a.u.`；rSO2 为 `%` |
 | `message` | string | 否 | 失败或调试说明 |
 
-成功示例：
+**rSO2 算法**（与 `data_analysis.plot_blood_oxygen_content` 一致）：
+
+- 固定假设：基线总血红蛋白 HbT = 80 µM，基线 rSO2 = 65%。
+- 基线时段：采集开始后 **30 s ~ 60 s** 内 ΔHbO/ΔHbR 的均值用于校正。
+- 公式：`rSO2 = 100 × HbO_abs / (HbO_abs + HbR_abs)`，其中绝对浓度由基线假设 + 浓度变化量叠加得到。
+- `baseline_ready=false` 时：仍可能携带 `times/hbo/hbr`，但不带 `rso2`；安卓应显示「基线建立中」。
+- `baseline_ready=true` 后：每批增量点携带 `rso2[i]`；无效点为 JSON `null`。
+
+成功示例（基线已建立）：
 
 ```json
 {
@@ -208,12 +220,37 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
   "ts_ms": 1717234569000,
   "body": {
     "ok": true,
-    "times": [30.125, 31.126, 32.127],
+    "times": [60.125, 61.126, 62.127],
     "hbo": [0.0000012, 0.0000014, 0.0000015],
     "hbr": [-0.0000004, -0.0000005, -0.0000006],
+    "rso2": [67.8, 68.1, 68.2],
+    "baseline_ready": true,
+    "latest_rso2_pct": 68.2,
+    "baseline_rso2_pct": 65.0,
     "sample_count": 3,
+    "window_start_s": 32.125,
+    "window_end_s": 62.127,
+    "unit": "a.u."
+  }
+}
+```
+
+基线建立前的示例：
+
+```json
+{
+  "ver": 1,
+  "type": "live_analysis_batch",
+  "seq": 2,
+  "body": {
+    "ok": true,
+    "times": [30.125, 31.126],
+    "hbo": [0.0000010, 0.0000011],
+    "hbr": [-0.0000003, -0.0000004],
+    "baseline_ready": false,
+    "sample_count": 2,
     "window_start_s": 2.125,
-    "window_end_s": 32.127,
+    "window_end_s": 31.126,
     "unit": "a.u."
   }
 }
@@ -221,13 +258,13 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 
 说明：
 
-- 在线算法使用滑动窗口，前期数据不足时 PC 可能暂时不发送本消息。
-- 安卓端可按 `times[i] / hbo[i] / hbr[i]` 直接追加到曲线。
-- 最终准确结果仍以 `analysis_result` 和 `processed_output.csv` 为准。
+- 在线算法使用滑动窗口（默认 30 s），前期数据不足时 PC 可能暂时不发送本消息。
+- 安卓端可按 `times[i] / hbo[i] / hbr[i]` 追加浓度曲线；`baseline_ready=true` 后按 `rso2[i]` 追加 rSO2 趋势，或用 `latest_rso2_pct` 刷新主屏数字。
+- rSO2 为固定基线假设下的估算值，仅供实时监护显示；最终准确结果仍以 `analysis_result` 和 `processed_output.csv` 为准。
 
 ### 5.7 `analysis_result`（PC -> 安卓）
 
-PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值。
+PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值；采集时长覆盖 rSO2 基线窗（默认 30~60 s）时还附带 rSO2 摘要。
 
 成功示例：
 
@@ -241,8 +278,12 @@ PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值�
     "ok": true,
     "mean_hbo": 0.0000123,
     "mean_hbr": -0.0000045,
+    "mean_rso2_pct": 67.5,
+    "latest_rso2_pct": 68.2,
+    "baseline_rso2_pct": 65.0,
     "sample_count": 128,
-    "unit": "a.u."
+    "unit": "a.u.",
+    "rso2_unit": "%"
   }
 }
 ```
@@ -324,7 +365,7 @@ sequenceDiagram
         DEV->>AND: UART 0x02 数据帧
         AND->>PC: serial_data(payload_b64)
         PC->>PC: 缓冲 + 26B 解帧 + 写 CSV + 在线窗口分析
-        PC-->>AND: live_analysis_batch(times, hbo, hbr)
+        PC-->>AND: live_analysis_batch(times, hbo, hbr, rso2?)
     end
     AND->>DEV: UI 停流，UART 写 26B 停流命令
     AND->>PC: bye(reason=user_stop)
@@ -343,7 +384,8 @@ sequenceDiagram
 - [ ] 连接后发送 `hello`
 - [ ] 收到 `hello_ack.ok=true` 后允许 UI 启流
 - [ ] 串口 `read()` 到的原始字节用 `serial_data.payload_b64` 上报
-- [ ] 采集过程中接收 `live_analysis_batch` 并追加绘图
+- [ ] 采集过程中接收 `live_analysis_batch` 并追加 HbO/HbR 曲线
+- [ ] `baseline_ready=true` 后解析 `rso2` / `latest_rso2_pct` 并显示 rSO2
 - [ ] UI 停流后发送 `bye`
 - [ ] 接收 `bye_ack`
 - [ ] 接收并显示 `analysis_result`
@@ -355,7 +397,7 @@ PC：
 - [ ] 长度头拆包 + JSON 解析
 - [ ] `hello` -> `hello_ack`
 - [ ] `serial_data` -> 缓冲 -> 26B 解帧 -> CSV
-- [ ] 采集过程中周期性发送 `live_analysis_batch`
+- [ ] 采集过程中周期性发送 `live_analysis_batch`（含 rSO2，基线窗 30~60 s 就绪后）
 - [ ] `bye` -> `bye_ack` -> 结束采集 -> 后处理
 - [ ] 后处理完成 -> `analysis_result`
 - [ ] 非法包回 `error`
@@ -369,3 +411,4 @@ PC：
 | 2026-06-01 | 初稿 |
 | 2026-06-02 | 精简为安卓主导启停：`hello` / `serial_data` / `bye` / `analysis_result` |
 | 2026-06-03 | 增加在线曲线回传：`live_analysis_batch` |
+| 2026-06-11 | `live_analysis_batch` 增加 rSO2 字段（`rso2`、`baseline_ready`、`latest_rso2_pct`） |

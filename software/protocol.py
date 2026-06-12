@@ -115,10 +115,10 @@ class FrameReader:
     def _read_more(self, timeout_seconds: Optional[float]) -> bool:
         """尽量多从串口读一点字节，补充到内部缓冲区。"""
         if timeout_seconds is None:
-            chunk = self.ser.read(1)
-            if not chunk:
+            chunk = self.ser.read(1) # 读取1个字节
+            if not chunk: # 读取失败
                 return False
-            self.buffer.extend(chunk)
+            self.buffer.extend(chunk) # 添加到缓冲区
             return True
 
         end_time = time.monotonic() + timeout_seconds

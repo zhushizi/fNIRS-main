@@ -1,9 +1,7 @@
 """
-Host TCP Protocol adapter for Android-driven capture mode.
+Host TCP Protocol：安卓上位机与 PC 解码端之间的 JSON/TCP 传输层。
 
-Android owns UART start/stop. The PC side accepts serial_data byte chunks,
-decodes 26B frames through protocol.FrameReader, acknowledges bye, and can send
-analysis_result after post-processing.
+Android 独占 UART 启停；PC 被动接收 serial_data，并可回传分析结果。
 """
 
 from __future__ import annotations
@@ -11,6 +9,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import socket
 import threading
 import time
@@ -53,15 +52,15 @@ class HostTcpSerialBridge:
         self._send_lock = threading.Lock()
         self._client_sock: socket.socket | None = None
 
-        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # 创建一个TCP/IP套接字
-        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # 设置套接字选项，允许重用地址
-        self._server_sock.bind((self.host, self.port)) # 绑定套接字到地址和端口
-        self._server_sock.listen(1) # 开始监听连接
-        self._server_sock.settimeout(0.5) # 设置套接字超时时间
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind((self.host, self.port))
+        self._server_sock.listen(1)
+        self._server_sock.settimeout(0.5)
 
-        print(f"Waiting for Android TCP client on {self.host}:{self.port} ...") # 打印等待Android客户端连接的信息
+        print(f"Waiting for Android TCP client on {self.host}:{self.port} ...")
         try:
-            self._client_sock, client_addr = self._accept_client() # 接受客户端连接
+            self._client_sock, client_addr = self._accept_client()
         except KeyboardInterrupt:
             self._server_sock.close()
             raise
@@ -132,21 +131,9 @@ class HostTcpSerialBridge:
     def send_analysis_result(
         self,
         ok: bool,
-        mean_hbo: float | None = None,
-        mean_hbr: float | None = None,
-        sample_count: int = 0,
         message: str | None = None,
     ) -> None:
         body: dict[str, Any] = {"ok": ok}
-        if ok:
-            body.update(
-                {
-                    "mean_hbo": mean_hbo,
-                    "mean_hbr": mean_hbr,
-                    "sample_count": sample_count,
-                    "unit": "a.u.",
-                }
-            )
         if message:
             body["message"] = message
         self._send_message("analysis_result", body)
@@ -160,12 +147,18 @@ class HostTcpSerialBridge:
         window_end_s: float,
         ok: bool = True,
         message: str | None = None,
+        *,
+        rso2: list[float] | None = None,
+        baseline_ready: bool = False,
+        latest_rso2_pct: float | None = None,
+        baseline_rso2_pct: float | None = None,
     ) -> None:
-        """为安卓端绘图发送一组在线含氧血红蛋白 / 还原血红蛋白批次数据。"""
+        """为安卓端绘图发送一组在线 HbO/HbR/rSO2 批次数据。"""
         body: dict[str, Any] = {
             "ok": ok,
             "sample_count": min(len(times), len(hbo), len(hbr)),
             "unit": "a.u.",
+            "baseline_ready": baseline_ready,
         }
         if ok:
             body.update(
@@ -177,6 +170,15 @@ class HostTcpSerialBridge:
                     "window_end_s": window_end_s,
                 }
             )
+            if rso2 is not None:
+                body["rso2"] = rso2
+                body["sample_count"] = min(
+                    len(times), len(hbo), len(hbr), len(rso2)
+                )
+            if latest_rso2_pct is not None and math.isfinite(latest_rso2_pct):
+                body["latest_rso2_pct"] = float(latest_rso2_pct)
+            if baseline_rso2_pct is not None:
+                body["baseline_rso2_pct"] = float(baseline_rso2_pct)
         if message:
             body["message"] = message
         self._send_message("live_analysis_batch", body)
