@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from .batch_recorder import AndroidLiveOutputRecorder
 from .config import OnlineSettings
 from .live_plotter import LiveAndroidBatchPlotter
 from .rso2 import compute_rso2_series
@@ -19,12 +20,16 @@ class AndroidReporter:
         bridge: HostTcpSerialBridge,
         settings: OnlineSettings | None = None,
         plotter: LiveAndroidBatchPlotter | None = None,
+        recorder: AndroidLiveOutputRecorder | None = None,
     ) -> None:
         self.bridge = bridge
         self.settings = settings or OnlineSettings()
         self.plotter = plotter
+        self.recorder = recorder
 
     def send_live_batch(self, batch: LiveAnalysisBatch) -> None:
+        if self.recorder is not None:
+            self.recorder.append_batch(batch)
         if self.plotter is not None:
             try:
                 self.plotter.update(batch)

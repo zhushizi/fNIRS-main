@@ -116,6 +116,8 @@ DEFAULT_SENSOR_ID = 0x00
 RAW_OUTPUT_CSV = "all_groups.csv"
 INTERLEAVED_OUTPUT_CSV = "interleaved_output.csv"
 PROCESSED_OUTPUT_CSV = "processed_output.csv"
+# 采集中发往安卓的 HbO/HbR 曲线（与 processed_output.csv 同列格式，便于对比）
+ANDROID_LIVE_OUTPUT_CSV = "android_live_output.csv"
 
 
 def wavelength_channel_by_code(code: int) -> WavelengthChannel | None:

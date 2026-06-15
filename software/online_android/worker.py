@@ -38,6 +38,10 @@ class OnlineAnalysisWorker:
     def stop(self) -> None:
         self.stop_event.set()
         if self.thread.is_alive():
+            try:
+                self._analyze_and_send_once()
+            except Exception as exc:
+                print(f"Online analysis final batch skipped: {exc}")
             self.thread.join(
                 timeout=max(1.0, self.settings.update_interval_seconds * 2.0),
             )

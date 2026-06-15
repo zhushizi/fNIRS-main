@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from .batch_builder import IncrementalBatchBuilder
+from .batch_recorder import AndroidLiveOutputRecorder
 from .buffer import OnlineSampleBuffer
 from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
 from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
@@ -30,6 +31,7 @@ class OnlineCaptureSession:
     worker: OnlineAnalysisWorker
     reporter: AndroidReporter
     plotter: LiveAndroidBatchPlotter | None = None
+    recorder: AndroidLiveOutputRecorder | None = None
 
     def feed_sample(
         self,
@@ -42,6 +44,8 @@ class OnlineCaptureSession:
 
     def stop(self) -> None:
         self.worker.stop()
+        if self.recorder is not None:
+            self.recorder.flush()
 
 
 def create_online_session(
@@ -53,6 +57,7 @@ def create_online_session(
     live_plot: bool = False,
     live_plot_hbo_hbr_window_s: float = HBO_HBR_WINDOW_S,
     live_plot_rso2_window_s: float = RSO2_WINDOW_S,
+    android_live_output_path: str | None = None,
 ) -> OnlineCaptureSession:
     """创建并启动在线分析会话（buffer + worker）。"""
     buffer = OnlineSampleBuffer(settings)
@@ -72,7 +77,12 @@ def create_online_session(
             f"HbO/HbR window={live_plot_hbo_hbr_window_s:.0f}s, "
             f"rSO2 window={live_plot_rso2_window_s:.0f}s."
         )
-    reporter = AndroidReporter(bridge, settings, plotter=plotter)
+    recorder = (
+        AndroidLiveOutputRecorder(android_live_output_path)
+        if android_live_output_path
+        else None
+    )
+    reporter = AndroidReporter(bridge, settings, plotter=plotter, recorder=recorder)
     worker = OnlineAnalysisWorker(
         buffer,
         bridge,
@@ -86,4 +96,5 @@ def create_online_session(
         worker=worker,
         reporter=reporter,
         plotter=plotter,
+        recorder=recorder,
     )

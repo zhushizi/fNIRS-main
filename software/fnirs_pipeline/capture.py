@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import csv
 import time
+from pathlib import Path
 
-from config import CHANNEL_NAME, HOST_TCP_DEFAULT_PORT, RAW_OUTPUT_CSV, TIMEOUT
+from config import (
+    ANDROID_LIVE_OUTPUT_CSV,
+    CHANNEL_NAME,
+    HOST_TCP_DEFAULT_PORT,
+    RAW_OUTPUT_CSV,
+    TIMEOUT,
+)
 from online_android import (
     AnalysisResult,
     AndroidReporter,
@@ -43,11 +50,13 @@ def capture_data(
     bridge = HostTcpSerialBridge(port=tcp_port, timeout=TIMEOUT, debug=tcp_debug) # 创建TCP连接
     print(f"Android TCP bridge listening on port {tcp_port}.") # 打印连接信息
     reader = FrameReader(bridge) # 创建帧读取器
+    android_live_output_path = str(Path(csv_filename).parent / ANDROID_LIVE_OUTPUT_CSV)
     online_session = create_online_session(
         bridge,
         prepare_interleaved=prepare_interleaved_dataframe, # 准备交错数据帧
         calculate_series=calculate_concentration_series, # 计算浓度系列
         live_plot=live_plot,
+        android_live_output_path=android_live_output_path,
     )
 
     try:
