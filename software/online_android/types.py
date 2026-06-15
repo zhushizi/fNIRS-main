@@ -21,3 +21,4 @@ class LiveAnalysisBatch:
     rso2: list[float | None] | None = None
     latest_rso2_pct: float | None = None
     baseline_rso2_pct: float | None = None
+    replace_full_series: bool = False

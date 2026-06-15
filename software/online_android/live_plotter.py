@@ -77,16 +77,28 @@ class _LivePlotWindow(QtWidgets.QWidget):
         if not batch.times:
             return
 
-        for elapsed_time, hbo, hbr in zip(batch.times, batch.hbo, batch.hbr):
-            self._times.append(float(elapsed_time))
-            self._hbo.append(float(hbo))
-            self._hbr.append(float(hbr))
+        if batch.replace_full_series:
+            self._times = [float(x) for x in batch.times]
+            self._hbo = [float(x) for x in batch.hbo]
+            self._hbr = [float(x) for x in batch.hbr]
+            self._rso2_times = []
+            self._rso2 = []
+            if batch.rso2:
+                for elapsed_time, rso2 in zip(batch.times, batch.rso2):
+                    if rso2 is not None and np.isfinite(rso2):
+                        self._rso2_times.append(float(elapsed_time))
+                        self._rso2.append(float(rso2))
+        else:
+            for elapsed_time, hbo, hbr in zip(batch.times, batch.hbo, batch.hbr):
+                self._times.append(float(elapsed_time))
+                self._hbo.append(float(hbo))
+                self._hbr.append(float(hbr))
 
-        if batch.rso2:
-            for elapsed_time, rso2 in zip(batch.times, batch.rso2):
-                if rso2 is not None and np.isfinite(rso2):
-                    self._rso2_times.append(float(elapsed_time))
-                    self._rso2.append(float(rso2))
+            if batch.rso2:
+                for elapsed_time, rso2 in zip(batch.times, batch.rso2):
+                    if rso2 is not None and np.isfinite(rso2):
+                        self._rso2_times.append(float(elapsed_time))
+                        self._rso2.append(float(rso2))
 
         self._prune_old_points()
         self._refresh_hbo_hbr()
@@ -94,9 +106,10 @@ class _LivePlotWindow(QtWidgets.QWidget):
 
         latest_rso2 = batch.latest_rso2_pct
         rso2_txt = f"{latest_rso2:.1f}%" if latest_rso2 is not None else "N/A"
+        mode = "replace" if batch.replace_full_series else "append"
         self.status_label.setText(
-            f"TX window {batch.window_start_s:.1f}s–{batch.window_end_s:.1f}s | "
-            f"new points={len(batch.times)} | latest rSO2={rso2_txt}"
+            f"TX {mode} | session {batch.window_start_s:.1f}s–{batch.window_end_s:.1f}s | "
+            f"points={len(batch.times)} | latest rSO2={rso2_txt}"
         )
 
     def _prune_old_points(self) -> None:

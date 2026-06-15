@@ -150,8 +150,8 @@ def prepare_interleaved_dataframe(
     原始单通道 CSV 格式 → 多波长配对后的 interleaved 表。
 
     在线分析与离线 run_pipeline 共用同一套预处理函数；
-    start_at_zero=False 时保留窗口内真实起始时间（在线用），
-    True 时时间轴从 0 起编（离线 run_pipeline 等价行为）。
+    start_at_zero=True 时时间轴从 0 起编（离线/在线全会话分析均使用）；
+    False 时保留窗口内真实起始时间（仅遗留滑动窗场景）。
     """
     if raw_df.empty or len(raw_df) < 2:
         return _empty_interleaved_frame()

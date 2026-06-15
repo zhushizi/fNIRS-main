@@ -30,6 +30,9 @@ class OnlineCaptureSession:
     buffer: OnlineSampleBuffer
     worker: OnlineAnalysisWorker
     reporter: AndroidReporter
+    batch_builder: IncrementalBatchBuilder
+    prepare_interleaved: PrepareInterleavedFn
+    calculate_series: CalculateSeriesFn
     plotter: LiveAndroidBatchPlotter | None = None
     recorder: AndroidLiveOutputRecorder | None = None
 
@@ -45,6 +48,12 @@ class OnlineCaptureSession:
     def stop(self) -> None:
         self.worker.stop()
         if self.recorder is not None:
+            raw_df = self.buffer.snapshot_all()
+            self.recorder.flush_from_raw(
+                raw_df,
+                prepare_interleaved=self.prepare_interleaved,
+                calculate_series=self.calculate_series,
+            )
             self.recorder.flush()
 
 
@@ -95,6 +104,9 @@ def create_online_session(
         buffer=buffer,
         worker=worker,
         reporter=reporter,
+        batch_builder=batch_builder,
+        prepare_interleaved=prepare_interleaved,
+        calculate_series=calculate_series,
         plotter=plotter,
         recorder=recorder,
     )

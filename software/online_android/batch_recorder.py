@@ -1,11 +1,14 @@
-"""将发往安卓的 live_analysis_batch 累积并保存为 processed_output 同款 CSV。"""
+"""将发往安卓的 live_analysis_batch 保存为 processed_output 同款 CSV。"""
 
 from __future__ import annotations
 
 import csv
+from collections.abc import Callable
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
+import pandas as pd
 
 from config import CHANNEL_NAME
 
@@ -15,26 +18,14 @@ HBO_COL = f"{CHANNEL_NAME}_hbo"
 HBR_COL = f"{CHANNEL_NAME}_hbr"
 PROCESSED_HEADER = ["Time", HBO_COL, HBR_COL]
 
-
-def align_times_like_processed(times: list[float]) -> list[float]:
-    """
-    重建与 prepare_interleaved(start_at_zero=True) / processed_output.csv 一致的时间轴。
-
-    在线批次保留窗口内真实起始时间；落盘时按平均配对间隔从 0 起编，便于与离线终算逐行对比。
-    """
-    if not times:
-        return []
-    arr = np.asarray(times, dtype=float)
-    if len(arr) == 1:
-        return [0.0]
-    diffs = np.diff(arr)
-    valid = diffs[np.isfinite(diffs) & (diffs > 0)]
-    increment = float(np.mean(valid)) if valid.size else 0.001
-    return [round(i * increment, 6) for i in range(len(arr))]
+PrepareInterleavedFn = Callable[[pd.DataFrame, bool], pd.DataFrame]
+CalculateSeriesFn = Callable[
+    [pd.DataFrame], Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]
+]
 
 
 class AndroidLiveOutputRecorder:
-    """累积每次 send_live_batch 的 HbO/HbR，采集结束时写入 android_live_output.csv。"""
+    """保存在线全量曲线；采集结束时可用全会话 raw 终算覆盖。"""
 
     def __init__(self, output_path: str | Path | None) -> None:
         self.output_path = Path(output_path) if output_path else None
@@ -46,7 +37,20 @@ class AndroidLiveOutputRecorder:
     def sample_count(self) -> int:
         return len(self._times)
 
+    def set_series(
+        self,
+        times: list[float] | np.ndarray,
+        hbo: list[float] | np.ndarray,
+        hbr: list[float] | np.ndarray,
+    ) -> None:
+        self._times = [float(x) for x in times]
+        self._hbo = [float(x) for x in hbo]
+        self._hbr = [float(x) for x in hbr]
+
     def append_batch(self, batch: LiveAnalysisBatch) -> None:
+        if batch.replace_full_series:
+            self.set_series(batch.times, batch.hbo, batch.hbr)
+            return
         if self.output_path is None:
             return
         for time_s, hbo, hbr in zip(batch.times, batch.hbo, batch.hbr):
@@ -54,21 +58,44 @@ class AndroidLiveOutputRecorder:
             self._hbo.append(float(hbo))
             self._hbr.append(float(hbr))
 
+    def flush_from_raw(
+        self,
+        raw_df: pd.DataFrame,
+        *,
+        prepare_interleaved: PrepareInterleavedFn,
+        calculate_series: CalculateSeriesFn,
+    ) -> bool:
+        """采集结束时用全会话 raw 终算，保证与 processed_output.csv 一致。"""
+        if self.output_path is None or raw_df.empty:
+            return False
+
+        interleaved_df = prepare_interleaved(raw_df, start_at_zero=True)
+        if interleaved_df.empty:
+            return False
+        series = calculate_series(interleaved_df)
+        if series is None:
+            return False
+        times, hbo, hbr = series
+        n = min(len(times), len(hbo), len(hbr))
+        if n == 0:
+            return False
+        self.set_series(times[:n], hbo[:n], hbr[:n])
+        return True
+
     def flush(self) -> str | None:
         if self.output_path is None or not self._times:
             return None
 
-        aligned_times = align_times_like_processed(self._times)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.output_path, "w", newline="", encoding="utf-8") as f_out:
             writer = csv.writer(f_out)
             writer.writerow(PROCESSED_HEADER)
-            for time_s, hbo, hbr in zip(aligned_times, self._hbo, self._hbr):
+            for time_s, hbo, hbr in zip(self._times, self._hbo, self._hbr):
                 writer.writerow([time_s, hbo, hbr])
 
         path_str = str(self.output_path)
         print(
             f"Android live HbO/HbR saved to '{path_str}' "
-            f"({len(self._times)} samples, Time aligned from 0 like processed_output.csv)."
+            f"({len(self._times)} samples, aligned with processed_output.csv)."
         )
         return path_str

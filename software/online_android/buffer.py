@@ -30,9 +30,19 @@ class OnlineSampleBuffer:
     ) -> None:
         with self._lock:
             self._rows.append((elapsed_time, sensor_id, value, wavelength_code))
-            cutoff = elapsed_time - self.retention_seconds
-            while self._rows and self._rows[0][0] < cutoff:
-                self._rows.popleft()
+            if self.retention_seconds is not None:
+                cutoff = elapsed_time - self.retention_seconds
+                while self._rows and self._rows[0][0] < cutoff:
+                    self._rows.popleft()
+
+    def snapshot_all(self) -> pd.DataFrame:
+        """返回本会话至今的全部原始采样（与离线 all_groups.csv 等价）。"""
+        with self._lock:
+            rows = list(self._rows)
+        return pd.DataFrame(
+            rows,
+            columns=["Time (s)", "SensorId", CHANNEL_NAME, "Wavelength"],
+        )
 
     def snapshot_recent(self, window_seconds: float) -> pd.DataFrame:
         with self._lock:

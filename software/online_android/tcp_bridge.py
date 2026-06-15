@@ -152,6 +152,7 @@ class HostTcpSerialBridge:
         baseline_ready: bool = False,
         latest_rso2_pct: float | None = None,
         baseline_rso2_pct: float | None = None,
+        replace_full_series: bool = False,
     ) -> None:
         """为安卓端绘图发送一组在线 HbO/HbR/rSO2 批次数据。"""
         body: dict[str, Any] = {
@@ -159,6 +160,7 @@ class HostTcpSerialBridge:
             "sample_count": min(len(times), len(hbo), len(hbr)),
             "unit": "a.u.",
             "baseline_ready": baseline_ready,
+            "replace_full_series": replace_full_series,
         }
         if ok:
             body.update(

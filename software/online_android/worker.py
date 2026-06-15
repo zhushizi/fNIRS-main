@@ -39,7 +39,7 @@ class OnlineAnalysisWorker:
         self.stop_event.set()
         if self.thread.is_alive():
             try:
-                self._analyze_and_send_once()
+                self._analyze_and_send_once(force_recompute=True)
             except Exception as exc:
                 print(f"Online analysis final batch skipped: {exc}")
             self.thread.join(
@@ -49,7 +49,7 @@ class OnlineAnalysisWorker:
     def _run(self) -> None:
         print(
             "Online analysis enabled: "
-            f"window={self.settings.window_seconds:.1f}s "
+            "full-session interleaved, full-series replace, "
             f"interval={self.settings.update_interval_seconds:.1f}s."
         )
         while not self.stop_event.wait(self.settings.update_interval_seconds):
@@ -60,9 +60,9 @@ class OnlineAnalysisWorker:
             except Exception as exc:
                 print(f"Online analysis skipped one batch: {exc}")
 
-    def _analyze_and_send_once(self) -> None:
-        raw_df = self.buffer.snapshot_recent(self.settings.window_seconds)
-        batch = self.batch_builder.try_build(raw_df)
+    def _analyze_and_send_once(self, *, force_recompute: bool = False) -> None:
+        raw_df = self.buffer.snapshot_all()
+        batch = self.batch_builder.try_build(raw_df, force_recompute=force_recompute)
         if batch is None:
             return
         self.reporter.send_live_batch(batch)

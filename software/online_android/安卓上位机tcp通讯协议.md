@@ -1,4 +1,4 @@
-﻿# 安卓上位机 TCP 通讯协议
+# 安卓上位机 TCP 通讯协议
 
 | 项目 | 说明 |
 |------|------|
@@ -184,11 +184,12 @@ PC 收到 `bye` 后立即回复，表示已经结束采集循环并即将开始�
 
 ### 5.6 `live_analysis_batch`（PC -> 安卓）
 
-PC 在采集过程中周期性发送在线分析结果。该消息用于安卓端实时曲线绘图；每批只包含上次回传后新增的点。
+PC 在采集过程中周期性发送在线分析结果。该消息用于安卓端实时曲线绘图。
 
 | `body` 字段 | 类型 | 必填 | 说明 |
 |-------------|------|------|------|
 | `ok` | bool | 是 | 是否成功生成本批在线结果 |
+| `replace_full_series` | bool | 否 | 默认 `false`。为 `true` 时用本批 `times/hbo/hbr(/rso2)` **整段覆盖**曲线，而非追加 |
 | `times` | number[] | 成功时是 | 曲线点时间，单位秒，相对本次采集开始 |
 | `hbo` | number[] | 成功时是 | 与 `times` 对齐的 HbO 序列（浓度变化量，a.u.） |
 | `hbr` | number[] | 成功时是 | 与 `times` 对齐的 HbR 序列（浓度变化量，a.u.） |
@@ -197,8 +198,8 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 | `latest_rso2_pct` | number | 否 | 本批最后一个有效 rSO2（%），便于大屏数字显示 |
 | `baseline_rso2_pct` | number | 否 | 算法假设的基线 rSO2（%），当前默认 `65.0` |
 | `sample_count` | int | 是 | 本批点数（含 `rso2` 时取 times/hbo/hbr/rso2 最短长度） |
-| `window_start_s` | number | 成功时是 | 本次滑动窗口起始时间 |
-| `window_end_s` | number | 成功时是 | 本次滑动窗口结束时间 |
+| `window_start_s` | number | 成功时是 | 本次分析会话起始时间（全会话模式通常为 `0`） |
+| `window_end_s` | number | 成功时是 | 本次分析会话结束时间 |
 | `unit` | string | 成功时是 | HbO/HbR 单位为 `a.u.`；rSO2 为 `%` |
 | `message` | string | 否 | 失败或调试说明 |
 
@@ -227,6 +228,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
     "baseline_ready": true,
     "latest_rso2_pct": 68.2,
     "baseline_rso2_pct": 65.0,
+    "replace_full_series": true,
     "sample_count": 3,
     "window_start_s": 32.125,
     "window_end_s": 62.127,
@@ -258,8 +260,11 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 
 说明：
 
-- 在线算法使用滑动窗口（默认 30 s），前期数据不足时 PC 可能暂时不发送本消息。
-- 安卓端可按 `times[i] / hbo[i] / hbr[i]` 追加浓度曲线；`baseline_ready=true` 后按 `rso2[i]` 追加 rSO2 趋势，或用 `latest_rso2_pct` 刷新主屏数字。
+- 在线算法使用**全会话 interleaved**（约 1 Hz 检查；仅当有新配对点时重算并发送）。
+- `replace_full_series=true` 时：安卓端应**整段替换** HbO/HbR(/rSO2) 曲线，以反映全长 `I_mean` 与 filtfilt 更新后的结果。
+- `replace_full_series` 缺省或为 `false` 时：按 `times[i]` 追加（旧版兼容）。
+- `baseline_ready=false` 时：仍可能携带 `times/hbo/hbr`，但不带 `rso2`；安卓应显示「基线建立中」。
+- `baseline_ready=true` 后：每批携带全长 `rso2[i]`；无效点为 JSON `null`。
 - rSO2 为固定基线假设下的估算值，仅供实时监护显示；最终准确结果仍以 `analysis_result` 和 `processed_output.csv` 为准。
 
 ### 5.7 `analysis_result`（PC -> 安卓）
