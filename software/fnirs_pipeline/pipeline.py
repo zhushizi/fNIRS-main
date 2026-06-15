@@ -22,6 +22,7 @@ RESULT_TABLE_DIR = os.path.normpath(
 def run_pipeline(
     tcp_port: int = HOST_TCP_DEFAULT_PORT,
     tcp_debug: bool = False,
+    live_plot: bool = False,
 ) -> None:
     """一键跑完整链路：安卓 TCP 采集 -> 预处理 -> 配对 -> MBLL -> CSV 输出。"""
     os.makedirs(RESULT_TABLE_DIR, exist_ok=True)
@@ -39,6 +40,7 @@ def run_pipeline(
             csv_filename=raw_path,
             tcp_port=tcp_port,
             tcp_debug=tcp_debug,
+            live_plot=live_plot,
         )
 
         df = pd.read_csv(raw_path) # 

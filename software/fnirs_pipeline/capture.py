@@ -31,6 +31,7 @@ def capture_data(
     duration_seconds: float | None = None,
     tcp_port: int = HOST_TCP_DEFAULT_PORT,
     tcp_debug: bool = False,
+    live_plot: bool = False,
 ) -> HostTcpSerialBridge:
     """
     通过安卓 TCP 桥采集单通道原始数据并写 CSV。
@@ -46,6 +47,7 @@ def capture_data(
         bridge,
         prepare_interleaved=prepare_interleaved_dataframe, # 准备交错数据帧
         calculate_series=calculate_concentration_series, # 计算浓度系列
+        live_plot=live_plot,
     )
 
     try:

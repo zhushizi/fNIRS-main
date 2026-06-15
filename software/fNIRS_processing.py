@@ -10,7 +10,8 @@
 6. 输出 processed_output.csv
 
 运行模式：安卓独占 UART，PC 通过 TCP 被动接收 serial_data；
-采集中由 online_android 包并行分析并回传 live_analysis_batch（含 rSO2）。
+采集中由 online_android 包并行分析并回传 live_analysis_batch（含 rSO2）；
+可选 --live_plot 在 PC 端同步绘制发往安卓的数据（HbO/HbR 30s 窗，rSO2 60s 窗）。
 采集结束后 run_pipeline 对全段 CSV 做离线 MBLL，并以 analysis_result 回传完成状态（不含均值）。
 
 在线安卓回传实现见 software/online_android/（配置 / 缓冲 / 批次构建 / 上报 / 会话）。
@@ -68,12 +69,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print TCP protocol rx/tx logs (type/seq/byte_len).",
     )
+    parser.add_argument(
+        "--live_plot",
+        action="store_true",
+        help=(
+            "Mirror live_analysis_batch to a local plot while sending to Android "
+            "(HbO/HbR: 30s window, rSO2: 60s window)."
+        ),
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     try:
-        run_pipeline(tcp_port=args.tcp_port, tcp_debug=args.tcp_debug)
+        run_pipeline(
+            tcp_port=args.tcp_port,
+            tcp_debug=args.tcp_debug,
+            live_plot=args.live_plot,
+        )
     except KeyboardInterrupt:
         print("\nStopped by user.")

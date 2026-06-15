@@ -1,6 +1,7 @@
 """TCP 采集中在线分析并回传安卓上位机。"""
 
 from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
+from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
 from .reporter import AndroidReporter, enrich_result_with_rso2
 from .rso2 import (
     DEFAULT_BASELINE_END_S,
@@ -24,6 +25,9 @@ __all__ = [
     "HostTcpProtocolError",
     "HostTcpSerialBridge",
     "LiveAnalysisBatch",
+    "LiveAndroidBatchPlotter",
+    "HBO_HBR_WINDOW_S",
+    "RSO2_WINDOW_S",
     "OnlineCaptureSession",
     "OnlineSettings",
     "compute_rso2_series",

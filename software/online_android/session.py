@@ -11,6 +11,7 @@ import pandas as pd
 from .batch_builder import IncrementalBatchBuilder
 from .buffer import OnlineSampleBuffer
 from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
+from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
 from .reporter import AndroidReporter
 from .worker import OnlineAnalysisWorker
 
@@ -28,6 +29,7 @@ class OnlineCaptureSession:
     buffer: OnlineSampleBuffer
     worker: OnlineAnalysisWorker
     reporter: AndroidReporter
+    plotter: LiveAndroidBatchPlotter | None = None
 
     def feed_sample(
         self,
@@ -48,6 +50,9 @@ def create_online_session(
     settings: OnlineSettings = DEFAULT_ONLINE_SETTINGS,
     prepare_interleaved: PrepareInterleavedFn,
     calculate_series: CalculateSeriesFn,
+    live_plot: bool = False,
+    live_plot_hbo_hbr_window_s: float = HBO_HBR_WINDOW_S,
+    live_plot_rso2_window_s: float = RSO2_WINDOW_S,
 ) -> OnlineCaptureSession:
     """创建并启动在线分析会话（buffer + worker）。"""
     buffer = OnlineSampleBuffer(settings)
@@ -56,7 +61,18 @@ def create_online_session(
         prepare_interleaved=prepare_interleaved,
         calculate_series=calculate_series,
     )
-    reporter = AndroidReporter(bridge, settings)
+    plotter: LiveAndroidBatchPlotter | None = None
+    if live_plot:
+        plotter = LiveAndroidBatchPlotter(
+            hbo_hbr_window_s=live_plot_hbo_hbr_window_s,
+            rso2_window_s=live_plot_rso2_window_s,
+        )
+        print(
+            "Live plot enabled: "
+            f"HbO/HbR window={live_plot_hbo_hbr_window_s:.0f}s, "
+            f"rSO2 window={live_plot_rso2_window_s:.0f}s."
+        )
+    reporter = AndroidReporter(bridge, settings, plotter=plotter)
     worker = OnlineAnalysisWorker(
         buffer,
         bridge,
@@ -65,4 +81,9 @@ def create_online_session(
         reporter=reporter,
     )
     worker.start()
-    return OnlineCaptureSession(buffer=buffer, worker=worker, reporter=reporter)
+    return OnlineCaptureSession(
+        buffer=buffer,
+        worker=worker,
+        reporter=reporter,
+        plotter=plotter,
+    )

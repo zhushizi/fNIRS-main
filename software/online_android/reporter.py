@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from .config import OnlineSettings
+from .live_plotter import LiveAndroidBatchPlotter
 from .rso2 import compute_rso2_series
 from .tcp_bridge import HostTcpSerialBridge
 from .types import AnalysisResult, LiveAnalysisBatch
@@ -17,11 +18,18 @@ class AndroidReporter:
         self,
         bridge: HostTcpSerialBridge,
         settings: OnlineSettings | None = None,
+        plotter: LiveAndroidBatchPlotter | None = None,
     ) -> None:
         self.bridge = bridge
         self.settings = settings or OnlineSettings()
+        self.plotter = plotter
 
     def send_live_batch(self, batch: LiveAnalysisBatch) -> None:
+        if self.plotter is not None:
+            try:
+                self.plotter.update(batch)
+            except Exception as exc:
+                print(f"Live plot update skipped: {exc}")
         try:
             self.bridge.send_live_analysis_batch(
                 times=batch.times,
