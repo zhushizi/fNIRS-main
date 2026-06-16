@@ -59,10 +59,10 @@ class OnlineAnalysisWorker:
                 self._analyze_and_send_once()
             except Exception as exc:
                 print(f"Online analysis skipped one batch: {exc}")
-
     def _analyze_and_send_once(self, *, force_recompute: bool = False) -> None:
         raw_df = self.buffer.snapshot_all()
         batch = self.batch_builder.try_build(raw_df, force_recompute=force_recompute)
         if batch is None:
             return
         self.reporter.send_live_batch(batch)
+
