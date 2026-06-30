@@ -1,267 +1,274 @@
-# 单通道 fNIRS 处理链路说明
+# 双接收源五波长 fNIRS 处理链路说明
 
-本文档说明当前 `software/fNIRS_processing.py` 的单通道处理链路。  
-当前版本已不再使用旧的 64B 多组协议，而是采用 **26B 带帧头/校验/ACK** 的单通道协议。
+本文档说明当前 `software/fNIRS_processing.py` → `fnirs_pipeline` 的处理链路。
+当前版本采用 **双接收源（S1_D1 长距 / S1_D2 短距）+ 五波长（850/810/770/730/700 nm）** 几何，
+数据经 **安卓 TCP 桥接** 进入 PC 解码端，最终反演 **HbO / HbR / Cyt** 三色团浓度并估算 **rSO₂**。
+
+> 旧版为单通道双波长（660/940）+ 本地串口直连，本文档不再描述该路径，
+> 相关脚本（`adc_live.py` 等）仅作历史保留。
 
 ---
 
 ## 1. 总览
 
 ```text
-26B 串口数据帧
-  -> 帧头同步 / 长度校验 / checksum 校验
-  -> 回 0x03 ACK
-  -> capture_data -> all_groups.csv
-  -> threshold_filter
-  -> butter_lowpass_filter
-  -> sliding_window_rms
-  -> interleave_mode_blocks
-  -> interleaved_output.csv
+安卓 App（独占 UART 启停）
+  -> TCP/JSON 转发设备串口字节（serial_data, base64）
+  -> PC 作为 TCP Server 被动接收（HostTcpSerialBridge）
+  -> FrameReader 从字节流同步 26B 数据帧（帧头/长度/checksum）
+  -> parse_data_frame -> DataSample(detector_code, wavelength_code, value)
+  -> capture_data
+       ├─ 写 all_groups.csv
+       └─ online_session.feed_sample（喂给在线分析缓冲）
+  -> prepare_interleaved_dataframe
+       -> butter_lowpass_filter（按 Detector/Wavelength 分组）
+       -> sliding_window_rms（按段 RMS）
+       -> aggregate_wavelength_cycles（凑齐 2×5 成一行）
+       -> interleaved_output.csv
   -> process_csv_dataset
-      -> 660/940 配对
-      -> intensities_to_od_changes
-      -> smart_bandpass
-      -> mbll
-      -> cbsi
-  -> processed_output.csv
+       -> compute_all_channel_concentrations
+            ├─ intensities_to_od_changes（每个接收源）
+            ├─ smart_bandpass（降采样 + 带通）
+            ├─ short_separation_regression（短距校正长距 -> *_ssr）
+            └─ generalized_mbll（HbO/HbR + 残差投影 Cyt）
+       -> select_output_series（取 config.OUTPUT_CHANNEL）
+       -> processed_output.csv
+       -> summarize_processed_concentrations（+ rSO₂ 摘要）
+
+并行：OnlineAnalysisWorker 每 ~1s 对【全会话】重算一次，
+      经 reporter 把整段 HbO/HbR/Cyt/rSO₂ 回传安卓（replace_full_series=true），
+      并镜像写 android_live_output.csv。
 ```
 
 ---
 
-## 2. 串口协议层
+## 2. 传输与协议层
 
-### 2.1 串口参数
+### 2.1 安卓 TCP 桥接（`online_android/tcp_bridge.py`）
 
-- 波特率：`115200`
-- 帧头：`0x55 0xAA`
-- 固定帧长：`26B`
-- 类型：
-  - `0x01` 指令帧
-  - `0x02` 数据帧
-  - `0x03` 应答帧
+- PC 监听 `HOST_TCP_LISTEN_HOST:HOST_TCP_DEFAULT_PORT`（默认 `0.0.0.0:9000`），安卓主动连接
+- 消息为 `4 字节大端长度 + UTF-8 JSON`，字段：`ver / type / seq / ts_ms / body`
+- 关键消息类型：
+  - `hello` / `hello_ack`：握手
+  - `serial_data`：安卓上行，`body.payload_b64` 为 base64 的设备串口字节
+  - `heartbeat`：心跳
+  - `bye` / `bye_ack`：安卓请求结束采集（PC 置 `capture_finished`）
+  - `live_analysis_batch` / `analysis_result`：PC 下行的分析结果
+- `HostTcpSerialBridge` 把收到的串口字节缓存，并暴露 `read()` / `in_waiting`，从而对上层伪装成一个串口对象
 
-### 2.2 校验规则
+### 2.2 26B 帧格式（`config.py` / `protocol.py`）
 
-- 校验范围：从 **长度字节** 到 **payload 最后一个字节**
-- 校验方式：**累加和低字节**
+- 帧头：`0x55 0xAA`，固定帧长：`0x1A`（26B），payload `21B`
+- 类型：`0x01` 指令帧 / `0x02` 数据帧 / `0x03` 应答帧
+- 校验：从 **长度字节** 累加到 **payload 末尾** 的低字节
+- ACK：当前固件不回 ACK，`send_frame_with_ack` 直接返回 True（启停由安卓侧控制）
 
-### 2.3 ACK / 重发
-
-- ACK 超时：`10ms`
-- 最多重发：`2` 次
-- 上位机收到 `0x02` 数据帧后会立即回 `0x03` ACK
-
-### 2.4 指令帧 `0x01`
-
-payload 共 21 字节，目前使用：
+### 2.3 数据帧 `0x02` payload
 
 | 字节 | 含义 |
 |------|------|
-| 0 | 启停：`0x00` 停止，`0x01` 启动 |
-| 1 | 光强单字节：`0x00~0xFF` |
-| 2 | 保留，当前填 0 |
-| 3-20 | 保留，当前填 0 |
+| 0 | 波长编号：`0x00=未点亮`，`0x01=850`，`0x02=810`，`0x03=770`，`0x04=730`，`0x05=700` nm |
+| 1 | 接收源编号：`0x01=S1_D1`，`0x02=S1_D2` |
+| 2-5 | 采集值（4 字节大端无符号） |
+| 6-20 | 保留 |
 
-默认光强：`0xC8`（200）
-
-### 2.5 数据帧 `0x02`
-
-payload 共 21 字节，目前使用：
-
-| 字节 | 含义 |
-|------|------|
-| 0 | 波长编号：`0x00=未点亮`，`0x01=940nm`，`0x02=660nm` |
-| 1 | 传感器编号：当前固定 `0x00`（单个传感器模块 `S1_D1`） |
-| 2 | 采集值低字节 |
-| 3 | 采集值高字节 |
-| 4-19 | 保留 |
-| 20 | 保留位，当前固定 `0x00` |
-
-单个数据帧只携带 **一个通道、一个波长下的一次采样值**。
-
-说明：
-
-- 当前上位机里，`payload byte0` 的**波长编号**同时承担了原先“emitter-state”的语义（含未点亮 `0x00`）。
-- **`0x00` 行在 `run_pipeline` 读入 `all_groups.csv` 后即丢弃**，不参与 RMS 切段与 660/940 交错配对。
-- 分段、配对、MBLL 组织仍只依赖 CSV 中的 `Wavelength` 列（有效值仅为 `1` 与 `2`）。
+单帧只携带 **一个接收源、一个波长下的一次采样值**。
+`Wavelength=0x00`（OFF）行在配对前丢弃，不参与 RMS 切段与多波长配对。
 
 ---
 
-## 3. 原始采集层
-
-### 3.1 `capture_data`
+## 3. 原始采集层（`fnirs_pipeline/capture.py`）
 
 `capture_data()` 的职责：
 
-1. 打开串口
-2. 发送启动命令帧
-3. 按帧头同步读取 26B 数据帧
-4. 校验通过后回 ACK
-5. 将数据写入 `all_groups.csv`
-6. 采集结束后发送停止命令帧
+1. 打开 TCP 桥（`HostTcpSerialBridge`）并等待安卓连接
+2. 创建并启动在线分析会话 `create_online_session`
+3. 用 `FrameReader` 按帧头同步读取 26B 数据帧
+4. 校验通过后 `parse_data_frame` 解出 `DataSample`
+5. `feed_sample` 喂给在线缓冲，并把每帧写入 `all_groups.csv`
+6. 收到安卓 `bye`（`capture_finished`）或连接关闭时结束采集
 
-### 3.2 `all_groups.csv` 结构
+### `all_groups.csv` 结构
 
 ```text
-Time (s),SensorId,S1_D1,Wavelength
+Time (s),DetectorId,Channel,Wavelength,Value
 ```
 
-字段说明：
-
-- `Time (s)`：接收该帧时的相对时间
-- `SensorId`：传感器编号，当前固定为 `0`
-- `S1_D1`：当前单通道采样值
-- `Wavelength`：波长编号（`0=未点亮`，`1=940`，`2=660`；流水线中会去掉 `0`）
-
-这里不再有 `Short / Long1 / Long2`，因为当前几何只有 **单物理通道 `S1_D1`**。
+- `Time (s)`：相对接收时间
+- `DetectorId`：接收源编号（`1=S1_D1`，`2=S1_D2`）
+- `Channel`：接收源名（`S1_D1` / `S1_D2`）
+- `Wavelength`：波长编号（`0=OFF`，`1..5` 对应五波长；流水线中去掉 `0`）
+- `Value`：4 字节采样值
 
 ---
 
-## 4. 预处理层
+## 4. 预处理层（`fnirs_pipeline/preprocessing.py`）
 
-输入：`all_groups.csv`  
+入口：`prepare_interleaved_dataframe`
+输入：`all_groups.csv`（或在线缓冲快照）
 输出：`interleaved_output.csv`
 
-### 4.1 阈值滤波 `threshold_filter`
+### 4.1 丢弃 OFF 行
 
-- 针对 `S1_D1` 做阈值过滤
-- 越界样本先置空，再插值补齐
+`Wavelength == WAVELENGTH_OFF_CODE(0x00)` 的样本先剔除。
 
 ### 4.2 低通滤波 `butter_lowpass_filter`
 
-- 对 `S1_D1` 沿时间轴做低通
-- 数据太短时自动跳过，避免 `filtfilt` 报错
+- 按 `(DetectorId, Wavelength)` 分组分别低通，避免不同 LED/PD 电平互相污染
+- 数据太短自动跳过，避免 `filtfilt` 报错
 
 ### 4.3 分段 RMS `sliding_window_rms`
 
-- 依据 `Wavelength` 变化切段
-- 每段把 `S1_D1` 用 RMS 代表值回填整段
+- 依据 `(DetectorId, Wavelength)` 连续段切段
+- 每段把采样值压成一行 RMS 代表值，时间取段内均值
+- 目的：用一个稳定值代表同一接收源/波长时隙，便于后续配对
 
-目的仍然是：
+### 4.4 多波长配对 `aggregate_wavelength_cycles`
 
-- 用一个稳定值代表同一波长时隙
-- 方便后续 660 / 940 配对
+- 在时序上每凑齐 `DETECTOR_CHANNELS × WAVELENGTH_CHANNELS`（当前 2×5=10 个键）即输出一行
+- 一行包含全部 10 个光强列
+- 配对完成后按平均步长重建等间隔时间戳（可从 0 起算）
 
-### 4.4 模式交错 `interleave_mode_blocks`
-
-- 将相邻的两个波长块成对处理
-- 自动识别哪一块对应 660，哪一块对应 940
-- 当两块长度不一致时，按较短块长度截断（不做末值补齐）
-- 生成一行一对的输出
-
-### 4.5 `interleaved_output.csv` 结构
+### `interleaved_output.csv` 结构
 
 ```text
-Time (s),S1_D1_660,S1_D1_940
+Time (s),S1_D1_850,S1_D1_810,S1_D1_770,S1_D1_730,S1_D1_700,S1_D2_850,...,S1_D2_700
 ```
 
-每一行表示一组已经对齐好的双波长样本。
+每行表示一组对齐好的「2 接收源 × 5 波长」光强样本。
 
 ---
 
-## 5. 后处理层
+## 5. 后处理层（`fnirs_pipeline/mbll.py`）
 
-入口函数：`process_csv_dataset`
-
-输入：`interleaved_output.csv`  
+入口：`process_csv_dataset`（离线终算）/ `calculate_concentration_series`（在线）
+核心：`compute_all_channel_concentrations`
+输入：`interleaved_output.csv`
 输出：`processed_output.csv`
 
-### 5.1 双波长配对
+### 5.1 OD 转换
 
-当前已不需要旧版本那种：
+对每个接收源，按 `WAVELENGTH_CHANNELS` 顺序堆叠为 `(5, N)` 光强矩阵，
+再 `nsp.intensities_to_od_changes` 得到 ΔOD。
 
-- 8 组
-- 每组 3 路
-- 共 48 个样本量
+### 5.2 带通滤波 `smart_bandpass`
 
-现在直接从 `interleaved_output.csv` 中取：
+- 默认带通 `BP_LOW_HZ ~ BP_HIGH_HZ`（`0.01 ~ 0.1 Hz`），4 阶 SOS
+- 高采样率时先降采样到 `BP_TARGET_FS_HZ`（默认 20 Hz）再滤波，最后插值回原长度
+- 样本太短时自动跳过
 
-- `S1_D1_660`
-- `S1_D1_940`
+### 5.3 短距回归校正 SSR `short_separation_regression`
 
-组合为形状 `(2, N)` 的样本矩阵。
+- 取距离最小的接收源（`S1_D2`，短距）作为头皮/全身干扰参考
+- 对每个波长，用短距 ΔOD 对长距 ΔOD 做最小二乘回归并扣除
+- 生成新通道 `S1_D1_ssr`（校正后的长距）
 
-### 5.2 `build_channel_info`
+### 5.4 广义 MBLL `generalized_mbll`
 
-当前几何固定为：
+分步反演，返回 `(3, N)`，行顺序 HbO / HbR / Cyt：
 
-- 通道名：`S1_D1`
-- 距离：`3.0 cm`（来自 `config.py`）
-- 波长：`660 / 940`
+1. HbO/HbR 消光系数来自 nirsimple 内置表（`wray`），插值到五个波长
+2. pathlength = `DPF(波长, 年龄) × 源探距离`
+3. 先用 `pinv(A_hb) @ ΔOD` 解出 HbO/HbR
+4. 计算 Hb 拟合残差 `ΔOD - A_hb·ΔC_hb`
+5. 把 Cyt 基向量投影到 Hb 零空间，再从残差中解出 Cyt（UCL-NIR 差分消光系数）
 
-### 5.3 OD 转换
+### 5.5 输出通道选择 `select_output_series`
 
-```python
-delta_od = nsp.intensities_to_od_changes(samples)
-```
+- 从全部通道结果中取 `config.OUTPUT_CHANNEL`（默认 `S1_D1_ssr`）
+- 去除非有限值后写盘
 
-### 5.4 带通滤波 `smart_bandpass`
+### `processed_output.csv` 结构
 
-- 默认带通：`0.05 ~ 0.1 Hz`
-- 样本太短时自动跳过滤波
-
-### 5.5 MBLL 与 CBSI
-
-使用单通道的：
-
-- `channel_names = [S1_D1, S1_D1]`
-- `wavelengths = [660, 940]`
-- `distances = [3.0, 3.0]`
-
-最终输出：
-
-- `S1_D1_hbo`
-- `S1_D1_hbr`
-
-### 5.6 `processed_output.csv` 结构
+列前缀取自 `OUTPUT_CHANNEL`：
 
 ```text
-Time,S1_D1_hbo,S1_D1_hbr
+Time,S1_D1_ssr_hbo,S1_D1_ssr_hbr,S1_D1_ssr_cyt
 ```
 
-这仍然保持旧版的输出风格：  
-第一列时间，后面采用 `{ChannelName}_{Type}` 形式。
+### 5.6 rSO₂ 摘要 `summarize_processed_concentrations`
+
+- 输出 HbO/HbR/Cyt 均值
+- 若基线窗内有样本，附加 rSO₂（见第 7 节）
 
 ---
 
-## 6. 关键配置
+## 6. 在线分析与回传（`online_android/`）
+
+- `OnlineSampleBuffer`：累积本会话全部样本
+- `OnlineAnalysisWorker`：每 `update_interval_seconds`（默认 1s）触发一次
+- `IncrementalBatchBuilder.try_build`：
+  - 对**全会话**原始数据重跑 `prepare_interleaved → calculate_series`
+  - 仅当配对行数增加（或强制）时才重算
+  - 每次发送【整段】曲线并置 `replace_full_series=true`
+- `AndroidReporter.send_live_batch`：经 TCP 回传 `live_analysis_batch`，
+  同时镜像写 `android_live_output.csv`，可选 PC 端 `live_plotter` 绘图
+- 采集结束 `stop()` 时做一次终算落盘
+
+---
+
+## 7. rSO₂ 估算（`online_android/rso2.py`）
+
+`compute_rso2_series` 在固定基线假设下，由 ΔHbO/ΔHbR 估算 rSO₂(%)：
+
+- 基线时段：`[baseline_start_s, baseline_end_s]`（默认 `30~60s`）
+- 基线 HbT：`DEFAULT_BASELINE_HBT_uM`（默认 `80 μM`）
+- 基线 rSO₂：`DEFAULT_BASELINE_RSO2_PCT`（默认 `65%`）
+- 用基线段内 ΔHbO/ΔHbR 均值做校正，得到绝对 HbO/HbR，
+  再 `rSO₂ = 100 × HbO_abs / (HbO_abs + HbR_abs)`
+- 基线窗内无样本时返回 None
+
+> 注意：基线 HbT 与 rSO₂ 为假设常量而非实测，因此 rSO₂ 反映 **相对趋势**，不是绝对标定值。
+
+---
+
+## 8. 关键配置
 
 位置：`software/config.py`
 
-重点参数：
+```text
+SERIAL_PORT / BAUD_RATE            # 旧串口脚本兜底
+HOST_TCP_DEFAULT_PORT = 9000       # 安卓 TCP 端口
+SAMPLING_RATE_HZ = 250.0
+DETECTOR_CHANNELS                  # S1_D1@3.0cm, S1_D2@1.0cm
+WAVELENGTH_CHANNELS                # 850/810/770/730/700 nm
+OUTPUT_CHANNEL = "S1_D1_ssr"       # 输出通道
+BP_LOW_HZ=0.01 / BP_HIGH_HZ=0.1 / BP_ORDER=4 / BP_TARGET_FS_HZ=20.0
+MBLL_DEFAULT_AGE = 27
+CYT_DIFFERENCE_EXTINCTION          # 五波长 Cyt 差分消光系数（UCL-NIR）
+```
 
-- `SERIAL_PORT`
-- `BAUD_RATE = 115200`
-- `ACK_TIMEOUT_SECONDS = 0.01`
-- `MAX_RETRIES = 2`
-- `DEFAULT_INTENSITY_MA = 200`
-- `SOURCE_DETECTOR_DISTANCE_CM = 3.0`
+`config.py` 在导入时自检：波长数 ≥ 3、code/emitter/detector 不重复、
+OFF code 不在表内、Cyt 消光系数覆盖全部波长、`OUTPUT_CHANNEL` 合法。
 
 ---
 
-## 7. 与旧版的核心差异
+## 9. 与旧版的核心差异
 
-| 项目 | 旧版 | 当前版 |
+| 项目 | 旧版（单通道） | 当前版（双接收五波长） |
 |------|------|--------|
-| 协议 | 64B 裸帧 | 26B 带帧头/校验/ACK |
-| 通道数 | 8组 x 3 路 | 1 路 `S1_D1` |
-| 波长组织 | 由多组 emitter 状态切段 | 单通道按 `Wavelength` 的 660/940 配对 |
-| 原始 CSV | `G0...G7` 宽表 | `Time,S1_D1,Wavelength` |
-| 处理中间表 | 33 列宽表 | 单通道双波长配对表 |
-| 几何 | 短距/长距混合 | 单距离 `3.0 cm` |
+| 数据来源 | 本地串口直连 | 安卓 TCP 桥接（PC 被动收） |
+| 通道数 | 1 路 `S1_D1` | 2 路 `S1_D1`(长) + `S1_D2`(短) |
+| 波长 | 660 / 940 | 850 / 810 / 770 / 730 / 700 |
+| 配对 | 660/940 两块交错 | 2×5=10 键凑齐成一行 |
+| 反演产物 | HbO / HbR | HbO / HbR / Cyt + rSO₂ |
+| 头皮干扰 | 无 | 短距回归校正（SSR -> `*_ssr`） |
+| 采样值 | 2 字节 | 4 字节大端 |
+| 在线分析 | 无 | 后台 worker 全量回传安卓 |
+| 原始 CSV | `Time,S1_D1,Wavelength` | `Time,DetectorId,Channel,Wavelength,Value` |
 
 ---
 
-## 8. 运行建议
+## 10. 运行建议
 
-1. 先确认 `config.py` 中串口端口正确
-2. 用 `python visualizer.py` 验证控制命令与 ACK
-3. 用 `python adc_live.py` 查看实时波形
-4. 用 `python fNIRS_processing.py` 完成一次采集和处理
+1. 确认 `config.py` 中 `HOST_TCP_DEFAULT_PORT`、`DETECTOR_CHANNELS`、`OUTPUT_CHANNEL` 正确
+2. 先启动 `python fNIRS_processing.py`，再让安卓连接并发送 `serial_data`
+3. 需要 PC 端实时观察时加 `--live_plot`，排查协议时加 `--tcp_debug`
+4. 结果在 `software/result_table/<时间戳>/` 下
 
 如果 `processed_output.csv` 行数太少，优先检查：
 
-- 是否确实收到了 `0x02` 数据帧
-- `Wavelength` 是否在 660 / 940 之间切换
-- ACK 是否正常返回
-- 原始采样是否足够形成多个配对样本
+- 是否确实收到了 `0x02` 数据帧（看采集日志）
+- `Wavelength` 是否在 1..5 之间正常轮转、`DetectorId` 是否覆盖 1 和 2
+- 是否能凑齐完整的 2×5 配对周期
+- 基线窗（默认 30~60s）内是否有样本（影响 rSO₂）
