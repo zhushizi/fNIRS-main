@@ -7,7 +7,6 @@ from collections import deque
 
 import pandas as pd
 
-from config import CHANNEL_NAME
 
 from .config import OnlineSettings
 
@@ -18,18 +17,19 @@ class OnlineSampleBuffer:
     def __init__(self, settings: OnlineSettings | None = None) -> None:
         cfg = settings or OnlineSettings()
         self.retention_seconds = cfg.buffer_retention_seconds
-        self._rows: deque[tuple[float, int, float, int]] = deque()
+        self._rows: deque[tuple[float, int, str, int, float]] = deque()
         self._lock = threading.Lock()
 
     def append(
         self,
         elapsed_time: float,
-        sensor_id: int,
+        detector_id: int,
         value: float,
         wavelength_code: int,
+        channel_name: str = "",
     ) -> None:
         with self._lock:
-            self._rows.append((elapsed_time, sensor_id, value, wavelength_code))
+            self._rows.append((elapsed_time, detector_id, channel_name, wavelength_code, value))
             if self.retention_seconds is not None:
                 cutoff = elapsed_time - self.retention_seconds
                 while self._rows and self._rows[0][0] < cutoff:
@@ -41,13 +41,13 @@ class OnlineSampleBuffer:
             rows = list(self._rows)
         return pd.DataFrame(
             rows,
-            columns=["Time (s)", "SensorId", CHANNEL_NAME, "Wavelength"],
+            columns=["Time (s)", "DetectorId", "Channel", "Wavelength", "Value"],
         )
 
     def snapshot_recent(self, window_seconds: float) -> pd.DataFrame:
         with self._lock:
             if not self._rows:
-                rows: list[tuple[float, int, float, int]] = []
+                rows: list[tuple[float, int, str, int, float]] = []
             else:
                 latest_time = self._rows[-1][0]
                 cutoff = latest_time - window_seconds
@@ -55,5 +55,5 @@ class OnlineSampleBuffer:
 
         return pd.DataFrame(
             rows,
-            columns=["Time (s)", "SensorId", CHANNEL_NAME, "Wavelength"],
+            columns=["Time (s)", "DetectorId", "Channel", "Wavelength", "Value"],
         )

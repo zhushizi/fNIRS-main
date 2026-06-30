@@ -1,16 +1,17 @@
 """
-单通道 fNIRS 上位机的集中配置文件。
+双接收源五波长 fNIRS 上位机的集中配置文件。
 
 这里统一放置：
 1. 串口参数
 2. 26B 协议常量
-3. 单通道几何与波长表（改波长 / 增波长只改 WAVELENGTH_CHANNELS）
-4. 输出文件名
+3. S1-D1 / S1-D2 几何与五波长表
+4. HbO / HbR / Cyt 反演、输出通道选择与输出文件名
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 # 串口端口号。Windows 例如 "COM5"，Linux/macOS 可写成 /dev/ttyUSB0 之类。
 SERIAL_PORT = "COM6"
@@ -42,15 +43,31 @@ ACK_TIMEOUT_SECONDS = 0.05
 MAX_RETRIES = 2
 
 # 默认下发的命令参数
-DEFAULT_INTENSITY_MA = 200
+DEFAULT_INTENSITY_MA = 0x18
 DEFAULT_STREAM_ENABLED = True
+DEFAULT_COMMAND_CHANNEL_CODE = 0x01
 
-# 当前软件按单物理通道处理：S1_D1
+# 默认通道名保留给旧脚本兜底；主处理链路使用 DETECTOR_CHANNELS。
 CHANNEL_NAME = "S1_D1"
 SOURCE_DETECTOR_DISTANCE_CM = 3.0
 
 # 数据帧 payload byte0：两路均未点亮
 WAVELENGTH_OFF_CODE = 0x00
+DETECTOR_OFF_CODE = 0x00
+
+# ---------------------------------------------------------------------------
+# 输出通道选择（离线 processed_output、在线回传安卓、live 曲线均使用此通道）
+# 可选: "S1_D1" | "S1_D2" | "S1_D1_ssr"
+# ---------------------------------------------------------------------------
+OutputChannelName = Literal["S1_D1", "S1_D2", "S1_D1_ssr"]
+OUTPUT_CHANNEL: OutputChannelName = "S1_D1_ssr"
+VALID_OUTPUT_CHANNELS: tuple[OutputChannelName, ...] = ("S1_D1", "S1_D2", "S1_D1_ssr")
+
+
+def _nm_suffix(nm: float) -> str:
+    if nm == int(nm):
+        return str(int(nm))
+    return str(nm).replace(".", "_")
 
 
 @dataclass(frozen=True)
@@ -58,9 +75,9 @@ class WavelengthChannel:
     """
     单路活跃波长。
 
-    - code: 协议 Wavelength 列取值（如 0x01、0x02）
-    - emitter_nm: 光源标称波长，用于 CSV 列名后缀（如 S1_D1_940）
-    - mbll_nm: MBLL / DPF 反演用的光学波长（可与 emitter 不同，如 940→860）
+    - code: 协议 Wavelength 列取值（LED1..LED5）
+    - emitter_nm: 光源标称波长，用于 CSV 列名后缀（如 S1_D1_850）
+    - mbll_nm: MBLL / DPF 反演用的光学波长
     """
 
     code: int
@@ -72,36 +89,86 @@ class WavelengthChannel:
         return intensity_column_name(self.emitter_nm)
 
 
-def intensity_column_name(emitter_nm: float) -> str:
-    """由光源标称波长生成光强列名，如 S1_D1_940。"""
-    if emitter_nm == int(emitter_nm):
-        suffix = str(int(emitter_nm))
-    else:
-        suffix = str(emitter_nm).replace(".", "_")
-    return f"{CHANNEL_NAME}_{suffix}"
+@dataclass(frozen=True)
+class DetectorChannel:
+    """
+    单个接收源形成的物理通道。
+
+    - code: 协议 DetectorId / SensorId 取值（PD1=0x01，PD2=0x02）
+    - name: 输出列名前缀（S1_D1 / S1_D2）
+    - distance_cm: 源探距离，进入 MBLL pathlength
+    """
+
+    code: int
+    name: str
+    distance_cm: float
+
+
+def intensity_column_name(emitter_nm: float, channel_name: str = CHANNEL_NAME) -> str:
+    """由通道名和光源标称波长生成光强列名，如 S1_D1_850。"""
+    return f"{channel_name}_{_nm_suffix(emitter_nm)}"
+
+
+def detector_channel_by_code(code: int) -> DetectorChannel | None:
+    for ch in DETECTOR_CHANNELS:
+        if ch.code == code:
+            return ch
+    return None
+
+
+def intensity_column_for(channel_name: str, emitter_nm: float) -> str:
+    return intensity_column_name(emitter_nm, channel_name)
 
 
 # ---------------------------------------------------------------------------
-# 活跃波长表（按 MBLL samples 矩阵的行顺序排列）
-# 增删波长：只改此元组；协议码不可重复，emitter_nm 不可重复。
+# 接收源与活跃波长表（按 samples 矩阵的行顺序排列）
 # ---------------------------------------------------------------------------
-WAVELENGTH_CHANNELS: tuple[WavelengthChannel, ...] = (
-    WavelengthChannel(code=0x01, emitter_nm=940.0, mbll_nm=860.0),
-    WavelengthChannel(code=0x02, emitter_nm=660.0, mbll_nm=660.0),
-    # 示例：第三波长
-    # WavelengthChannel(code=0x03, emitter_nm=850.0, mbll_nm=850.0),
+DETECTOR_CHANNELS: tuple[DetectorChannel, ...] = (
+    DetectorChannel(code=0x01, name="S1_D1", distance_cm=3.0),
+    DetectorChannel(code=0x02, name="S1_D2", distance_cm=1.0),
 )
 
-# 兼容旧代码的别名（由 WAVELENGTH_CHANNELS 派生）
-WAVELENGTH_940_CODE = WAVELENGTH_CHANNELS[0].code
-WAVELENGTH_660_CODE = WAVELENGTH_CHANNELS[1].code
+WAVELENGTH_CHANNELS: tuple[WavelengthChannel, ...] = (
+    WavelengthChannel(code=0x01, emitter_nm=850.0, mbll_nm=850.0),
+    WavelengthChannel(code=0x02, emitter_nm=810.0, mbll_nm=810.0),
+    WavelengthChannel(code=0x03, emitter_nm=770.0, mbll_nm=770.0),
+    WavelengthChannel(code=0x04, emitter_nm=730.0, mbll_nm=730.0),
+    WavelengthChannel(code=0x05, emitter_nm=700.0, mbll_nm=700.0),
+)
+
+# 兼容旧代码的别名
+WAVELENGTH_850_CODE = WAVELENGTH_CHANNELS[0].code
+WAVELENGTH_810_CODE = WAVELENGTH_CHANNELS[1].code
+WAVELENGTH_770_CODE = WAVELENGTH_CHANNELS[2].code
+WAVELENGTH_730_CODE = WAVELENGTH_CHANNELS[3].code
+WAVELENGTH_700_CODE = WAVELENGTH_CHANNELS[4].code
+WAVELENGTH_940_CODE = WAVELENGTH_850_CODE
+WAVELENGTH_660_CODE = WAVELENGTH_700_CODE
 MBLL_WAVELENGTH_WL1_NM = WAVELENGTH_CHANNELS[0].mbll_nm
 MBLL_WAVELENGTH_WL2_NM = WAVELENGTH_CHANNELS[1].mbll_nm
 
 WAVELENGTH_BY_CODE = {ch.code: ch.emitter_nm for ch in WAVELENGTH_CHANNELS}
 CODE_BY_WAVELENGTH = {ch.emitter_nm: ch.code for ch in WAVELENGTH_CHANNELS}
 ACTIVE_WAVELENGTH_CODES = frozenset(ch.code for ch in WAVELENGTH_CHANNELS)
-INTENSITY_COLUMNS: tuple[str, ...] = tuple(ch.intensity_column for ch in WAVELENGTH_CHANNELS)
+DETECTOR_BY_CODE = {ch.code: ch.name for ch in DETECTOR_CHANNELS}
+ACTIVE_DETECTOR_CODES = frozenset(ch.code for ch in DETECTOR_CHANNELS)
+CHANNEL_NAMES: tuple[str, ...] = tuple(ch.name for ch in DETECTOR_CHANNELS)
+INTENSITY_COLUMNS: tuple[str, ...] = tuple(
+    intensity_column_for(det.name, wl.emitter_nm)
+    for det in DETECTOR_CHANNELS
+    for wl in WAVELENGTH_CHANNELS
+)
+
+# Cyt / oxCCO 差分消光系数，单位 OD / cm / mM（UCL-NIR-Spectra）。
+CYT_DIFFERENCE_EXTINCTION = {
+    700.0: 2.4148076,
+    730.0: 1.8012364,
+    770.0: 1.9650957,
+    810.0: 2.3166136,
+    850.0: 2.2899045,
+}
+CYT_RELATIVE_EXTINCTION = CYT_DIFFERENCE_EXTINCTION
+CHROMOPHORE_TYPES: tuple[str, ...] = ("hbo", "hbr", "cyt")
 
 MBLL_DEFAULT_AGE = 27
 
@@ -116,7 +183,6 @@ DEFAULT_SENSOR_ID = 0x00
 RAW_OUTPUT_CSV = "all_groups.csv"
 INTERLEAVED_OUTPUT_CSV = "interleaved_output.csv"
 PROCESSED_OUTPUT_CSV = "processed_output.csv"
-# 采集中发往安卓的 HbO/HbR 曲线（与 processed_output.csv 同列格式，便于对比）
 ANDROID_LIVE_OUTPUT_CSV = "android_live_output.csv"
 
 
@@ -131,9 +197,26 @@ def mbll_wavelengths_nm() -> list[float]:
     return [ch.mbll_nm for ch in WAVELENGTH_CHANNELS]
 
 
+def intensity_columns_for_detector(detector: DetectorChannel) -> tuple[str, ...]:
+    return tuple(intensity_column_for(detector.name, ch.emitter_nm) for ch in WAVELENGTH_CHANNELS)
+
+
+def processed_column_names(channel: str | None = None) -> tuple[str, ...]:
+    """生成 processed_output 列名，如 S1_D1_ssr_hbo。"""
+    prefix = channel if channel is not None else OUTPUT_CHANNEL
+    return tuple(f"{prefix}_{chrom}" for chrom in CHROMOPHORE_TYPES)
+
+
+def _validate_output_channel() -> None:
+    if OUTPUT_CHANNEL not in VALID_OUTPUT_CHANNELS:
+        raise ValueError(
+            f"config.OUTPUT_CHANNEL 必须为 {VALID_OUTPUT_CHANNELS} 之一，当前为 {OUTPUT_CHANNEL!r}。"
+        )
+
+
 def _validate_wavelength_channels() -> None:
-    if len(WAVELENGTH_CHANNELS) < 2:
-        raise ValueError("config.WAVELENGTH_CHANNELS 至少需要 2 路波长才能运行 MBLL。")
+    if len(WAVELENGTH_CHANNELS) < len(CHROMOPHORE_TYPES):
+        raise ValueError("config.WAVELENGTH_CHANNELS 至少需要 3 路波长才能反演 HbO/HbR/Cyt。")
     codes = [ch.code for ch in WAVELENGTH_CHANNELS]
     if len(codes) != len(set(codes)):
         raise ValueError("config.WAVELENGTH_CHANNELS 中存在重复的协议 code。")
@@ -142,6 +225,18 @@ def _validate_wavelength_channels() -> None:
         raise ValueError("config.WAVELENGTH_CHANNELS 中存在重复的 emitter_nm（列名会冲突）。")
     if WAVELENGTH_OFF_CODE in codes:
         raise ValueError("WAVELENGTH_OFF_CODE 不能出现在 WAVELENGTH_CHANNELS 中。")
+    detector_codes = [ch.code for ch in DETECTOR_CHANNELS]
+    if len(detector_codes) != len(set(detector_codes)):
+        raise ValueError("config.DETECTOR_CHANNELS 中存在重复的协议 code。")
+    detector_names = [ch.name for ch in DETECTOR_CHANNELS]
+    if len(detector_names) != len(set(detector_names)):
+        raise ValueError("config.DETECTOR_CHANNELS 中存在重复的 name。")
+    if DETECTOR_OFF_CODE in detector_codes:
+        raise ValueError("DETECTOR_OFF_CODE 不能出现在 DETECTOR_CHANNELS 中。")
+    missing_cyt = [ch.mbll_nm for ch in WAVELENGTH_CHANNELS if ch.mbll_nm not in CYT_RELATIVE_EXTINCTION]
+    if missing_cyt:
+        raise ValueError(f"CYT_RELATIVE_EXTINCTION 缺少波长: {missing_cyt}")
 
 
 _validate_wavelength_channels()
+_validate_output_channel()

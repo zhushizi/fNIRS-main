@@ -15,6 +15,7 @@ class LiveAnalysisBatch:
     times: list[float]
     hbo: list[float]
     hbr: list[float]
+    cyt: list[float]
     window_start_s: float
     window_end_s: float
     baseline_ready: bool = False

@@ -193,6 +193,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 | `times` | number[] | 成功时是 | 曲线点时间，单位秒，相对本次采集开始 |
 | `hbo` | number[] | 成功时是 | 与 `times` 对齐的 HbO 序列（浓度变化量，a.u.） |
 | `hbr` | number[] | 成功时是 | 与 `times` 对齐的 HbR 序列（浓度变化量，a.u.） |
+| `cyt` | number[] | 成功时是 | 与 `times` 对齐的 Cyt 序列（浓度变化量，a.u.） |
 | `rso2` | number[] \| null[] | 否 | 与 `times` 对齐的 rSO2（%）；基线未建立时不出现本字段 |
 | `baseline_ready` | bool | 是 | 基线时段是否已有足够样本可估算 rSO2 |
 | `latest_rso2_pct` | number | 否 | 本批最后一个有效 rSO2（%），便于大屏数字显示 |
@@ -224,6 +225,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
     "times": [60.125, 61.126, 62.127],
     "hbo": [0.0000012, 0.0000014, 0.0000015],
     "hbr": [-0.0000004, -0.0000005, -0.0000006],
+    "cyt": [0.0000001, 0.0000002, 0.0000001],
     "rso2": [67.8, 68.1, 68.2],
     "baseline_ready": true,
     "latest_rso2_pct": 68.2,
@@ -249,6 +251,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
     "times": [30.125, 31.126],
     "hbo": [0.0000010, 0.0000011],
     "hbr": [-0.0000003, -0.0000004],
+    "cyt": [0.0000000, 0.0000001],
     "baseline_ready": false,
     "sample_count": 2,
     "window_start_s": 2.125,
@@ -416,4 +419,4 @@ PC：
 | 2026-06-01 | 初稿 |
 | 2026-06-02 | 精简为安卓主导启停：`hello` / `serial_data` / `bye` / `analysis_result` |
 | 2026-06-03 | 增加在线曲线回传：`live_analysis_batch` |
-| 2026-06-11 | `live_analysis_batch` 增加 rSO2 字段（`rso2`、`baseline_ready`、`latest_rso2_pct`） |
+| 2026-06-30 | `live_analysis_batch` 增加 `cyt` 字段（与 HbO/HbR 对齐的三色团在线曲线） |

@@ -1,11 +1,11 @@
-"""光强 → OD → 带通 → MBLL → CBSI 及结果汇总。"""
+"""光强 → OD → 带通 → 广义 MBLL → SSR → 三色团浓度。"""
 
 from __future__ import annotations
 
 import csv
+import os
 
 import nirsimple.preprocessing as nsp
-import nirsimple.processing as nproc
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, resample_poly, sosfiltfilt
@@ -16,15 +16,19 @@ from config import (
     BP_LOW_HZ,
     BP_ORDER,
     BP_TARGET_FS_HZ,
-    CHANNEL_NAME,
+    CHROMOPHORE_TYPES,
+    CYT_DIFFERENCE_EXTINCTION,
+    DETECTOR_CHANNELS,
     INTENSITY_COLUMNS,
     MBLL_DEFAULT_AGE,
-    SOURCE_DETECTOR_DISTANCE_CM,
+    OUTPUT_CHANNEL,
+    WAVELENGTH_CHANNELS,
     mbll_wavelengths_nm,
+    processed_column_names,
 )
 from online_android import AnalysisResult, enrich_result_with_rso2
 
-from .preprocessing import stack_intensities_for_mbll
+from .preprocessing import stack_intensities_for_detector
 
 
 def butter_bandpass_sos(lowcut: float, highcut: float, fs: float, order: int = 4):
@@ -43,12 +47,7 @@ def smart_bandpass(
     order: int = BP_ORDER,
     target_fs: float = BP_TARGET_FS_HZ,
 ) -> np.ndarray:
-    """
-    对 OD 数据做稳健带通。
-
-    当采样率过高时，先降采样再滤波，最后升采样回来，
-    可以减少数值不稳定和不必要的计算量。
-    """
+    """对 OD 数据做稳健带通。"""
     if data.shape[1] < max(16, 3 * (order + 1) + 1):
         return data
 
@@ -73,88 +72,98 @@ def smart_bandpass(
     return data_bp
 
 
-def build_channel_info(
-    age: int = MBLL_DEFAULT_AGE,
-    source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
-):
-    """构造单通道 MBLL 所需的通道名、波长、DPF 与源探距离。"""
-    ch_wls = mbll_wavelengths_nm()
-    channel_names = [CHANNEL_NAME] * len(ch_wls)
-    ch_dpfs = [nsp.get_dpf(wl, age) for wl in ch_wls]
-    ch_distances = [source_detector_distance_cm] * len(ch_wls)
-    return channel_names, ch_wls, ch_dpfs, ch_distances
+def short_separation_regression(
+    long_od: np.ndarray,
+    short_od: np.ndarray,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """用短距 OD 回归校正长距 OD，返回 (corrected_long_od, beta)。"""
+    if long_od.shape != short_od.shape:
+        raise ValueError("long_od and short_od must have the same shape.")
+    if long_od.ndim != 2:
+        raise ValueError("OD matrices must be shaped as (n_wavelengths, n_timepoints).")
+
+    short_centered = short_od - np.mean(short_od, axis=1, keepdims=True)
+    long_centered = long_od - np.mean(long_od, axis=1, keepdims=True)
+    denominator = np.sum(short_centered * short_centered, axis=1)
+    numerator = np.sum(long_centered * short_centered, axis=1)
+    beta = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator, dtype=float),
+        where=denominator > eps,
+    )
+    corrected = long_od - beta[:, np.newaxis] * short_centered
+    return corrected, beta
 
 
-def extract_hbo_hbr_series(
-    delta_c_corr: np.ndarray,
-    channel_types: list[str],
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """从 CBSI 输出中按通道类型提取 HbO/HbR 序列；多通道时取均值。"""
-    hbo_indices: list[int] = []
-    hbr_indices: list[int] = []
-    for idx, channel_type in enumerate(channel_types):
-        normalized = str(channel_type).lower()
-        if "hbo" in normalized:
-            hbo_indices.append(idx)
-        elif "hbr" in normalized:
-            hbr_indices.append(idx)
-
-    if not hbo_indices or not hbr_indices:
-        return None
-    hbo = np.mean(delta_c_corr[hbo_indices, :], axis=0)
-    hbr = np.mean(delta_c_corr[hbr_indices, :], axis=0)
-    return hbo, hbr
+def _hemoglobin_extinctions(wavelengths: list[float], table: str = "wray") -> np.ndarray:
+    """读取 nirsimple 内置 HbO/HbR 消光系数表，并插值到目标波长。"""
+    ex_path = os.path.join(os.path.dirname(nsp.__file__), "tables", f"{table}.csv")
+    ex_df = pd.read_csv(ex_path)
+    table_wls = ex_df["lambda"].to_numpy(dtype=float)
+    hbo = ex_df["hbo"].to_numpy(dtype=float)
+    hbr = ex_df["hbr"].to_numpy(dtype=float)
+    return np.column_stack(
+        [
+            np.interp(wavelengths, table_wls, hbo),
+            np.interp(wavelengths, table_wls, hbr),
+        ]
+    )
 
 
-def run_mbll_cbsi(
-    samples: np.ndarray,
-    times: np.ndarray,
+def _cyt_extinction_vector(wavelengths: list[float]) -> np.ndarray:
+    """返回 Cyt 差分消光系数向量，单位与 HbO/HbR 一致（OD / cm / M）。"""
+    return np.asarray([CYT_DIFFERENCE_EXTINCTION[float(wl)] for wl in wavelengths], dtype=float) * 1000.0
+
+
+def generalized_mbll(
+    delta_od: np.ndarray,
+    wavelengths: list[float],
+    dpfs: list[float],
+    distance_cm: float,
+    table: str = "wray",
+) -> np.ndarray:
+    """
+    分步广义 MBLL：先反演 HbO/HbR，再从 Hb 残差估计 Cyt。
+
+    返回 (3, n_timepoints)，行顺序为 HbO / HbR / Cyt。
+    """
+    hb_ex = _hemoglobin_extinctions(wavelengths, table)
+    cyt_ex = _cyt_extinction_vector(wavelengths)
+    pathlength = np.asarray(dpfs, dtype=float) * float(distance_cm)
+    a_hb = hb_ex * pathlength[:, np.newaxis]
+    a_cyt = (cyt_ex * pathlength)[:, np.newaxis]
+
+    hb_delta_c = np.linalg.pinv(a_hb) @ delta_od
+    hb_fit_od = a_hb @ hb_delta_c
+    residual_od = delta_od - hb_fit_od
+
+    hb_projection = a_hb @ np.linalg.pinv(a_hb)
+    cyt_residual_basis = a_cyt - hb_projection @ a_cyt
+    cyt_delta_c = np.linalg.pinv(cyt_residual_basis) @ residual_od
+    return np.vstack([hb_delta_c, cyt_delta_c])
+
+
+def _estimate_fs(times: np.ndarray) -> float:
+    dt = np.mean(np.diff(times))
+    return 1.0 / dt if dt > 0 else 1.0
+
+
+def compute_all_channel_concentrations(
+    interleaved_df: pd.DataFrame,
     *,
     age: int = MBLL_DEFAULT_AGE,
-    source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
     molar_ext_coeff_table: str = "wray",
     bp_low: float = BP_LOW_HZ,
     bp_high: float = BP_HIGH_HZ,
     bp_order: int = BP_ORDER,
-) -> tuple[np.ndarray, list[str], list[str]]:
-    """共享核心：光强矩阵 → OD 变化 → 带通 → MBLL → CBSI。"""
-    channel_names, ch_wls, ch_dpfs, ch_distances = build_channel_info(
-        age,
-        source_detector_distance_cm,
-    )
-    delta_od = nsp.intensities_to_od_changes(samples)
-
-    dt = np.mean(np.diff(times))
-    fs = 1.0 / dt if dt > 0 else 1.0
-    delta_od_filt = smart_bandpass(delta_od, fs, lowcut=bp_low, highcut=bp_high, order=bp_order)
-
-    delta_c, new_ch_names, new_ch_types = nsp.mbll(
-        delta_od_filt,
-        channel_names,
-        ch_wls,
-        ch_dpfs,
-        ch_distances,
-        unit="cm",
-        table=molar_ext_coeff_table,
-    )
-    delta_c_corr, corr_ch_names, corr_ch_types = nproc.cbsi(delta_c, new_ch_names, new_ch_types)
-    return delta_c_corr, corr_ch_names, corr_ch_types
-
-
-def calculate_concentration_series(
-    interleaved_df: pd.DataFrame,
-    age: int = MBLL_DEFAULT_AGE,
-    source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
-    molar_ext_coeff_table: str = "wray",
-    bp_low: float = BP_LOW_HZ,
-    bp_high: float = BP_HIGH_HZ,
-    bp_order: int = BP_ORDER,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, dict[str, np.ndarray]] | None:
     """
-    从配对后的光强表计算 HbO/HbR 时间序列（在线分析入口）。
+    从配对光强表计算全部通道浓度。
 
-    流程：光强 → OD 变化 → 带通 → MBLL → CBSI → 提取 HbO/HbR。
-    离线终算使用 process_csv_dataset，算法步骤相同但未调用本函数。
+    返回 (times, {channel_name: (3, n_timepoints)})。
+    channel_name 包含各 DETECTOR_CHANNELS.name 及长距 SSR 通道（如 S1_D1_ssr）。
     """
     required_cols = ["Time (s)", *INTENSITY_COLUMNS]
     if interleaved_df.empty or any(col not in interleaved_df.columns for col in required_cols):
@@ -164,57 +173,123 @@ def calculate_concentration_series(
     if len(times) < 2:
         return None
 
-    samples = stack_intensities_for_mbll(interleaved_df)
-    delta_c_corr, _corr_ch_names, corr_ch_types = run_mbll_cbsi(
-        samples,
-        times,
+    fs = _estimate_fs(times)
+    wavelengths = mbll_wavelengths_nm()
+    dpfs = [nsp.get_dpf(wl, age) for wl in wavelengths]
+
+    detector_delta_od: dict[str, np.ndarray] = {}
+    results: dict[str, np.ndarray] = {}
+
+    for detector in DETECTOR_CHANNELS:
+        samples = stack_intensities_for_detector(interleaved_df, detector)
+        delta_od = nsp.intensities_to_od_changes(samples)
+        detector_delta_od[detector.name] = delta_od
+        delta_od_filt = smart_bandpass(delta_od, fs, lowcut=bp_low, highcut=bp_high, order=bp_order)
+        results[detector.name] = generalized_mbll(
+            delta_od_filt,
+            wavelengths,
+            dpfs,
+            detector.distance_cm,
+            table=molar_ext_coeff_table,
+        )
+
+    if len(DETECTOR_CHANNELS) >= 2:
+        short_detector = min(DETECTOR_CHANNELS, key=lambda det: det.distance_cm)
+        long_detector = max(DETECTOR_CHANNELS, key=lambda det: det.distance_cm)
+        if short_detector.name != long_detector.name:
+            corrected_od, _beta = short_separation_regression(
+                detector_delta_od[long_detector.name],
+                detector_delta_od[short_detector.name],
+            )
+            corrected_od_filt = smart_bandpass(
+                corrected_od,
+                fs,
+                lowcut=bp_low,
+                highcut=bp_high,
+                order=bp_order,
+            )
+            ssr_name = f"{long_detector.name}_ssr"
+            results[ssr_name] = generalized_mbll(
+                corrected_od_filt,
+                wavelengths,
+                dpfs,
+                long_detector.distance_cm,
+                table=molar_ext_coeff_table,
+            )
+
+    return times, results
+
+
+def select_output_series(
+    times: np.ndarray,
+    all_results: dict[str, np.ndarray],
+    output_channel: str = OUTPUT_CHANNEL,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """从全部通道结果中提取配置输出通道的 HbO/HbR/Cyt 序列。"""
+    delta_c = all_results.get(output_channel)
+    if delta_c is None or delta_c.shape[0] < len(CHROMOPHORE_TYPES):
+        return None
+
+    hbo = delta_c[0]
+    hbr = delta_c[1]
+    cyt = delta_c[2]
+    n_cols = min(len(times), len(hbo), len(hbr), len(cyt))
+    if n_cols == 0:
+        return None
+
+    times = times[:n_cols]
+    hbo = hbo[:n_cols]
+    hbr = hbr[:n_cols]
+    cyt = cyt[:n_cols]
+    finite_mask = np.isfinite(times) & np.isfinite(hbo) & np.isfinite(hbr) & np.isfinite(cyt)
+    if not np.any(finite_mask):
+        return None
+    return times[finite_mask], hbo[finite_mask], hbr[finite_mask], cyt[finite_mask]
+
+
+def calculate_concentration_series(
+    interleaved_df: pd.DataFrame,
+    age: int = MBLL_DEFAULT_AGE,
+    molar_ext_coeff_table: str = "wray",
+    bp_low: float = BP_LOW_HZ,
+    bp_high: float = BP_HIGH_HZ,
+    bp_order: int = BP_ORDER,
+    output_channel: str = OUTPUT_CHANNEL,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """
+    从配对光强表计算配置输出通道的 HbO/HbR/Cyt 时间序列（在线分析入口）。
+    """
+    computed = compute_all_channel_concentrations(
+        interleaved_df,
         age=age,
-        source_detector_distance_cm=source_detector_distance_cm,
         molar_ext_coeff_table=molar_ext_coeff_table,
         bp_low=bp_low,
         bp_high=bp_high,
         bp_order=bp_order,
     )
-    series = extract_hbo_hbr_series(delta_c_corr, corr_ch_types)
-    if series is None:
+    if computed is None:
         return None
-
-    hbo, hbr = series
-    n_cols = min(len(times), len(hbo), len(hbr))
-    if n_cols == 0:
+    times, all_results = computed
+    selected = select_output_series(times, all_results, output_channel)
+    if selected is None:
         return None
-    times = times[:n_cols]
-    hbo = hbo[:n_cols]
-    hbr = hbr[:n_cols]
-    finite_mask = np.isfinite(times) & np.isfinite(hbo) & np.isfinite(hbr)
-    if not np.any(finite_mask):
-        return None
-    return times[finite_mask], hbo[finite_mask], hbr[finite_mask]
+    return selected
 
 
 def summarize_processed_concentrations(
-    delta_c_corr: np.ndarray,
-    channel_types: list[str],
+    delta_c: np.ndarray,
     times: np.ndarray | None = None,
+    output_channel: str = OUTPUT_CHANNEL,
 ) -> AnalysisResult:
-    """为安卓端测试显示提取本次 HbO/HbR 平均值，并在可能时附带 rSO2 摘要。"""
-    hbo_values = []
-    hbr_values = []
-    for idx, channel_type in enumerate(channel_types):
-        normalized = str(channel_type).lower()
-        if "hbo" in normalized:
-            hbo_values.append(delta_c_corr[idx])
-        elif "hbr" in normalized:
-            hbr_values.append(delta_c_corr[idx])
-
-    if not hbo_values or not hbr_values:
+    """为安卓端提取配置输出通道的 HbO/HbR 均值摘要。"""
+    if delta_c.shape[0] < 2:
         return {
             "ok": False,
-            "message": f"Cannot identify HbO/HbR columns from channel types: {channel_types}",
+            "message": f"Cannot extract HbO/HbR from channel {output_channel}.",
         }
 
-    hbo = np.concatenate(hbo_values)
-    hbr = np.concatenate(hbr_values)
+    hbo = delta_c[0]
+    hbr = delta_c[1]
     hbo = hbo[np.isfinite(hbo)]
     hbr = hbr[np.isfinite(hbr)]
     if hbo.size == 0 or hbr.size == 0:
@@ -222,19 +297,24 @@ def summarize_processed_concentrations(
 
     result: AnalysisResult = {
         "ok": True,
+        "output_channel": output_channel,
         "mean_hbo": float(np.mean(hbo)),
         "mean_hbr": float(np.mean(hbr)),
         "sample_count": int(min(hbo.size, hbr.size)),
     }
+    if delta_c.shape[0] >= 3:
+        cyt = delta_c[2]
+        cyt_finite = cyt[np.isfinite(cyt)]
+        if cyt_finite.size > 0:
+            result["mean_cyt"] = float(np.mean(cyt_finite))
+
     if times is not None and times.size >= 2:
-        hbo_series = np.mean(np.vstack(hbo_values), axis=0)
-        hbr_series = np.mean(np.vstack(hbr_values), axis=0)
-        n = min(times.size, hbo_series.size, hbr_series.size)
+        n = min(times.size, delta_c.shape[1])
         return enrich_result_with_rso2(
             result,
             times=times[:n],
-            hbo_series=hbo_series[:n],
-            hbr_series=hbr_series[:n],
+            hbo_series=delta_c[0, :n],
+            hbr_series=delta_c[1, :n],
         )
     return result
 
@@ -243,58 +323,53 @@ def process_csv_dataset(
     input_csv: str,
     output_csv: str,
     age: int = MBLL_DEFAULT_AGE,
-    source_detector_distance_cm: float = SOURCE_DETECTOR_DISTANCE_CM,
     molar_ext_coeff_table: str = "wray",
     bp_low: float = BP_LOW_HZ,
     bp_high: float = BP_HIGH_HZ,
     bp_order: int = BP_ORDER,
+    output_channel: str = OUTPUT_CHANNEL,
 ) -> AnalysisResult:
-    """
-    离线终算入口：从 interleaved CSV 计算 HbO/HbR 并写入 processed_output.csv。
-
-    算法与 calculate_concentration_series 相同（OD → 带通 → MBLL → CBSI），
-    但面向全段文件；成功时返回 {"ok": True} 供 analysis_result 回传安卓。
-    """
+    """离线终算：写入配置输出通道的 HbO/HbR/Cyt 到 processed_output.csv。"""
     df = pd.read_csv(input_csv)
-    required_cols = ["Time (s)", *INTENSITY_COLUMNS]
-    if df.empty or any(col not in df.columns for col in required_cols):
-        message = "Insufficient or invalid interleaved data for processing."
-        print(message)
-        return {"ok": False, "message": message}
-
-    times = df["Time (s)"].to_numpy(dtype=float)
-    if len(times) < 2:
-        message = "Need at least two time samples to run MBLL."
-        print(message)
-        return {"ok": False, "message": message}
-
-    samples = stack_intensities_for_mbll(df)
-    delta_c_corr, corr_ch_names, corr_ch_types = run_mbll_cbsi(
-        samples,
-        times,
+    computed = compute_all_channel_concentrations(
+        df,
         age=age,
-        source_detector_distance_cm=source_detector_distance_cm,
         molar_ext_coeff_table=molar_ext_coeff_table,
         bp_low=bp_low,
         bp_high=bp_high,
         bp_order=bp_order,
     )
+    if computed is None:
+        message = "Insufficient or invalid interleaved data for processing."
+        print(message)
+        return {"ok": False, "message": message}
 
-    processed_headers = [f"{name}_{ctype}" for name, ctype in zip(corr_ch_names, corr_ch_types)]
-    header_out = ["Time"] + processed_headers
+    times, all_results = computed
+    selected = select_output_series(times, all_results, output_channel)
+    if selected is None:
+        message = f"Output channel {output_channel!r} not available in MBLL results."
+        print(message)
+        return {"ok": False, "message": message}
+
+    times, hbo, hbr, cyt = selected
+    delta_c = np.vstack([hbo, hbr, cyt])
+    col_names = processed_column_names(output_channel)
+    header_out = ["Time"] + list(col_names)
 
     with open(output_csv, "w", newline="", encoding="utf-8") as f_out:
         writer = csv.writer(f_out)
         writer.writerow(header_out)
-        n_cols = min(len(times), delta_c_corr.shape[1])
+        n_cols = min(len(times), delta_c.shape[1])
         for col_idx in range(n_cols):
-            writer.writerow([times[col_idx]] + list(delta_c_corr[:, col_idx]))
+            writer.writerow([times[col_idx]] + list(delta_c[:, col_idx]))
 
-    last_sample = delta_c_corr[:, -1]
-    table_data = []
-    for idx, ch in enumerate(corr_ch_names):
-        table_data.append([ch, corr_ch_types[idx], f"{last_sample[idx]:.4e}"])
-    print(f"Post-processing complete. Output saved to '{output_csv}'.")
-    print("\nExample: Processed concentrations at the final time sample:")
+    last_sample = delta_c[:, -1]
+    table_data = [
+        [output_channel, chrom, f"{last_sample[idx]:.4e}"]
+        for idx, chrom in enumerate(CHROMOPHORE_TYPES)
+    ]
+    print(f"Post-processing complete. Output channel: {output_channel}")
+    print(f"Output saved to '{output_csv}'.")
+    print("\nExample: Processed concentrations at the final time sample (Cyt uses UCL extinction):")
     print(tabulate(table_data, headers=["Channel", "Type", "Concentration"]))
-    return {"ok": True}
+    return summarize_processed_concentrations(delta_c, times=times, output_channel=output_channel)

@@ -39,11 +39,12 @@ class OnlineCaptureSession:
     def feed_sample(
         self,
         elapsed_time: float,
-        sensor_id: int,
+        detector_id: int,
         value: float,
         wavelength_code: int,
+        channel_name: str = "",
     ) -> None:
-        self.buffer.append(elapsed_time, sensor_id, value, wavelength_code)
+        self.buffer.append(elapsed_time, detector_id, value, wavelength_code, channel_name)
 
     def stop(self) -> None:
         self.worker.stop()

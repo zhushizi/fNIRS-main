@@ -143,6 +143,7 @@ class HostTcpSerialBridge:
         times: list[float],
         hbo: list[float],
         hbr: list[float],
+        cyt: list[float],
         window_start_s: float,
         window_end_s: float,
         ok: bool = True,
@@ -154,10 +155,10 @@ class HostTcpSerialBridge:
         baseline_rso2_pct: float | None = None,
         replace_full_series: bool = False,
     ) -> None:
-        """为安卓端绘图发送一组在线 HbO/HbR/rSO2 批次数据。"""
+        """为安卓端绘图发送一组在线 HbO/HbR/Cyt/rSO2 批次数据。"""
         body: dict[str, Any] = {
             "ok": ok,
-            "sample_count": min(len(times), len(hbo), len(hbr)),
+            "sample_count": min(len(times), len(hbo), len(hbr), len(cyt)),
             "unit": "a.u.",
             "baseline_ready": baseline_ready,
             "replace_full_series": replace_full_series,
@@ -168,6 +169,7 @@ class HostTcpSerialBridge:
                     "times": times,
                     "hbo": hbo,
                     "hbr": hbr,
+                    "cyt": cyt,
                     "window_start_s": window_start_s,
                     "window_end_s": window_end_s,
                 }
@@ -175,7 +177,7 @@ class HostTcpSerialBridge:
             if rso2 is not None:
                 body["rso2"] = rso2
                 body["sample_count"] = min(
-                    len(times), len(hbo), len(hbr), len(rso2)
+                    len(times), len(hbo), len(hbr), len(cyt), len(rso2)
                 )
             if latest_rso2_pct is not None and math.isfinite(latest_rso2_pct):
                 body["latest_rso2_pct"] = float(latest_rso2_pct)

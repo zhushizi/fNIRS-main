@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from config import HOST_TCP_DEFAULT_PORT, WAVELENGTH_OFF_CODE
+from config import HOST_TCP_DEFAULT_PORT, OUTPUT_CHANNEL, WAVELENGTH_OFF_CODE
 from online_android import HostTcpSerialBridge
 
 from .capture import capture_data, send_analysis_result_to_android
@@ -24,7 +24,7 @@ def run_pipeline(
     tcp_debug: bool = False,
     live_plot: bool = False,
 ) -> None:
-    """一键跑完整链路：安卓 TCP 采集 -> 预处理 -> 配对 -> MBLL -> CSV 输出。"""
+    """一键跑完整链路：安卓 TCP 采集 -> 预处理 -> 配对 -> 广义 MBLL/SSR -> CSV 输出。"""
     os.makedirs(RESULT_TABLE_DIR, exist_ok=True)
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = os.path.join(RESULT_TABLE_DIR, run_id)
@@ -33,6 +33,7 @@ def run_pipeline(
     interleaved_path = os.path.join(output_dir, "interleaved_output.csv")
     processed_path = os.path.join(output_dir, "processed_output.csv")
     print(f"本次结果将保存到: {output_dir}")
+    print(f"输出通道: {OUTPUT_CHANNEL}")
     tcp_bridge: HostTcpSerialBridge | None = None
 
     try:
@@ -54,7 +55,7 @@ def run_pipeline(
         df = df[df["Wavelength"] != WAVELENGTH_OFF_CODE].reset_index(drop=True)
         dropped = n_raw - len(df)
         if dropped:
-            print(f"Dropped {dropped} raw row(s) with Wavelength=OFF (0x00); not used for dual-wavelength pairing.")
+            print(f"Dropped {dropped} raw row(s) with Wavelength=OFF (0x00); not used for wavelength pairing.")
 
         if df.empty or len(df) < 2:
             result = {"ok": False, "message": "No enough non-OFF samples after filtering; skipping processing."}

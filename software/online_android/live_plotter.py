@@ -34,6 +34,7 @@ class _LivePlotWindow(QtWidgets.QWidget):
         self._times: list[float] = []
         self._hbo: list[float] = []
         self._hbr: list[float] = []
+        self._cyt: list[float] = []
         self._rso2_times: list[float] = []
         self._rso2: list[float] = []
 
@@ -54,6 +55,10 @@ class _LivePlotWindow(QtWidgets.QWidget):
         self.hbr_curve = self.hbo_hbr_plot.plot(
             pen=pg.mkPen("#2980b9", width=2),
             name="HbR",
+        )
+        self.cyt_curve = self.hbo_hbr_plot.plot(
+            pen=pg.mkPen("#8e44ad", width=2),
+            name="Cyt",
         )
         layout.addWidget(self.hbo_hbr_plot)
 
@@ -81,6 +86,7 @@ class _LivePlotWindow(QtWidgets.QWidget):
             self._times = [float(x) for x in batch.times]
             self._hbo = [float(x) for x in batch.hbo]
             self._hbr = [float(x) for x in batch.hbr]
+            self._cyt = [float(x) for x in batch.cyt]
             self._rso2_times = []
             self._rso2 = []
             if batch.rso2:
@@ -89,10 +95,11 @@ class _LivePlotWindow(QtWidgets.QWidget):
                         self._rso2_times.append(float(elapsed_time))
                         self._rso2.append(float(rso2))
         else:
-            for elapsed_time, hbo, hbr in zip(batch.times, batch.hbo, batch.hbr):
+            for elapsed_time, hbo, hbr, cyt in zip(batch.times, batch.hbo, batch.hbr, batch.cyt):
                 self._times.append(float(elapsed_time))
                 self._hbo.append(float(hbo))
                 self._hbr.append(float(hbr))
+                self._cyt.append(float(cyt))
 
             if batch.rso2:
                 for elapsed_time, rso2 in zip(batch.times, batch.rso2):
@@ -120,6 +127,7 @@ class _LivePlotWindow(QtWidgets.QWidget):
             self._times.pop(0)
             self._hbo.pop(0)
             self._hbr.pop(0)
+            self._cyt.pop(0)
         while self._rso2_times and self._rso2_times[0] < cutoff:
             self._rso2_times.pop(0)
             self._rso2.pop(0)
@@ -144,8 +152,10 @@ class _LivePlotWindow(QtWidgets.QWidget):
     def _refresh_hbo_hbr(self) -> None:
         t_hbo, hbo = self._slice_window(self._times, self._hbo, self.hbo_hbr_window_s)
         _, hbr = self._slice_window(self._times, self._hbr, self.hbo_hbr_window_s)
+        _, cyt = self._slice_window(self._times, self._cyt, self.hbo_hbr_window_s)
         self.hbo_curve.setData(t_hbo, hbo)
         self.hbr_curve.setData(t_hbo, hbr)
+        self.cyt_curve.setData(t_hbo, cyt)
         if t_hbo:
             self.hbo_hbr_plot.setXRange(t_hbo[0], t_hbo[-1], padding=0.02)
 

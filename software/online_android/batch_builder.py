@@ -15,7 +15,7 @@ from .types import LiveAnalysisBatch
 
 PrepareInterleavedFn = Callable[[pd.DataFrame, bool], pd.DataFrame]
 CalculateSeriesFn = Callable[
-    [pd.DataFrame], Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]
+    [pd.DataFrame], Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
 ]
 
 
@@ -57,13 +57,14 @@ class IncrementalBatchBuilder:
         self._last_interleaved_count = n_interleaved
         if series is None:
             return None
-        times, hbo, hbr = series
-        n = min(len(times), len(hbo), len(hbr))
+        times, hbo, hbr, cyt = series
+        n = min(len(times), len(hbo), len(hbr), len(cyt))
         if n == 0:
             return None
         times = times[:n]
         hbo = hbo[:n]
         hbr = hbr[:n]
+        cyt = cyt[:n]
 
         rso2_full, baseline_ready, latest_rso2_pct = self._build_rso2_full(times, hbo, hbr)
         session_times = interleaved_df["Time (s)"].to_numpy(dtype=float)
@@ -71,6 +72,7 @@ class IncrementalBatchBuilder:
             times=[float(x) for x in times],
             hbo=[float(x) for x in hbo],
             hbr=[float(x) for x in hbr],
+            cyt=[float(x) for x in cyt],
             window_start_s=float(session_times[0]),
             window_end_s=float(session_times[-1]),
             baseline_ready=baseline_ready,

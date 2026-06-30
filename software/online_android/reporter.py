@@ -40,6 +40,7 @@ class AndroidReporter:
                 times=batch.times,
                 hbo=batch.hbo,
                 hbr=batch.hbr,
+                cyt=batch.cyt,
                 window_start_s=batch.window_start_s,
                 window_end_s=batch.window_end_s,
                 ok=True,

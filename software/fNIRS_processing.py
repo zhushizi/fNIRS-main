@@ -1,28 +1,23 @@
 """
-单通道 fNIRS 采集与处理主脚本。
+双接收源五波长 fNIRS 采集与处理主脚本。
 
 完整链路如下：
-1. 通过 26B 协议采集原始单通道数据
+1. 通过 26B 协议采集 S1-D1 / S1-D2 五波长原始数据（安卓 TCP 桥接）
 2. 写入 all_groups.csv
-3. 对单通道信号做阈值/低通/RMS 预处理
-4. 按 config.WAVELENGTH_CHANNELS 聚合成多列光强
-5. 计算 OD -> MBLL -> CBSI
-6. 输出 processed_output.csv
+3. 对每个接收源/波长组合做低通/RMS 预处理
+4. 聚合成 2 接收源 x 5 波长光强宽表
+5. 计算 OD -> 短距回归校正 -> 广义 MBLL -> HbO/HbR/Cyt
+6. 按 config.OUTPUT_CHANNEL 输出 processed_output.csv（S1_D1 / S1_D2 / S1_D1_ssr）
 
-运行模式：安卓独占 UART，PC 通过 TCP 被动接收 serial_data；
-采集中由 online_android 包并行分析并回传 live_analysis_batch（含 rSO2）；
-可选 --live_plot 在 PC 端同步绘制发往安卓的数据（HbO/HbR 30s 窗，rSO2 60s 窗）。
-采集结束后 run_pipeline 对全段 CSV 做离线 MBLL，并以 analysis_result 回传完成状态（不含均值）。
-
-在线安卓回传实现见 software/online_android/（配置 / 缓冲 / 批次构建 / 上报 / 会话）。
-处理实现见 software/fnirs_pipeline/（预处理 / MBLL / 采集 / 管线编排）。
+采集中由 online_android 并行分析并回传 live_analysis_batch；
+可选 --live_plot 在 PC 端同步绘制发往安卓的数据。
 """
 
 from __future__ import annotations
 
-import argparse # 
+import argparse
 
-from config import HOST_TCP_DEFAULT_PORT # 导入端口号
+from config import HOST_TCP_DEFAULT_PORT, OUTPUT_CHANNEL
 from fnirs_pipeline import (
     aggregate_wavelength_cycles,
     calculate_concentration_series,
@@ -32,6 +27,7 @@ from fnirs_pipeline import (
     run_pipeline,
     send_analysis_result_to_android,
     sliding_window_rms,
+    stack_intensities_for_detector,
     summarize_processed_concentrations,
     threshold_filter,
 )
@@ -45,6 +41,7 @@ __all__ = [
     "run_pipeline",
     "send_analysis_result_to_android",
     "sliding_window_rms",
+    "stack_intensities_for_detector",
     "summarize_processed_concentrations",
     "threshold_filter",
 ]
@@ -53,7 +50,7 @@ __all__ = [
 def parse_args() -> argparse.Namespace:
     """解析命令行：安卓 TCP 桥接参数。"""
     parser = argparse.ArgumentParser(
-        description="Run fNIRS capture and processing via Android TCP bridge."
+        description="Run dual-detector five-wavelength fNIRS via Android TCP bridge."
     )
     parser.add_argument(
         "-tcp_port",
@@ -82,6 +79,7 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    print(f"Configured output channel: {OUTPUT_CHANNEL}")
     try:
         run_pipeline(
             tcp_port=args.tcp_port,
