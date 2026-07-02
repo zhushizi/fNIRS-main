@@ -19,8 +19,36 @@ from config import (
     HOST_TCP_LISTEN_HOST,
     HOST_TCP_MAX_BODY_BYTES,
     HOST_TCP_PROTOCOL_VERSION,
+    LIVE_SEND_DELTA_THB,
     TIMEOUT,
 )
+
+from .types import compute_delta_thb
+
+
+def _json_safe_float(value: float) -> float:
+    """JSON 标准不允许 NaN/Inf；安卓端解析非标准 JSON 可能直接断连。"""
+    number = float(value)
+    return number if math.isfinite(number) else 0.0
+
+
+def _json_safe_float_list(values: list[float]) -> list[float]:
+    return [_json_safe_float(v) for v in values]
+
+
+def _align_live_series(
+    times: list[float],
+    hbo: list[float],
+    hbr: list[float],
+    cyt: list[float],
+    rso2: list[float] | None,
+) -> tuple[list[float], list[float], list[float], list[float], list[float] | None]:
+    """各曲线数组对齐到同一长度，避免 sample_count 与数组不一致。"""
+    n = min(len(times), len(hbo), len(hbr), len(cyt))
+    if rso2 is not None:
+        n = min(n, len(rso2))
+    aligned_rso2 = list(rso2[:n]) if rso2 is not None else None
+    return times[:n], hbo[:n], hbr[:n], cyt[:n], aligned_rso2
 
 
 class HostTcpProtocolError(RuntimeError):
@@ -157,29 +185,37 @@ class HostTcpSerialBridge:
         unit: str = "a.u.",
     ) -> None:
         """为安卓端绘图发送一组在线 HbO/HbR/Cyt/rSO2 批次数据。"""
+        times, hbo, hbr, cyt, rso2 = _align_live_series(times, hbo, hbr, cyt, rso2)
+        times = _json_safe_float_list(times)
+        hbo = _json_safe_float_list(hbo)
+        hbr = _json_safe_float_list(hbr)
+        cyt = _json_safe_float_list(cyt)
+
         body: dict[str, Any] = {
             "ok": ok,
-            "sample_count": min(len(times), len(hbo), len(hbr), len(cyt)),
+            "sample_count": len(times),
             "unit": unit,
             "baseline_ready": baseline_ready,
             "replace_full_series": replace_full_series,
         }
         if ok:
-            body.update(
-                {
-                    "times": times,
-                    "hbo": hbo,
-                    "hbr": hbr,
-                    "cyt": cyt,
-                    "window_start_s": window_start_s,
-                    "window_end_s": window_end_s,
-                }
-            )
+            payload: dict[str, Any] = {
+                "times": times,
+                "hbo": hbo,
+                "hbr": hbr,
+                "cyt": cyt,
+                "window_start_s": _json_safe_float(window_start_s),
+                "window_end_s": _json_safe_float(window_end_s),
+            }
+            if LIVE_SEND_DELTA_THB:
+                payload["delta_thb"] = _json_safe_float_list(compute_delta_thb(hbo, hbr))
+            body.update(payload)
             if rso2 is not None:
-                body["rso2"] = rso2
-                body["sample_count"] = min(
-                    len(times), len(hbo), len(hbr), len(cyt), len(rso2)
-                )
+                body["rso2"] = [
+                    _json_safe_float(v) if v is not None and math.isfinite(v) else None
+                    for v in rso2
+                ]
+                body["sample_count"] = min(len(times), len(body["rso2"]))
             if latest_rso2_pct is not None and math.isfinite(latest_rso2_pct):
                 body["latest_rso2_pct"] = float(latest_rso2_pct)
             if baseline_rso2_pct is not None:
@@ -209,7 +245,12 @@ class HostTcpSerialBridge:
             "ts_ms": int(time.time() * 1000),
             "body": body,
         }
-        raw = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        raw = json.dumps(
+            message,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
         if len(raw) > HOST_TCP_MAX_BODY_BYTES:
             raise HostTcpProtocolError(f"Message too large: {len(raw)} bytes.")
         packet = len(raw).to_bytes(4, byteorder="big", signed=False) + raw

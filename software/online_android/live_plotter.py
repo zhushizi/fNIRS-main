@@ -12,6 +12,8 @@ from PyQt5 import QtCore, QtWidgets
 if TYPE_CHECKING:
     from .types import LiveAnalysisBatch
 
+from .types import compute_delta_thb
+
 HBO_HBR_WINDOW_S = 30.0
 RSO2_WINDOW_S = 60.0
 RETENTION_BUFFER_S = 15.0
@@ -42,7 +44,7 @@ class _LivePlotWindow(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
 
         self.hbo_hbr_plot = pg.PlotWidget(
-            title=f"HbO / HbR sent to Android (last {hbo_hbr_window_s:.0f}s)",
+            title=f"HbO / HbR / ΔtHb sent to Android (last {hbo_hbr_window_s:.0f}s)",
         )
         self.hbo_hbr_plot.addLegend()
         self.hbo_hbr_plot.showGrid(x=True, y=True, alpha=0.3)
@@ -59,6 +61,10 @@ class _LivePlotWindow(QtWidgets.QWidget):
         self.cyt_curve = self.hbo_hbr_plot.plot(
             pen=pg.mkPen("#8e44ad", width=2),
             name="Cyt",
+        )
+        self.dthb_curve = self.hbo_hbr_plot.plot(
+            pen=pg.mkPen("#d35400", width=2, style=QtCore.Qt.DashLine),
+            name="ΔtHb",
         )
         layout.addWidget(self.hbo_hbr_plot)
 
@@ -153,9 +159,11 @@ class _LivePlotWindow(QtWidgets.QWidget):
         t_hbo, hbo = self._slice_window(self._times, self._hbo, self.hbo_hbr_window_s)
         _, hbr = self._slice_window(self._times, self._hbr, self.hbo_hbr_window_s)
         _, cyt = self._slice_window(self._times, self._cyt, self.hbo_hbr_window_s)
+        dthb = compute_delta_thb(hbo, hbr)
         self.hbo_curve.setData(t_hbo, hbo)
         self.hbr_curve.setData(t_hbo, hbr)
         self.cyt_curve.setData(t_hbo, cyt)
+        self.dthb_curve.setData(t_hbo, dthb)
         if t_hbo:
             self.hbo_hbr_plot.setXRange(t_hbo[0], t_hbo[-1], padding=0.02)
 

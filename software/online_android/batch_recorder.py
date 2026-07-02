@@ -12,7 +12,7 @@ import pandas as pd
 
 from config import OUTPUT_CHANNEL, processed_column_names
 
-from .types import LiveAnalysisBatch
+from .types import LiveAnalysisBatch, compute_delta_thb
 
 PrepareInterleavedFn = Callable[[pd.DataFrame, bool], pd.DataFrame]
 CalculateSeriesFn = Callable[
@@ -20,7 +20,8 @@ CalculateSeriesFn = Callable[
 ]
 
 HBO_COL, HBR_COL, CYT_COL = processed_column_names(OUTPUT_CHANNEL)
-PROCESSED_HEADER = ["Time", HBO_COL, HBR_COL, CYT_COL]
+DTHB_COL = f"{OUTPUT_CHANNEL}_dthb"
+PROCESSED_HEADER = ["Time", HBO_COL, HBR_COL, CYT_COL, DTHB_COL]
 
 
 class AndroidLiveOutputRecorder:
@@ -114,9 +115,11 @@ class AndroidLiveOutputRecorder:
             writer = csv.writer(f_out)
             writer.writerow(PROCESSED_HEADER)
             n = len(self._times)
+            dthb_series = compute_delta_thb(self._hbo, self._hbr)
             for idx in range(n):
                 cyt_val = self._cyt[idx] if idx < len(self._cyt) else ""
-                writer.writerow([self._times[idx], self._hbo[idx], self._hbr[idx], cyt_val])
+                dthb_val = dthb_series[idx] if idx < len(dthb_series) else ""
+                writer.writerow([self._times[idx], self._hbo[idx], self._hbr[idx], cyt_val, dthb_val])
 
         path_str = str(self.output_path)
         print(

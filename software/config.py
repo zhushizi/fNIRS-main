@@ -77,6 +77,8 @@ LIVE_CONC_SCALE = 1.0
 LIVE_CONC_UNIT = "M"
 # 是否减去基线窗均值做锚定（让每条曲线从 0 起算，run 之间幅度可比）。
 LIVE_BASELINE_ANCHOR = False
+# 是否向安卓 live_analysis_batch 附带 delta_thb（HbO+HbR）。安卓未升级解析前可设 False。
+LIVE_SEND_DELTA_THB = True
 
 
 def _nm_suffix(nm: float) -> str:

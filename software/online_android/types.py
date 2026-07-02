@@ -8,6 +8,19 @@ from typing import Any
 AnalysisResult = dict[str, Any]
 
 
+def compute_delta_thb(
+    hbo: list[float] | tuple[float, ...],
+    hbr: list[float] | tuple[float, ...],
+) -> list[float]:
+    """ΔtHb = HbO + HbR（与回传安卓的 hbo/hbr 同单位、同锚定）。"""
+    n = min(len(hbo), len(hbr))
+    out: list[float] = []
+    for idx in range(n):
+        value = float(hbo[idx]) + float(hbr[idx])
+        out.append(value)
+    return out
+
+
 @dataclass(frozen=True)
 class LiveAnalysisBatch:
     """一次 live_analysis_batch 消息的载荷。"""
