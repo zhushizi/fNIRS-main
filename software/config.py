@@ -63,6 +63,21 @@ OutputChannelName = Literal["S1_D1", "S1_D2", "S1_D1_ssr"]
 OUTPUT_CHANNEL: OutputChannelName = "S1_D1_ssr"
 VALID_OUTPUT_CHANNELS: tuple[OutputChannelName, ...] = ("S1_D1", "S1_D2", "S1_D1_ssr")
 
+# ---------------------------------------------------------------------------
+# 在线回传安卓的模式与显示单位
+# ---------------------------------------------------------------------------
+# "full_replace"       : 旧逻辑，每 tick 对全会话非因果重算并整段重发（历史会变）。
+# "causal_incremental" : 路线 B，因果 IIR 滤波 + 仅追加新样本（历史不再变，量纲固定）。
+OnlineModeName = Literal["full_replace", "causal_incremental"]
+ONLINE_MODE: OnlineModeName = "causal_incremental"
+
+# 回传安卓前对浓度做显示换算：摩尔(M) × LIVE_CONC_SCALE，并附带单位标签。
+# 1.0 → 保持原始摩尔(M)，与离线 processed_output.csv 同量纲；1e6 → 微摩尔(μM)。
+LIVE_CONC_SCALE = 1.0
+LIVE_CONC_UNIT = "M"
+# 是否减去基线窗均值做锚定（让每条曲线从 0 起算，run 之间幅度可比）。
+LIVE_BASELINE_ANCHOR = False
+
 
 def _nm_suffix(nm: float) -> str:
     if nm == int(nm):

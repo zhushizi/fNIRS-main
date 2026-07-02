@@ -49,6 +49,7 @@ class AndroidReporter:
                 latest_rso2_pct=batch.latest_rso2_pct,
                 baseline_rso2_pct=batch.baseline_rso2_pct,
                 replace_full_series=batch.replace_full_series,
+                unit=batch.unit,
             )
         except Exception as exc:
             print(f"Failed to send live_analysis_batch to Android: {exc}")

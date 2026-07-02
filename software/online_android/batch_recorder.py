@@ -24,7 +24,13 @@ PROCESSED_HEADER = ["Time", HBO_COL, HBR_COL, CYT_COL]
 
 
 class AndroidLiveOutputRecorder:
-    """保存在线全量曲线；采集结束时可用全会话 raw 终算覆盖。"""
+    """
+    保存实际回传安卓的在线曲线（replace 整段重置、append 追加），
+    采集结束直接 flush，落盘内容与安卓所见一致。
+
+    `flush_from_raw`（用离线全会话终算覆盖）保留备用，但默认不再调用，
+    以免覆盖掉真实回传的数据。
+    """
 
     def __init__(self, output_path: str | Path | None) -> None:
         self.output_path = Path(output_path) if output_path else None
@@ -115,6 +121,6 @@ class AndroidLiveOutputRecorder:
         path_str = str(self.output_path)
         print(
             f"Android live output ({OUTPUT_CHANNEL}) saved to '{path_str}' "
-            f"({len(self._times)} samples, aligned with processed_output.csv)."
+            f"({len(self._times)} samples, exactly as streamed to Android)."
         )
         return path_str

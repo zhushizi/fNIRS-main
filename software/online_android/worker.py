@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from .batch_builder import IncrementalBatchBuilder
 from .buffer import OnlineSampleBuffer
+from .causal_processor import IncrementalCausalProcessor
 from .config import OnlineSettings
 from .reporter import AndroidReporter
 
@@ -21,7 +22,7 @@ class OnlineAnalysisWorker:
         self,
         buffer: OnlineSampleBuffer,
         bridge: HostTcpSerialBridge,
-        batch_builder: IncrementalBatchBuilder,
+        batch_builder: IncrementalBatchBuilder | IncrementalCausalProcessor,
         settings: OnlineSettings | None = None,
         reporter: AndroidReporter | None = None,
     ) -> None:

@@ -11,6 +11,7 @@ import pandas as pd
 from .batch_builder import IncrementalBatchBuilder
 from .batch_recorder import AndroidLiveOutputRecorder
 from .buffer import OnlineSampleBuffer
+from .causal_processor import IncrementalCausalProcessor
 from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
 from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
 from .reporter import AndroidReporter
@@ -30,7 +31,7 @@ class OnlineCaptureSession:
     buffer: OnlineSampleBuffer
     worker: OnlineAnalysisWorker
     reporter: AndroidReporter
-    batch_builder: IncrementalBatchBuilder
+    batch_builder: IncrementalBatchBuilder | IncrementalCausalProcessor
     prepare_interleaved: PrepareInterleavedFn
     calculate_series: CalculateSeriesFn
     plotter: LiveAndroidBatchPlotter | None = None
@@ -49,12 +50,8 @@ class OnlineCaptureSession:
     def stop(self) -> None:
         self.worker.stop()
         if self.recorder is not None:
-            raw_df = self.buffer.snapshot_all()
-            self.recorder.flush_from_raw(
-                raw_df,
-                prepare_interleaved=self.prepare_interleaved,
-                calculate_series=self.calculate_series,
-            )
+            # 落盘的是「实际回传安卓的曲线」本身（μM、已锚定、因果），
+            # 不再用离线终算覆盖，确保 android_live_output.csv 与安卓所见一致。
             self.recorder.flush()
 
 
@@ -71,11 +68,20 @@ def create_online_session(
 ) -> OnlineCaptureSession:
     """创建并启动在线分析会话（buffer + worker）。"""
     buffer = OnlineSampleBuffer(settings)
-    batch_builder = IncrementalBatchBuilder(
-        settings,
-        prepare_interleaved=prepare_interleaved,
-        calculate_series=calculate_series,
-    )
+    if settings.online_mode == "causal_incremental":
+        batch_builder = IncrementalCausalProcessor(
+            settings,
+            prepare_interleaved=prepare_interleaved,
+            calculate_series=calculate_series,
+        )
+        print("Online mode: causal_incremental (causal IIR + append-only).")
+    else:
+        batch_builder = IncrementalBatchBuilder(
+            settings,
+            prepare_interleaved=prepare_interleaved,
+            calculate_series=calculate_series,
+        )
+        print("Online mode: full_replace (non-causal, full-series replace).")
     plotter: LiveAndroidBatchPlotter | None = None
     if live_plot:
         plotter = LiveAndroidBatchPlotter(

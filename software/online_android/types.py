@@ -23,3 +23,4 @@ class LiveAnalysisBatch:
     latest_rso2_pct: float | None = None
     baseline_rso2_pct: float | None = None
     replace_full_series: bool = False
+    unit: str = "a.u."

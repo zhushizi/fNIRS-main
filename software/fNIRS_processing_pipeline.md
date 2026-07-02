@@ -197,13 +197,29 @@ Time,S1_D1_ssr_hbo,S1_D1_ssr_hbr,S1_D1_ssr_cyt
 
 - `OnlineSampleBuffer`：累积本会话全部样本
 - `OnlineAnalysisWorker`：每 `update_interval_seconds`（默认 1s）触发一次
-- `IncrementalBatchBuilder.try_build`：
-  - 对**全会话**原始数据重跑 `prepare_interleaved → calculate_series`
-  - 仅当配对行数增加（或强制）时才重算
-  - 每次发送【整段】曲线并置 `replace_full_series=true`
 - `AndroidReporter.send_live_batch`：经 TCP 回传 `live_analysis_batch`，
   同时镜像写 `android_live_output.csv`，可选 PC 端 `live_plotter` 绘图
 - 采集结束 `stop()` 时做一次终算落盘
+
+由 `config.ONLINE_MODE` 选择两种在线分析路线：
+
+### 6.1 `full_replace`（旧逻辑，`IncrementalBatchBuilder`）
+
+- 每 tick 对**全会话**重跑 `prepare_interleaved → calculate_series`（非因果 `sosfiltfilt`）
+- 仅当配对行数增加（或强制）时才重算
+- 每次发送【整段】曲线并置 `replace_full_series=true`
+- 缺点：计算/传输随时长 O(N²)，历史曲线每 tick 被改写，量纲不固定
+
+### 6.2 `causal_incremental`（路线 B，`IncrementalCausalProcessor`，默认）
+
+- **增量配对**：自维护流式分段 RMS + 凑组，原始样本只折叠一次，不再每 tick 重跑 prepare
+- **固定基准 I0**：用基线窗均值算 ΔOD，历史不随新数据漂移
+- **因果 IIR 带通**：`sosfilt` + 持久 `zi` 状态替代零相位滤波，过去的滤波值不再变
+- 短距回归 β、显示锚定基线、rSO₂ 基线在**热身末端**（`causal_warmup_seconds`，默认 60s）一次性冻结
+- 热身期：用全量 `calculate_series` 出临时曲线（`replace_full_series=true`、`baseline_ready=false`）
+- 冻结后：整段回填一次（replace），随后**只追加新样本**（`replace_full_series=false`），单 tick 成本 O(新样本)
+- 回传前对浓度做显示换算：摩尔 × `LIVE_CONC_SCALE`（默认 1e6 → μM），并按 `LIVE_BASELINE_ANCHOR` 减基线窗均值锚定，`unit` 字段随之置 `"uM"`
+- 代价：用分段 RMS 直接代表波长时隙、跳过离线那步非因果 1Hz 低通，故**在线结果与离线 `processed_output.csv` 不再逐点一致**——离线终算仍是权威结果；因果滤波有群延迟（相位滞后）
 
 ---
 
@@ -235,6 +251,10 @@ WAVELENGTH_CHANNELS                # 850/810/770/730/700 nm
 OUTPUT_CHANNEL = "S1_D1_ssr"       # 输出通道
 BP_LOW_HZ=0.01 / BP_HIGH_HZ=0.1 / BP_ORDER=4 / BP_TARGET_FS_HZ=20.0
 MBLL_DEFAULT_AGE = 27
+ONLINE_MODE = "causal_incremental" # 在线路线: full_replace | causal_incremental
+LIVE_CONC_SCALE = 1e6              # 回传安卓前浓度换算: 1e6 → μM
+LIVE_CONC_UNIT = "uM"
+LIVE_BASELINE_ANCHOR = True        # 减基线窗均值，曲线从 0 起算
 CYT_DIFFERENCE_EXTINCTION          # 五波长 Cyt 差分消光系数（UCL-NIR）
 ```
 
