@@ -10,6 +10,7 @@ import pandas as pd
 
 from .rso2 import compute_rso2_series, compute_thi_series
 
+from .baseline_state import MutableBaseline
 from .config import OnlineSettings
 from .types import LiveAnalysisBatch
 
@@ -31,10 +32,15 @@ class IncrementalBatchBuilder:
         *,
         prepare_interleaved: PrepareInterleavedFn,
         calculate_series: CalculateSeriesFn,
+        baseline: MutableBaseline | None = None,
     ) -> None:
         self.settings = settings
         self._prepare_interleaved = prepare_interleaved
         self._calculate_series = calculate_series
+        self._baseline = baseline or MutableBaseline(
+            rso2_pct=settings.rso2_baseline_rso2_pct,
+            hbt_uM=settings.rso2_baseline_hbt_uM,
+        )
         self._last_interleaved_count = 0
 
     def try_build(
@@ -79,9 +85,7 @@ class IncrementalBatchBuilder:
             baseline_ready=baseline_ready,
             rso2=rso2_full,
             latest_rso2_pct=latest_rso2_pct,
-            baseline_rso2_pct=(
-                self.settings.rso2_baseline_rso2_pct if baseline_ready else None
-            ),
+            baseline_rso2_pct=(self._baseline.rso2_pct if baseline_ready else None),
             replace_full_series=True,
             thi=thi_full,
             delta_thi=delta_thi_full,
@@ -91,20 +95,32 @@ class IncrementalBatchBuilder:
         """终算落盘：忽略配对计数门闩，对当前原始数据做一次全会话分析。"""
         return self.try_build(raw_df, force_recompute=True)
 
+    def update_baseline(
+        self,
+        rso2_pct: float,
+        hbt_uM: float | None = None,
+    ) -> tuple[float, float]:
+        return self._baseline.update(rso2_pct, hbt_uM)
+
+    def apply_baseline_and_rebuild(self, raw_df: pd.DataFrame) -> LiveAnalysisBatch | None:
+        """安卓 set_baseline 后：用新 BL 对当前全会话重算并整段回填。"""
+        return self.try_build(raw_df, force_recompute=True)
+
     def _build_rso2_full(
         self,
         times: np.ndarray,
         hbo: np.ndarray,
         hbr: np.ndarray,
     ) -> tuple[list[float | None] | None, bool, float | None]:
+        bl_pct, bl_hbt = self._baseline.snapshot()
         rso2_series = compute_rso2_series(
             times,
             hbo,
             hbr,
             baseline_start_s=self.settings.rso2_baseline_start_s,
             baseline_end_s=self.settings.rso2_baseline_end_s,
-            baseline_hbt_uM=self.settings.rso2_baseline_hbt_uM,
-            baseline_rso2_pct=self.settings.rso2_baseline_rso2_pct,
+            baseline_hbt_uM=bl_hbt,
+            baseline_rso2_pct=bl_pct,
         )
         if rso2_series is None:
             return None, False, None
@@ -121,14 +137,15 @@ class IncrementalBatchBuilder:
         hbr: np.ndarray,
     ) -> tuple[list[float] | None, list[float] | None]:
         """全会话 tHi / ΔtHi（摩尔，与本路径 hbo/hbr 同量纲）。基线窗无样本时返回 (None, None)。"""
+        bl_pct, bl_hbt = self._baseline.snapshot()
         thi_pair = compute_thi_series(
             times,
             hbo,
             hbr,
             baseline_start_s=self.settings.rso2_baseline_start_s,
             baseline_end_s=self.settings.rso2_baseline_end_s,
-            baseline_hbt_uM=self.settings.rso2_baseline_hbt_uM,
-            baseline_rso2_pct=self.settings.rso2_baseline_rso2_pct,
+            baseline_hbt_uM=bl_hbt,
+            baseline_rso2_pct=bl_pct,
         )
         if thi_pair is None:
             return None, None

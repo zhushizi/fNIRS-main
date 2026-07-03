@@ -182,6 +182,87 @@ PC 收到 `bye` 后立即回复，表示已经结束采集循环并即将开始�
 }
 ```
 
+### 5.5.1 `set_baseline`（安卓 -> PC）
+
+采集中任意时刻，安卓可发送新的 **BL 基线 rSO2（%）**。PC 收到后：
+
+1. 更新运行时 BL 假设；
+2. 对**当前已采集的全会话数据**重算 `rso2` / `thi` / `delta_thi`（及 `hbo/hbr/cyt` 在因果模式下同步重算）；
+3. 先回 `set_baseline_ack`，再发一批 `live_analysis_batch`（`replace_full_series=true`，整段覆盖曲线）。
+
+| `body` 字段 | 类型 | 必填 | 说明 |
+|-------------|------|------|------|
+| `baseline_rso2_pct` | number | 是 | 新 BL 基线 rSO2（%），范围 `1` ~ `99` |
+| `baseline_hbt_uM` | number | 否 | 新基线总血红蛋白（µM），缺省沿用当前值（默认 `80`） |
+
+```json
+{
+  "ver": 1,
+  "type": "set_baseline",
+  "seq": 50,
+  "ts_ms": 1717234568500,
+  "body": {
+    "baseline_rso2_pct": 68.0,
+    "baseline_hbt_uM": 80.0
+  }
+}
+```
+
+### 5.5.2 `set_baseline_ack`（PC -> 安卓）
+
+| `body` 字段 | 类型 | 必填 | 说明 |
+|-------------|------|------|------|
+| `ref_seq` | int | 否 | 对应 `set_baseline.seq` |
+| `ok` | bool | 是 | 是否接受并重算 |
+| `baseline_rso2_pct` | number | 成功时是 | 已生效的 BL（%） |
+| `baseline_hbt_uM` | number | 成功时是 | 已生效的基线 HbT（µM） |
+| `recomputed` | bool | 否 | 是否已产出新曲线并发送 `live_analysis_batch` |
+| `baseline_ready` | bool | 否 | 重算后是否已有 rSO2 |
+| `sample_count` | int | 否 | 重算批次的点数 |
+| `message` | string | 否 | 失败原因 |
+
+成功示例：
+
+```json
+{
+  "ver": 1,
+  "type": "set_baseline_ack",
+  "seq": 4,
+  "ts_ms": 1717234568501,
+  "body": {
+    "ref_seq": 50,
+    "ok": true,
+    "baseline_rso2_pct": 68.0,
+    "baseline_hbt_uM": 80.0,
+    "recomputed": true,
+    "baseline_ready": true,
+    "sample_count": 120
+  }
+}
+```
+
+失败示例（样本不足）：
+
+```json
+{
+  "ver": 1,
+  "type": "set_baseline_ack",
+  "seq": 5,
+  "body": {
+    "ref_seq": 51,
+    "ok": true,
+    "baseline_rso2_pct": 68.0,
+    "baseline_hbt_uM": 80.0,
+    "recomputed": false,
+    "baseline_ready": false,
+    "sample_count": 0,
+    "message": "insufficient samples for recompute"
+  }
+}
+```
+
+> **安卓侧注意**：`set_baseline_ack` 之后紧接一条 `live_analysis_batch`（`replace_full_series=true`）时，应**清空旧曲线再绘制**，不要与历史批次拼接。
+
 ### 5.6 `live_analysis_batch`（PC -> 安卓）
 
 PC 在采集过程中周期性发送在线分析结果。该消息用于安卓端实时曲线绘图。
@@ -200,7 +281,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 | `rso2` | number[] \| null[] | 否 | 与 `times` 对齐的 rSO2（%）；基线未建立时不出现本字段 |
 | `baseline_ready` | bool | 是 | 基线时段是否已有足够样本可估算 rSO2 / tHi |
 | `latest_rso2_pct` | number | 否 | 本批最后一个有效 rSO2（%），便于大屏数字显示 |
-| `baseline_rso2_pct` | number | 否 | 算法假设的基线 rSO2（%），当前默认 `65.0` |
+| `baseline_rso2_pct` | number | 否 | 当前生效的 BL 基线 rSO2（%）；默认 `65.0`，可由 `set_baseline` 在采集中更新 |
 | `sample_count` | int | 是 | 本批点数（含 `rso2` 时取 times/hbo/hbr/rso2 最短长度） |
 | `window_start_s` | number | 成功时是 | 本次分析会话起始时间（全会话模式通常为 `0`） |
 | `window_end_s` | number | 成功时是 | 本次分析会话结束时间 |
@@ -412,6 +493,7 @@ sequenceDiagram
 - [ ] 收到 `hello_ack.ok=true` 后允许 UI 启流
 - [ ] 串口 `read()` 到的原始字节用 `serial_data.payload_b64` 上报
 - [ ] 采集过程中接收 `live_analysis_batch` 并按 `replace_full_series` 整段替换或追加曲线
+- [ ] 需要重设 BL 时发送 `set_baseline`；收到 `set_baseline_ack.ok=true` 后等待 `live_analysis_batch` 整段替换
 - [ ] 解析 `delta_thb`（若存在）并绘制 ΔtHb 曲线
 - [ ] `baseline_ready=true` 后解析 `rso2` / `latest_rso2_pct` 并显示 rSO2
 - [ ] `baseline_ready=true` 后解析 `thi` / `delta_thi`（若存在）；`thi` 建议独立 Y 轴或子图（量级 ~80 µM）
@@ -426,6 +508,7 @@ PC：
 - [ ] 长度头拆包 + JSON 解析
 - [ ] `hello` -> `hello_ack`
 - [ ] `serial_data` -> 缓冲 -> 26B 解帧 -> CSV
+- [ ] `set_baseline` -> 更新 BL -> 全会话重算 -> `set_baseline_ack` + `live_analysis_batch(replace_full_series=true)`
 - [ ] 采集过程中周期性发送 `live_analysis_batch`（含 rSO2，基线窗 30~60 s 就绪后）
 - [ ] `bye` -> `bye_ack` -> 结束采集 -> 后处理
 - [ ] 后处理完成 -> `analysis_result`
@@ -442,3 +525,4 @@ PC：
 | 2026-06-03 | 增加在线曲线回传：`live_analysis_batch` |
 | 2026-06-30 | `live_analysis_batch` 增加 `cyt` 字段（与 HbO/HbR 对齐的三色团在线曲线） |
 | 2026-07-02 | `live_analysis_batch` 增加 `delta_thb`（ΔtHb）/ `thi`（tHi）/ `delta_thi`（ΔtHi）字段；`unit` 改由 `LIVE_CONC_UNIT` 决定（默认 `"M"`）；补充双在线模式（`causal_incremental` / `full_replace`）说明；更新第二层 26B 协议为双接收源五波长 |
+| 2026-07-03 | 增加 `set_baseline` / `set_baseline_ack`：安卓可动态重设 BL，PC 全会话重算并整段回填 |

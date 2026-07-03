@@ -13,7 +13,7 @@ import math
 import socket
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from config import (
     HOST_TCP_LISTEN_HOST,
@@ -80,6 +80,7 @@ class HostTcpSerialBridge:
         self._buffer_cond = threading.Condition()
         self._send_lock = threading.Lock()
         self._client_sock: socket.socket | None = None
+        self._set_baseline_handler: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -156,6 +157,24 @@ class HostTcpSerialBridge:
                     sock.close()
             except Exception:
                 pass
+
+    def register_set_baseline_handler(
+        self,
+        handler: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> None:
+        """注册安卓 set_baseline 回调（由在线 worker 在会话创建后注入）。"""
+        self._set_baseline_handler = handler
+
+    def send_set_baseline_ack(
+        self,
+        body: dict[str, Any],
+        *,
+        ref_seq: int | None = None,
+    ) -> None:
+        payload = dict(body)
+        if ref_seq is not None:
+            payload["ref_seq"] = ref_seq
+        self._send_message("set_baseline_ack", payload)
 
     def send_analysis_result(
         self,
@@ -337,6 +356,8 @@ class HostTcpSerialBridge:
             self._handle_serial_data(body, seq)
         elif msg_type == "heartbeat":
             return
+        elif msg_type == "set_baseline":
+            self._handle_set_baseline(body, seq)
         elif msg_type == "bye":
             print(f"Android TCP client sent bye: {body.get('reason', '')}")
             self._send_message("bye_ack", {"ref_seq": seq, "ok": True})
@@ -347,6 +368,30 @@ class HostTcpSerialBridge:
             print(f"Android TCP error: {body}")
         else:
             self._send_error("UNSUPPORTED_TYPE", f"Unsupported message type: {msg_type}", seq)
+
+    def _handle_set_baseline(self, body: dict[str, Any], seq: int | None) -> None:
+        if self._set_baseline_handler is None:
+            self.send_set_baseline_ack(
+                {"ok": False, "message": "set_baseline handler not registered"},
+                ref_seq=seq,
+            )
+            return
+        try:
+            result = self._set_baseline_handler(body)
+        except Exception as exc:
+            print(f"set_baseline failed: {exc}")
+            self.send_set_baseline_ack(
+                {"ok": False, "message": str(exc)},
+                ref_seq=seq,
+            )
+            return
+        if not isinstance(result, dict):
+            self.send_set_baseline_ack(
+                {"ok": False, "message": "invalid set_baseline handler result"},
+                ref_seq=seq,
+            )
+            return
+        self.send_set_baseline_ack(result, ref_seq=seq)
 
     def _handle_serial_data(self, body: dict[str, Any], seq: int | None) -> None:
         payload_b64 = body.get("payload_b64", "")

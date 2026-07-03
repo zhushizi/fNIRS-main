@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from .baseline_state import MutableBaseline
 from .batch_builder import IncrementalBatchBuilder
 from .batch_recorder import AndroidLiveOutputRecorder
 from .buffer import OnlineSampleBuffer
@@ -67,12 +68,17 @@ def create_online_session(
     android_live_output_path: str | None = None,
 ) -> OnlineCaptureSession:
     """创建并启动在线分析会话（buffer + worker）。"""
+    baseline = MutableBaseline(
+        rso2_pct=settings.rso2_baseline_rso2_pct,
+        hbt_uM=settings.rso2_baseline_hbt_uM,
+    )
     buffer = OnlineSampleBuffer(settings)
     if settings.online_mode == "causal_incremental":
         batch_builder = IncrementalCausalProcessor(
             settings,
             prepare_interleaved=prepare_interleaved,
             calculate_series=calculate_series,
+            baseline=baseline,
         )
         print("Online mode: causal_incremental (causal IIR + append-only).")
     else:
@@ -80,6 +86,7 @@ def create_online_session(
             settings,
             prepare_interleaved=prepare_interleaved,
             calculate_series=calculate_series,
+            baseline=baseline,
         )
         print("Online mode: full_replace (non-causal, full-series replace).")
     plotter: LiveAndroidBatchPlotter | None = None
@@ -106,6 +113,7 @@ def create_online_session(
         settings=settings,
         reporter=reporter,
     )
+    bridge.register_set_baseline_handler(worker.handle_set_baseline)
     worker.start()
     return OnlineCaptureSession(
         buffer=buffer,

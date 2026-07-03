@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .batch_builder import IncrementalBatchBuilder
 from .buffer import OnlineSampleBuffer
@@ -31,6 +31,7 @@ class OnlineAnalysisWorker:
         self.batch_builder = batch_builder
         self.reporter = reporter or AndroidReporter(bridge, self.settings)
         self.stop_event = threading.Event()
+        self._baseline_lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -66,4 +67,53 @@ class OnlineAnalysisWorker:
         if batch is None:
             return
         self.reporter.send_live_batch(batch)
+
+    def handle_set_baseline(self, body: dict[str, Any]) -> dict[str, Any]:
+        """安卓 set_baseline：更新 BL 并重算当前全会话后回传 live_analysis_batch。"""
+        rso2_raw = body.get("baseline_rso2_pct")
+        if rso2_raw is None:
+            return {"ok": False, "message": "baseline_rso2_pct is required"}
+
+        try:
+            rso2_pct = float(rso2_raw)
+        except (TypeError, ValueError):
+            return {"ok": False, "message": "baseline_rso2_pct must be a number"}
+
+        if not (1.0 <= rso2_pct <= 99.0):
+            return {
+                "ok": False,
+                "message": "baseline_rso2_pct must be between 1 and 99",
+            }
+
+        hbt_uM: float | None = None
+        if "baseline_hbt_uM" in body and body["baseline_hbt_uM"] is not None:
+            try:
+                hbt_uM = float(body["baseline_hbt_uM"])
+            except (TypeError, ValueError):
+                return {"ok": False, "message": "baseline_hbt_uM must be a number"}
+            if not (10.0 <= hbt_uM <= 200.0):
+                return {
+                    "ok": False,
+                    "message": "baseline_hbt_uM must be between 10 and 200",
+                }
+
+        with self._baseline_lock:
+            bl_pct, bl_hbt = self.batch_builder.update_baseline(rso2_pct, hbt_uM)
+            raw_df = self.buffer.snapshot_all()
+            batch = self.batch_builder.apply_baseline_and_rebuild(raw_df)
+
+        if batch is not None:
+            self.reporter.send_live_batch(batch)
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "baseline_rso2_pct": bl_pct,
+            "baseline_hbt_uM": bl_hbt,
+            "recomputed": batch is not None,
+            "baseline_ready": batch.baseline_ready if batch is not None else False,
+            "sample_count": len(batch.times) if batch is not None else 0,
+        }
+        if batch is None:
+            result["message"] = "insufficient samples for recompute"
+        return result
 

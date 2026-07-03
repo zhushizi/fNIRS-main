@@ -43,6 +43,7 @@ from config import (
     wavelength_channel_by_code,
 )
 
+from .baseline_state import MutableBaseline
 from .config import OnlineSettings
 from .types import LiveAnalysisBatch
 
@@ -71,10 +72,15 @@ class IncrementalCausalProcessor:
         prepare_interleaved: PrepareInterleavedFn,  # 接口对齐，本路径不逐 tick 调用
         calculate_series: CalculateSeriesFn,
         output_channel: str = OUTPUT_CHANNEL,
+        baseline: MutableBaseline | None = None,
     ) -> None:
         self.settings = settings
         self._calculate_series = calculate_series
         self._output_channel = output_channel
+        self._baseline = baseline or MutableBaseline(
+            rso2_pct=settings.rso2_baseline_rso2_pct,
+            hbt_uM=settings.rso2_baseline_hbt_uM,
+        )
 
         # 输出通道几何解析
         if output_channel.endswith("_ssr"):
@@ -149,6 +155,33 @@ class IncrementalCausalProcessor:
         if n <= self._processed_count:
             return None
         return self._build_append(times)
+
+    def update_baseline(
+        self,
+        rso2_pct: float,
+        hbt_uM: float | None = None,
+    ) -> tuple[float, float]:
+        return self._baseline.update(rso2_pct, hbt_uM)
+
+    def apply_baseline_and_rebuild(self, raw_df: pd.DataFrame) -> LiveAnalysisBatch | None:
+        """安卓 set_baseline 后：更新 BL 假设并对全会话重算，整段回填安卓。"""
+        if self._long_det is None:
+            return None
+
+        self._ingest_raw(raw_df)
+        n = len(self._inter_rows)
+        if n < self.settings.min_interleaved_points:
+            return None
+
+        times = np.asarray([r[_TIME_COL] for r in self._inter_rows], dtype=float)
+        bl_pct, bl_hbt = self._baseline.snapshot()
+        hbt_M = bl_hbt * 1e-6
+        self._rso2_hbo_abs = hbt_M * (bl_pct / 100.0)
+        self._rso2_hbr_abs = hbt_M - self._rso2_hbo_abs
+
+        if not self._ready:
+            self._freeze_baseline(times)
+        return self._build_backfill(times)
 
     # --------------------------------------------------------- 增量配对
     def _ingest_raw(self, raw_df: pd.DataFrame) -> None:
@@ -285,8 +318,9 @@ class IncrementalCausalProcessor:
         conc_all = self._mbll(filtered_all)  # (3, N) 摩尔
         self._baseline_conc = np.mean(conc_all[:, baseline_mask], axis=1)
 
-        hbt_M = self.settings.rso2_baseline_hbt_uM * 1e-6
-        self._rso2_hbo_abs = hbt_M * (self.settings.rso2_baseline_rso2_pct / 100.0)
+        bl_pct, bl_hbt = self._baseline.snapshot()
+        hbt_M = bl_hbt * 1e-6
+        self._rso2_hbo_abs = hbt_M * (bl_pct / 100.0)
         self._rso2_hbr_abs = hbt_M - self._rso2_hbo_abs
         self._rso2_dhbo_mean = float(np.mean(conc_all[0, baseline_mask]))
         self._rso2_dhbr_mean = float(np.mean(conc_all[1, baseline_mask]))
@@ -362,13 +396,15 @@ class IncrementalCausalProcessor:
         # tHi / ΔtHi 与 rSO₂ 共用同一组冻结基线的绝对 HbO/HbR，保证三者自洽。
         hbo_abs, hbr_abs = self._abs_hb(conc)
         hbt_M = hbo_abs + hbr_abs
-        baseline_hbt_M = self.settings.rso2_baseline_hbt_uM * 1e-6
+        _, bl_hbt = self._baseline.snapshot()
+        baseline_hbt_M = bl_hbt * 1e-6
         thi = hbt_M * scale                            # 绝对量，≈ 基线 HbT
         delta_thi = (hbt_M - baseline_hbt_M) * scale   # 相对基线，≈0 起算
 
         rso2 = self._rso2_from_abs(hbo_abs, hbr_abs)
         finite = [v for v in rso2 if v is not None and np.isfinite(v)]
         latest = float(finite[-1]) if finite else None
+        bl_pct, _ = self._baseline.snapshot()
 
         return LiveAnalysisBatch(
             times=[float(t) for t in times],
@@ -380,7 +416,7 @@ class IncrementalCausalProcessor:
             baseline_ready=True,
             rso2=rso2,
             latest_rso2_pct=latest,
-            baseline_rso2_pct=self.settings.rso2_baseline_rso2_pct,
+            baseline_rso2_pct=bl_pct,
             replace_full_series=replace_full_series,
             unit=self.settings.conc_unit,
             thi=[float(v) for v in thi],
