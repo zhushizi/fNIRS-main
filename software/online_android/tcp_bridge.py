@@ -20,6 +20,7 @@ from config import (
     HOST_TCP_MAX_BODY_BYTES,
     HOST_TCP_PROTOCOL_VERSION,
     LIVE_SEND_DELTA_THB,
+    LIVE_SEND_THI,
     TIMEOUT,
 )
 
@@ -183,6 +184,8 @@ class HostTcpSerialBridge:
         baseline_rso2_pct: float | None = None,
         replace_full_series: bool = False,
         unit: str = "a.u.",
+        thi: list[float] | None = None,
+        delta_thi: list[float] | None = None,
     ) -> None:
         """为安卓端绘图发送一组在线 HbO/HbR/Cyt/rSO2 批次数据。"""
         times, hbo, hbr, cyt, rso2 = _align_live_series(times, hbo, hbr, cyt, rso2)
@@ -209,6 +212,11 @@ class HostTcpSerialBridge:
             }
             if LIVE_SEND_DELTA_THB:
                 payload["delta_thb"] = _json_safe_float_list(compute_delta_thb(hbo, hbr))
+            if LIVE_SEND_THI and thi is not None:
+                n = len(times)
+                payload["thi"] = _json_safe_float_list(list(thi)[:n])
+                if delta_thi is not None:
+                    payload["delta_thi"] = _json_safe_float_list(list(delta_thi)[:n])
             body.update(payload)
             if rso2 is not None:
                 body["rso2"] = [

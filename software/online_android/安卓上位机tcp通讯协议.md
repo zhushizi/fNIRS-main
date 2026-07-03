@@ -189,19 +189,22 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 | `body` 字段 | 类型 | 必填 | 说明 |
 |-------------|------|------|------|
 | `ok` | bool | 是 | 是否成功生成本批在线结果 |
-| `replace_full_series` | bool | 否 | 默认 `false`。为 `true` 时用本批 `times/hbo/hbr(/rso2)` **整段覆盖**曲线，而非追加 |
+| `replace_full_series` | bool | 否 | 默认 `false`。为 `true` 时用本批全部序列（`times/hbo/hbr/cyt/delta_thb/thi/delta_thi/rso2`，以实际携带者为准）**整段覆盖**曲线，而非追加 |
 | `times` | number[] | 成功时是 | 曲线点时间，单位秒，相对本次采集开始 |
-| `hbo` | number[] | 成功时是 | 与 `times` 对齐的 HbO 序列（浓度变化量，a.u.） |
-| `hbr` | number[] | 成功时是 | 与 `times` 对齐的 HbR 序列（浓度变化量，a.u.） |
-| `cyt` | number[] | 成功时是 | 与 `times` 对齐的 Cyt 序列（浓度变化量，a.u.） |
+| `hbo` | number[] | 成功时是 | 与 `times` 对齐的 HbO 序列（浓度变化量，单位见 `unit`） |
+| `hbr` | number[] | 成功时是 | 与 `times` 对齐的 HbR 序列（浓度变化量，单位见 `unit`） |
+| `cyt` | number[] | 成功时是 | 与 `times` 对齐的 Cyt 序列（浓度变化量，单位见 `unit`） |
+| `delta_thb` | number[] | 否 | 与 `times` 对齐的 **ΔtHb = HbO + HbR**（总血红蛋白变化量，单位同 `hbo`）。由 PC 端 `LIVE_SEND_DELTA_THB` 开关控制，与 `baseline_ready` 无关 |
+| `thi` | number[] | 否 | 与 `times` 对齐的 **tHi**（固定基线伪绝对总血红蛋白，≈ 基线 HbT，单位同 `hbo`）。**仅 `baseline_ready=true` 后出现**，由 `LIVE_SEND_THI` 开关控制 |
+| `delta_thi` | number[] | 否 | 与 `times` 对齐的 **ΔtHi = tHi − 基线HbT**（相对基线，≈0 起算，单位同 `hbo`）。出现条件同 `thi` |
 | `rso2` | number[] \| null[] | 否 | 与 `times` 对齐的 rSO2（%）；基线未建立时不出现本字段 |
-| `baseline_ready` | bool | 是 | 基线时段是否已有足够样本可估算 rSO2 |
+| `baseline_ready` | bool | 是 | 基线时段是否已有足够样本可估算 rSO2 / tHi |
 | `latest_rso2_pct` | number | 否 | 本批最后一个有效 rSO2（%），便于大屏数字显示 |
 | `baseline_rso2_pct` | number | 否 | 算法假设的基线 rSO2（%），当前默认 `65.0` |
 | `sample_count` | int | 是 | 本批点数（含 `rso2` 时取 times/hbo/hbr/rso2 最短长度） |
 | `window_start_s` | number | 成功时是 | 本次分析会话起始时间（全会话模式通常为 `0`） |
 | `window_end_s` | number | 成功时是 | 本次分析会话结束时间 |
-| `unit` | string | 成功时是 | HbO/HbR 单位为 `a.u.`；rSO2 为 `%` |
+| `unit` | string | 成功时是 | 所有浓度序列（`hbo/hbr/cyt/delta_thb/thi/delta_thi`）的统一单位，由 PC 端 `LIVE_CONC_UNIT` 决定：默认 `"M"`（摩尔），或 `"uM"`（微摩尔）；rSO2 恒为 `%` |
 | `message` | string | 否 | 失败或调试说明 |
 
 **rSO2 算法**（与 `data_analysis.plot_blood_oxygen_content` 一致）：
@@ -212,7 +215,15 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 - `baseline_ready=false` 时：仍可能携带 `times/hbo/hbr`，但不带 `rso2`；安卓应显示「基线建立中」。
 - `baseline_ready=true` 后：每批增量点携带 `rso2[i]`；无效点为 JSON `null`。
 
-成功示例（基线已建立）：
+**ΔtHb / tHi / ΔtHi 算法**（与 rSO2 共用同一套固定基线假设，三者自洽）：
+
+- `delta_thb`（ΔtHb）= `hbo + hbr`，逐点求和，单位同 `hbo`。**基线建立前后都会发送**（受 `LIVE_SEND_DELTA_THB` 控制），是一条围绕 0 波动的相对量。
+- `thi`（tHi）= `HbO_abs + HbR_abs`，其中绝对浓度 = 基线假设（HbT=80 µM、rSO2=65%）+ 相对基线的浓度变化，与 rSO2 分母一致。是一条 **≈基线 HbT（约 80 µM）** 的绝对量，带直流基座。
+- `delta_thi`（ΔtHi）= `thi − 基线HbT`，围绕 0 波动。
+- `thi` / `delta_thi` **只在 `baseline_ready=true`（基线冻结）后出现**，受 `LIVE_SEND_THI` 控制；基线建立前这两个字段缺省。
+- 安卓绘图提示：`thi` 量级（~80 µM）远大于其它 0 中心的 Δ 量，若同轴会把 Δ 曲线压平，建议 `thi` 用独立 Y 轴或单独子图。
+
+成功示例（基线已建立，`unit="M"`）：
 
 ```json
 {
@@ -226,6 +237,9 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
     "hbo": [0.0000012, 0.0000014, 0.0000015],
     "hbr": [-0.0000004, -0.0000005, -0.0000006],
     "cyt": [0.0000001, 0.0000002, 0.0000001],
+    "delta_thb": [0.0000008, 0.0000009, 0.0000009],
+    "thi": [0.0000800, 0.0000801, 0.0000802],
+    "delta_thi": [0.0000000, 0.0000001, 0.0000002],
     "rso2": [67.8, 68.1, 68.2],
     "baseline_ready": true,
     "latest_rso2_pct": 68.2,
@@ -234,12 +248,12 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
     "sample_count": 3,
     "window_start_s": 32.125,
     "window_end_s": 62.127,
-    "unit": "a.u."
+    "unit": "M"
   }
 }
 ```
 
-基线建立前的示例：
+基线建立前的示例（有 `delta_thb`，但无 `thi/delta_thi/rso2`）：
 
 ```json
 {
@@ -252,23 +266,26 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
     "hbo": [0.0000010, 0.0000011],
     "hbr": [-0.0000003, -0.0000004],
     "cyt": [0.0000000, 0.0000001],
+    "delta_thb": [0.0000007, 0.0000007],
     "baseline_ready": false,
     "sample_count": 2,
     "window_start_s": 2.125,
     "window_end_s": 31.126,
-    "unit": "a.u."
+    "unit": "M"
   }
 }
 ```
 
 说明：
 
-- 在线算法使用**全会话 interleaved**（约 1 Hz 检查；仅当有新配对点时重算并发送）。
-- `replace_full_series=true` 时：安卓端应**整段替换** HbO/HbR(/rSO2) 曲线，以反映全长 `I_mean` 与 filtfilt 更新后的结果。
-- `replace_full_series` 缺省或为 `false` 时：按 `times[i]` 追加（旧版兼容）。
-- `baseline_ready=false` 时：仍可能携带 `times/hbo/hbr`，但不带 `rso2`；安卓应显示「基线建立中」。
-- `baseline_ready=true` 后：每批携带全长 `rso2[i]`；无效点为 JSON `null`。
-- rSO2 为固定基线假设下的估算值，仅供实时监护显示；最终准确结果仍以 `analysis_result` 和 `processed_output.csv` 为准。
+- PC 端有两种在线分析模式（`config.ONLINE_MODE`），对安卓透明，只影响发批节奏与 `replace_full_series` 语义：
+  - `causal_incremental`（默认）：因果 IIR + 增量。热身期（默认前 60 s）用 `replace_full_series=true` 发临时曲线（`baseline_ready=false`）；基线冻结后先整段回填一次（`replace_full_series=true`），随后**只追加新点**（`replace_full_series=false`）。历史点量纲固定、不再改写。
+  - `full_replace`（旧逻辑）：每次对全会话重算并整段重发（恒 `replace_full_series=true`），历史曲线每批被改写。
+- `replace_full_series=true` 时：安卓端应**整段替换**全部浓度曲线（`hbo/hbr/cyt/delta_thb/thi/delta_thi`）与 `rso2`。
+- `replace_full_series` 缺省或为 `false` 时：按 `times[i]` 把新点**追加**到既有曲线尾部。
+- `baseline_ready=false` 时：携带 `times/hbo/hbr/cyt`（及 `delta_thb`），但不带 `thi/delta_thi/rso2`；安卓应显示「基线建立中」。
+- `baseline_ready=true` 后：每批携带 `rso2[i]`（无效点为 JSON `null`），并在 PC 端开启 `LIVE_SEND_THI` 时携带 `thi/delta_thi`。
+- 所有在线浓度（含 ΔtHb / tHi / ΔtHi / rSO2）均为固定基线假设下的估算值，仅供实时监护显示；最终准确结果仍以 `analysis_result` 与 `processed_output.csv`（HbO/HbR/Cyt）为准。
 
 ### 5.7 `analysis_result`（PC -> 安卓）
 
@@ -350,7 +367,9 @@ PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值�
 | 帧长 | 固定 26 字节 |
 | 长度字节 | `0x1A` |
 | 帧类型 | `0x01` 命令 / `0x02` 数据 / `0x03` ACK |
-| 数据 payload[0] | 波长码：`0x00` OFF，`0x01` 940nm，`0x02` 660nm 等 |
+| 数据 payload[0] | 波长码：`0x00` OFF，`0x01` 850，`0x02` 810，`0x03` 770，`0x04` 730，`0x05` 700 nm |
+| 数据 payload[1] | 接收源码：`0x01` S1_D1（长距 3.0cm），`0x02` S1_D2（短距 1.0cm） |
+| 数据 payload[2:6] | 采集值：4 字节大端无符号 |
 
 启流/停流命令帧由安卓本地生成并写入 UART，PC 不通过 TCP 下发。
 
@@ -392,8 +411,10 @@ sequenceDiagram
 - [ ] 连接后发送 `hello`
 - [ ] 收到 `hello_ack.ok=true` 后允许 UI 启流
 - [ ] 串口 `read()` 到的原始字节用 `serial_data.payload_b64` 上报
-- [ ] 采集过程中接收 `live_analysis_batch` 并追加 HbO/HbR 曲线
+- [ ] 采集过程中接收 `live_analysis_batch` 并按 `replace_full_series` 整段替换或追加曲线
+- [ ] 解析 `delta_thb`（若存在）并绘制 ΔtHb 曲线
 - [ ] `baseline_ready=true` 后解析 `rso2` / `latest_rso2_pct` 并显示 rSO2
+- [ ] `baseline_ready=true` 后解析 `thi` / `delta_thi`（若存在）；`thi` 建议独立 Y 轴或子图（量级 ~80 µM）
 - [ ] UI 停流后发送 `bye`
 - [ ] 接收 `bye_ack`
 - [ ] 接收并显示 `analysis_result`
@@ -420,3 +441,4 @@ PC：
 | 2026-06-02 | 精简为安卓主导启停：`hello` / `serial_data` / `bye` / `analysis_result` |
 | 2026-06-03 | 增加在线曲线回传：`live_analysis_batch` |
 | 2026-06-30 | `live_analysis_batch` 增加 `cyt` 字段（与 HbO/HbR 对齐的三色团在线曲线） |
+| 2026-07-02 | `live_analysis_batch` 增加 `delta_thb`（ΔtHb）/ `thi`（tHi）/ `delta_thi`（ΔtHi）字段；`unit` 改由 `LIVE_CONC_UNIT` 决定（默认 `"M"`）；补充双在线模式（`causal_incremental` / `full_replace`）说明；更新第二层 26B 协议为双接收源五波长 |

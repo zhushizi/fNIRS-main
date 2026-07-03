@@ -8,7 +8,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from .rso2 import compute_rso2_series
+from .rso2 import compute_rso2_series, compute_thi_series
 
 from .config import OnlineSettings
 from .types import LiveAnalysisBatch
@@ -67,6 +67,7 @@ class IncrementalBatchBuilder:
         cyt = cyt[:n]
 
         rso2_full, baseline_ready, latest_rso2_pct = self._build_rso2_full(times, hbo, hbr)
+        thi_full, delta_thi_full = self._build_thi_full(times, hbo, hbr)
         session_times = interleaved_df["Time (s)"].to_numpy(dtype=float)
         return LiveAnalysisBatch(
             times=[float(x) for x in times],
@@ -82,6 +83,8 @@ class IncrementalBatchBuilder:
                 self.settings.rso2_baseline_rso2_pct if baseline_ready else None
             ),
             replace_full_series=True,
+            thi=thi_full,
+            delta_thi=delta_thi_full,
         )
 
     def build_from_raw(self, raw_df: pd.DataFrame) -> LiveAnalysisBatch | None:
@@ -110,3 +113,27 @@ class IncrementalBatchBuilder:
         finite_rso2 = rso2_series[np.isfinite(rso2_series)]
         latest = float(finite_rso2[-1]) if finite_rso2.size > 0 else None
         return rso2_full, True, latest
+
+    def _build_thi_full(
+        self,
+        times: np.ndarray,
+        hbo: np.ndarray,
+        hbr: np.ndarray,
+    ) -> tuple[list[float] | None, list[float] | None]:
+        """全会话 tHi / ΔtHi（摩尔，与本路径 hbo/hbr 同量纲）。基线窗无样本时返回 (None, None)。"""
+        thi_pair = compute_thi_series(
+            times,
+            hbo,
+            hbr,
+            baseline_start_s=self.settings.rso2_baseline_start_s,
+            baseline_end_s=self.settings.rso2_baseline_end_s,
+            baseline_hbt_uM=self.settings.rso2_baseline_hbt_uM,
+            baseline_rso2_pct=self.settings.rso2_baseline_rso2_pct,
+        )
+        if thi_pair is None:
+            return None, None
+        thi_series, delta_thi_series = thi_pair
+        return (
+            [float(v) for v in thi_series],
+            [float(v) for v in delta_thi_series],
+        )

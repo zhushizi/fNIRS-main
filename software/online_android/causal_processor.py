@@ -359,7 +359,14 @@ class IncrementalCausalProcessor:
         hbr = (conc[1] - anchor[1]) * scale
         cyt = (conc[2] - anchor[2]) * scale
 
-        rso2 = self._rso2_for(conc)
+        # tHi / ΔtHi 与 rSO₂ 共用同一组冻结基线的绝对 HbO/HbR，保证三者自洽。
+        hbo_abs, hbr_abs = self._abs_hb(conc)
+        hbt_M = hbo_abs + hbr_abs
+        baseline_hbt_M = self.settings.rso2_baseline_hbt_uM * 1e-6
+        thi = hbt_M * scale                            # 绝对量，≈ 基线 HbT
+        delta_thi = (hbt_M - baseline_hbt_M) * scale   # 相对基线，≈0 起算
+
+        rso2 = self._rso2_from_abs(hbo_abs, hbr_abs)
         finite = [v for v in rso2 if v is not None and np.isfinite(v)]
         latest = float(finite[-1]) if finite else None
 
@@ -376,12 +383,19 @@ class IncrementalCausalProcessor:
             baseline_rso2_pct=self.settings.rso2_baseline_rso2_pct,
             replace_full_series=replace_full_series,
             unit=self.settings.conc_unit,
+            thi=[float(v) for v in thi],
+            delta_thi=[float(v) for v in delta_thi],
         )
 
-    def _rso2_for(self, conc: np.ndarray) -> list[float | None]:
-        """用冻结基线把 ΔHbO/ΔHbR（摩尔）转 rSO₂（%）。"""
+    def _abs_hb(self, conc: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """用冻结基线把 ΔHbO/ΔHbR（摩尔）转绝对 HbO/HbR（摩尔，下限截 0）。"""
         hbo_abs = np.maximum(self._rso2_hbo_abs + (conc[0] - self._rso2_dhbo_mean), 0.0)
         hbr_abs = np.maximum(self._rso2_hbr_abs + (conc[1] - self._rso2_dhbr_mean), 0.0)
+        return hbo_abs, hbr_abs
+
+    @staticmethod
+    def _rso2_from_abs(hbo_abs: np.ndarray, hbr_abs: np.ndarray) -> list[float | None]:
+        """由绝对 HbO/HbR（摩尔）算 rSO₂（%）。"""
         hbt = hbo_abs + hbr_abs
         with np.errstate(divide="ignore", invalid="ignore"):
             rso2 = np.where(hbt > 0, 100.0 * hbo_abs / hbt, np.nan)

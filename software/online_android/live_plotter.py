@@ -14,9 +14,9 @@ if TYPE_CHECKING:
 
 from .types import compute_delta_thb
 
-HBO_HBR_WINDOW_S = 30.0
-RSO2_WINDOW_S = 60.0
-RETENTION_BUFFER_S = 15.0
+HBO_HBR_WINDOW_S = 120.0
+RSO2_WINDOW_S = 120.0
+RETENTION_BUFFER_S = 30.0
 
 
 class _PlotSignals(QtCore.QObject):
@@ -30,6 +30,7 @@ class _LivePlotWindow(QtWidgets.QWidget):
         rso2_window_s: float = RSO2_WINDOW_S,
     ) -> None:
         super().__init__()
+        self.resize(1100, 800)
         self.hbo_hbr_window_s = hbo_hbr_window_s
         self.rso2_window_s = rso2_window_s
         self._retention_s = max(hbo_hbr_window_s, rso2_window_s) + RETENTION_BUFFER_S
@@ -37,6 +38,8 @@ class _LivePlotWindow(QtWidgets.QWidget):
         self._hbo: list[float] = []
         self._hbr: list[float] = []
         self._cyt: list[float] = []
+        self._delta_thi: list[float] = []
+        self._thi: list[float] = []
         self._rso2_times: list[float] = []
         self._rso2: list[float] = []
 
@@ -44,12 +47,13 @@ class _LivePlotWindow(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
 
         self.hbo_hbr_plot = pg.PlotWidget(
-            title=f"HbO / HbR / ΔtHb sent to Android (last {hbo_hbr_window_s:.0f}s)",
+            title=f"HbO / HbR / Cyt / ΔtHb / ΔtHi / tHi sent to Android "
+            f"(last {hbo_hbr_window_s:.0f}s)",
         )
         self.hbo_hbr_plot.addLegend()
         self.hbo_hbr_plot.showGrid(x=True, y=True, alpha=0.3)
         self.hbo_hbr_plot.setLabel("bottom", "Time (s)")
-        self.hbo_hbr_plot.setLabel("left", "Δ conc.")
+        self.hbo_hbr_plot.setLabel("left", "conc.")
         self.hbo_curve = self.hbo_hbr_plot.plot(
             pen=pg.mkPen("#c0392b", width=2),
             name="HbO",
@@ -65,6 +69,15 @@ class _LivePlotWindow(QtWidgets.QWidget):
         self.dthb_curve = self.hbo_hbr_plot.plot(
             pen=pg.mkPen("#d35400", width=2, style=QtCore.Qt.DashLine),
             name="ΔtHb",
+        )
+        self.dthi_curve = self.hbo_hbr_plot.plot(
+            pen=pg.mkPen("#16a085", width=2, style=QtCore.Qt.DotLine),
+            name="ΔtHi",
+        )
+        # 绝对 tHi(≈80µM) 与其它量同轴；Y 轴自适应会撑大以容纳它。
+        self.thi_curve = self.hbo_hbr_plot.plot(
+            pen=pg.mkPen("#34495e", width=2),
+            name="tHi",
         )
         layout.addWidget(self.hbo_hbr_plot)
 
@@ -88,11 +101,15 @@ class _LivePlotWindow(QtWidgets.QWidget):
         if not batch.times:
             return
 
+        dthi_vals = self._align_optional(batch.delta_thi, len(batch.times))
+        thi_vals = self._align_optional(batch.thi, len(batch.times))
         if batch.replace_full_series:
             self._times = [float(x) for x in batch.times]
             self._hbo = [float(x) for x in batch.hbo]
             self._hbr = [float(x) for x in batch.hbr]
             self._cyt = [float(x) for x in batch.cyt]
+            self._delta_thi = list(dthi_vals)
+            self._thi = list(thi_vals)
             self._rso2_times = []
             self._rso2 = []
             if batch.rso2:
@@ -101,11 +118,15 @@ class _LivePlotWindow(QtWidgets.QWidget):
                         self._rso2_times.append(float(elapsed_time))
                         self._rso2.append(float(rso2))
         else:
-            for elapsed_time, hbo, hbr, cyt in zip(batch.times, batch.hbo, batch.hbr, batch.cyt):
+            for idx, (elapsed_time, hbo, hbr, cyt) in enumerate(
+                zip(batch.times, batch.hbo, batch.hbr, batch.cyt)
+            ):
                 self._times.append(float(elapsed_time))
                 self._hbo.append(float(hbo))
                 self._hbr.append(float(hbr))
                 self._cyt.append(float(cyt))
+                self._delta_thi.append(dthi_vals[idx])
+                self._thi.append(thi_vals[idx])
 
             if batch.rso2:
                 for elapsed_time, rso2 in zip(batch.times, batch.rso2):
@@ -125,6 +146,14 @@ class _LivePlotWindow(QtWidgets.QWidget):
             f"points={len(batch.times)} | latest rSO2={rso2_txt}"
         )
 
+    @staticmethod
+    def _align_optional(values: list[float] | None, n: int) -> list[float]:
+        """把可选序列对齐到 n 长度；缺失（热身期）填 NaN 以在图上留空。"""
+        if values is None:
+            return [float("nan")] * n
+        vals = list(values)
+        return [float(vals[i]) if i < len(vals) else float("nan") for i in range(n)]
+
     def _prune_old_points(self) -> None:
         if not self._times:
             return
@@ -134,6 +163,8 @@ class _LivePlotWindow(QtWidgets.QWidget):
             self._hbo.pop(0)
             self._hbr.pop(0)
             self._cyt.pop(0)
+            self._delta_thi.pop(0)
+            self._thi.pop(0)
         while self._rso2_times and self._rso2_times[0] < cutoff:
             self._rso2_times.pop(0)
             self._rso2.pop(0)
@@ -159,11 +190,15 @@ class _LivePlotWindow(QtWidgets.QWidget):
         t_hbo, hbo = self._slice_window(self._times, self._hbo, self.hbo_hbr_window_s)
         _, hbr = self._slice_window(self._times, self._hbr, self.hbo_hbr_window_s)
         _, cyt = self._slice_window(self._times, self._cyt, self.hbo_hbr_window_s)
+        _, dthi = self._slice_window(self._times, self._delta_thi, self.hbo_hbr_window_s)
+        _, thi = self._slice_window(self._times, self._thi, self.hbo_hbr_window_s)
         dthb = compute_delta_thb(hbo, hbr)
         self.hbo_curve.setData(t_hbo, hbo)
         self.hbr_curve.setData(t_hbo, hbr)
         self.cyt_curve.setData(t_hbo, cyt)
         self.dthb_curve.setData(t_hbo, dthb)
+        self.dthi_curve.setData(t_hbo, dthi)
+        self.thi_curve.setData(t_hbo, thi)
         if t_hbo:
             self.hbo_hbr_plot.setXRange(t_hbo[0], t_hbo[-1], padding=0.02)
 

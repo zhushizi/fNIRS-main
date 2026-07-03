@@ -21,7 +21,9 @@ CalculateSeriesFn = Callable[
 
 HBO_COL, HBR_COL, CYT_COL = processed_column_names(OUTPUT_CHANNEL)
 DTHB_COL = f"{OUTPUT_CHANNEL}_dthb"
-PROCESSED_HEADER = ["Time", HBO_COL, HBR_COL, CYT_COL, DTHB_COL]
+THI_COL = f"{OUTPUT_CHANNEL}_thi"
+DTHI_COL = f"{OUTPUT_CHANNEL}_dthi"
+PROCESSED_HEADER = ["Time", HBO_COL, HBR_COL, CYT_COL, DTHB_COL, THI_COL, DTHI_COL]
 
 
 class AndroidLiveOutputRecorder:
@@ -39,6 +41,10 @@ class AndroidLiveOutputRecorder:
         self._hbo: list[float] = []
         self._hbr: list[float] = []
         self._cyt: list[float] = []
+        # tHi / ΔtHi 无法从 hbo/hbr 重算（依赖冻结基线），故直接存回传值；
+        # 热身期批次不带 tHi，对应位置存 None，落盘写空。
+        self._thi: list[float | None] = []
+        self._delta_thi: list[float | None] = []
 
     @property
     def sample_count(self) -> int:
@@ -50,24 +56,38 @@ class AndroidLiveOutputRecorder:
         hbo: list[float] | np.ndarray,
         hbr: list[float] | np.ndarray,
         cyt: list[float] | np.ndarray | None = None,
+        thi: list[float] | np.ndarray | None = None,
+        delta_thi: list[float] | np.ndarray | None = None,
     ) -> None:
         self._times = [float(x) for x in times]
         self._hbo = [float(x) for x in hbo]
         self._hbr = [float(x) for x in hbr]
         if cyt is not None:
             self._cyt = [float(x) for x in cyt]
+        n = len(self._times)
+        self._thi = [float(x) for x in thi] if thi is not None else [None] * n
+        self._delta_thi = [float(x) for x in delta_thi] if delta_thi is not None else [None] * n
 
     def append_batch(self, batch: LiveAnalysisBatch) -> None:
         if batch.replace_full_series:
-            self.set_series(batch.times, batch.hbo, batch.hbr, batch.cyt)
+            self.set_series(batch.times, batch.hbo, batch.hbr, batch.cyt, batch.thi, batch.delta_thi)
             return
         if self.output_path is None:
             return
-        for time_s, hbo, hbr, cyt in zip(batch.times, batch.hbo, batch.hbr, batch.cyt):
+        count = len(batch.times)
+        thi_vals = list(batch.thi) if batch.thi is not None else [None] * count
+        dthi_vals = list(batch.delta_thi) if batch.delta_thi is not None else [None] * count
+        for idx, (time_s, hbo, hbr, cyt) in enumerate(
+            zip(batch.times, batch.hbo, batch.hbr, batch.cyt)
+        ):
             self._times.append(float(time_s))
             self._hbo.append(float(hbo))
             self._hbr.append(float(hbr))
             self._cyt.append(float(cyt))
+            thi_v = thi_vals[idx] if idx < len(thi_vals) else None
+            dthi_v = dthi_vals[idx] if idx < len(dthi_vals) else None
+            self._thi.append(float(thi_v) if thi_v is not None else None)
+            self._delta_thi.append(float(dthi_v) if dthi_v is not None else None)
 
     def flush_from_raw(
         self,
@@ -119,7 +139,15 @@ class AndroidLiveOutputRecorder:
             for idx in range(n):
                 cyt_val = self._cyt[idx] if idx < len(self._cyt) else ""
                 dthb_val = dthb_series[idx] if idx < len(dthb_series) else ""
-                writer.writerow([self._times[idx], self._hbo[idx], self._hbr[idx], cyt_val, dthb_val])
+                thi_val = self._thi[idx] if idx < len(self._thi) and self._thi[idx] is not None else ""
+                dthi_val = (
+                    self._delta_thi[idx]
+                    if idx < len(self._delta_thi) and self._delta_thi[idx] is not None
+                    else ""
+                )
+                writer.writerow(
+                    [self._times[idx], self._hbo[idx], self._hbr[idx], cyt_val, dthb_val, thi_val, dthi_val]
+                )
 
         path_str = str(self.output_path)
         print(

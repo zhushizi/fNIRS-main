@@ -10,6 +10,7 @@ from .rso2 import (
     DEFAULT_BASELINE_RSO2_PCT,
     DEFAULT_BASELINE_START_S,
     compute_rso2_series,
+    compute_thi_series,
 )
 from .session import OnlineCaptureSession, create_online_session
 from .tcp_bridge import HostTcpProtocolError, HostTcpSerialBridge
@@ -33,6 +34,7 @@ __all__ = [
     "OnlineCaptureSession",
     "OnlineSettings",
     "compute_rso2_series",
+    "compute_thi_series",
     "create_online_session",
     "enrich_result_with_rso2",
 ]

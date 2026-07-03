@@ -79,6 +79,10 @@ LIVE_CONC_UNIT = "M"
 LIVE_BASELINE_ANCHOR = False
 # 是否向安卓 live_analysis_batch 附带 delta_thb（HbO+HbR）。安卓未升级解析前可设 False。
 LIVE_SEND_DELTA_THB = True
+# 是否向安卓 live_analysis_batch 附带 thi / delta_thi（固定基线伪绝对总血红蛋白）。
+# thi = HbO_abs + HbR_abs（与 rSO₂ 同一套基线假设，绝对量 ≈ 基线 HbT）；
+# delta_thi = thi − 基线 HbT（相对基线的变化，≈0 起算）。安卓未升级解析前可设 False。
+LIVE_SEND_THI = True
 
 
 def _nm_suffix(nm: float) -> str:
