@@ -13,7 +13,7 @@ import time
 from collections import deque
 
 import numpy as np
-import nirsimple.preprocessing as nsp
+from fnirs_pipeline.mbll_core import get_dpf, mbll_hbo_hbr
 import pyqtgraph as pg
 import serial
 from PyQt5 import QtCore, QtWidgets
@@ -103,8 +103,8 @@ def _channel_info():
     ch_names = [CHANNEL_NAME, CHANNEL_NAME]
     ch_wls = [MBLL_WAVELENGTH_WL1_NM, MBLL_WAVELENGTH_WL2_NM]
     ch_dpfs = [
-        nsp.get_dpf(MBLL_WAVELENGTH_WL1_NM, MBLL_DEFAULT_AGE),
-        nsp.get_dpf(MBLL_WAVELENGTH_WL2_NM, MBLL_DEFAULT_AGE),
+        get_dpf(MBLL_WAVELENGTH_WL1_NM, MBLL_DEFAULT_AGE),
+        get_dpf(MBLL_WAVELENGTH_WL2_NM, MBLL_DEFAULT_AGE),
     ]
     ch_distances = [SOURCE_DETECTOR_DISTANCE_CM, SOURCE_DETECTOR_DISTANCE_CM]
     return ch_names, ch_wls, ch_dpfs, ch_distances
@@ -310,7 +310,7 @@ class MainWindow(QtWidgets.QWidget):
             delta_od = delta_od_filt[:, -1:].astype(float, copy=False)
             ch_names, ch_wls, ch_dpfs, ch_distances = _channel_info()
             try:
-                delta_c, names, types = nsp.mbll(
+                delta_c, names, types = mbll_hbo_hbr(
                     delta_od,
                     ch_names,
                     ch_wls,

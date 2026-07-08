@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import csv
-import os
 
-import nirsimple.preprocessing as nsp
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, resample_poly, sosfiltfilt
@@ -28,6 +26,7 @@ from config import (
 )
 from online_android import AnalysisResult, enrich_result_with_rso2
 
+from .mbll_core import get_dpf, hemoglobin_extinctions, intensities_to_od_changes
 from .preprocessing import stack_intensities_for_detector
 
 
@@ -97,21 +96,6 @@ def short_separation_regression(
     return corrected, beta
 
 
-def _hemoglobin_extinctions(wavelengths: list[float], table: str = "wray") -> np.ndarray:
-    """读取 nirsimple 内置 HbO/HbR 消光系数表，并插值到目标波长。"""
-    ex_path = os.path.join(os.path.dirname(nsp.__file__), "tables", f"{table}.csv")
-    ex_df = pd.read_csv(ex_path)
-    table_wls = ex_df["lambda"].to_numpy(dtype=float)
-    hbo = ex_df["hbo"].to_numpy(dtype=float)
-    hbr = ex_df["hbr"].to_numpy(dtype=float)
-    return np.column_stack(
-        [
-            np.interp(wavelengths, table_wls, hbo),
-            np.interp(wavelengths, table_wls, hbr),
-        ]
-    )
-
-
 def _cyt_extinction_vector(wavelengths: list[float]) -> np.ndarray:
     """返回 Cyt 差分消光系数向量，单位与 HbO/HbR 一致（OD / cm / M）。"""
     return np.asarray([CYT_DIFFERENCE_EXTINCTION[float(wl)] for wl in wavelengths], dtype=float) * 1000.0
@@ -129,7 +113,7 @@ def generalized_mbll(
 
     返回 (3, n_timepoints)，行顺序为 HbO / HbR / Cyt。
     """
-    hb_ex = _hemoglobin_extinctions(wavelengths, table)
+    hb_ex = hemoglobin_extinctions(wavelengths, table)
     cyt_ex = _cyt_extinction_vector(wavelengths)
     pathlength = np.asarray(dpfs, dtype=float) * float(distance_cm)
     a_hb = hb_ex * pathlength[:, np.newaxis]
@@ -175,14 +159,14 @@ def compute_all_channel_concentrations(
 
     fs = _estimate_fs(times)
     wavelengths = mbll_wavelengths_nm()
-    dpfs = [nsp.get_dpf(wl, age) for wl in wavelengths]
+    dpfs = [get_dpf(wl, age) for wl in wavelengths]
 
     detector_delta_od: dict[str, np.ndarray] = {}
     results: dict[str, np.ndarray] = {}
 
     for detector in DETECTOR_CHANNELS:
         samples = stack_intensities_for_detector(interleaved_df, detector)
-        delta_od = nsp.intensities_to_od_changes(samples)
+        delta_od = intensities_to_od_changes(samples)
         detector_delta_od[detector.name] = delta_od
         delta_od_filt = smart_bandpass(delta_od, fs, lowcut=bp_low, highcut=bp_high, order=bp_order)
         results[detector.name] = generalized_mbll(

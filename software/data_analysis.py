@@ -4,8 +4,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import nirsimple.preprocessing as nsp
-import nirsimple.processing as nproc
+from fnirs_pipeline.mbll_core import get_dpf, intensities_to_od_changes, mbll_hbo_hbr
 from scipy.signal import butter, filtfilt, resample_poly, sosfiltfilt
 
 from config import (
@@ -186,8 +185,8 @@ def _channel_info():
     ch_names = [CHANNEL_NAME, CHANNEL_NAME]
     ch_wls = [MBLL_WAVELENGTH_WL1_NM, MBLL_WAVELENGTH_WL2_NM]
     ch_dpfs = [
-        nsp.get_dpf(MBLL_WAVELENGTH_WL1_NM, MBLL_DEFAULT_AGE),
-        nsp.get_dpf(MBLL_WAVELENGTH_WL2_NM, MBLL_DEFAULT_AGE),
+        get_dpf(MBLL_WAVELENGTH_WL1_NM, MBLL_DEFAULT_AGE),
+        get_dpf(MBLL_WAVELENGTH_WL2_NM, MBLL_DEFAULT_AGE),
     ]
     ch_distances = [3.0, 3.0]
     return ch_names, ch_wls, ch_dpfs, ch_distances
@@ -373,10 +372,10 @@ print('samples.shape: ', samples.shape)
 b, a = butter(4, 1.0/(0.5*split_fs), btype='low', analog=False)
 samples = filtfilt(b, a, samples, axis=1)
 plot_array(samples,['Wavelength=1','Wavelength=2'])
-delta_od = nsp.intensities_to_od_changes(samples)
+delta_od = intensities_to_od_changes(samples)
 delta_od_filt = smart_bandpass(delta_od, split_fs)
 ch_names, ch_wls, ch_dpfs, ch_distances = _channel_info()
-delta_c, new_ch_names, new_ch_types = nsp.mbll(
+delta_c, new_ch_names, new_ch_types = mbll_hbo_hbr(
         delta_od_filt,
         ch_names,
         ch_wls,

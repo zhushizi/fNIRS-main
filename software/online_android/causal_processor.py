@@ -43,6 +43,8 @@ from config import (
     wavelength_channel_by_code,
 )
 
+from fnirs_pipeline.mbll_core import get_dpf, intensities_to_od_changes
+
 from .baseline_state import MutableBaseline
 from .config import OnlineSettings
 from .types import LiveAnalysisBatch
@@ -267,7 +269,6 @@ class IncrementalCausalProcessor:
 
     def _freeze_baseline(self, times: np.ndarray) -> None:
         """热身末端：一次性冻结 I0 / β / 滤波状态 / 锚定基线 / rSO₂ 基线。"""
-        import nirsimple.preprocessing as nsp
         from fnirs_pipeline.mbll import butter_bandpass_sos, short_separation_regression
         from fnirs_pipeline.preprocessing import stack_intensities_for_detector
 
@@ -276,7 +277,7 @@ class IncrementalCausalProcessor:
         fs = 1.0 / float(np.mean(valid)) if valid.size else 1.0
 
         self._wavelengths = mbll_wavelengths_nm()
-        self._dpfs = [nsp.get_dpf(wl, MBLL_DEFAULT_AGE) for wl in self._wavelengths]
+        self._dpfs = [get_dpf(wl, MBLL_DEFAULT_AGE) for wl in self._wavelengths]
 
         inter_df = self._interleaved_df()
         baseline_mask = (
@@ -288,12 +289,12 @@ class IncrementalCausalProcessor:
 
         s_long = stack_intensities_for_detector(inter_df, self._long_det)
         self._ref_long = np.mean(np.abs(s_long[:, baseline_mask]), axis=1)
-        long_od = nsp.intensities_to_od_changes(s_long, refs=self._ref_long)
+        long_od = intensities_to_od_changes(s_long, refs=self._ref_long)
 
         if self._ssr and self._short_det is not None:
             s_short = stack_intensities_for_detector(inter_df, self._short_det)
             self._ref_short = np.mean(np.abs(s_short[:, baseline_mask]), axis=1)
-            short_od = nsp.intensities_to_od_changes(s_short, refs=self._ref_short)
+            short_od = intensities_to_od_changes(s_short, refs=self._ref_short)
             self._short_mean = np.mean(short_od, axis=1)
             _corrected, self._beta = short_separation_regression(long_od, short_od)
             corrected_all = long_od - self._beta[:, np.newaxis] * (
@@ -349,14 +350,13 @@ class IncrementalCausalProcessor:
 
     def _concentrations(self, df: pd.DataFrame, *, reuse_zi: bool) -> np.ndarray:
         """对给定（整段或增量）interleaved 行计算 (3, N) 摩尔浓度。"""
-        import nirsimple.preprocessing as nsp
         from fnirs_pipeline.preprocessing import stack_intensities_for_detector
 
         s_long = stack_intensities_for_detector(df, self._long_det)
-        long_od = nsp.intensities_to_od_changes(s_long, refs=self._ref_long)
+        long_od = intensities_to_od_changes(s_long, refs=self._ref_long)
         if self._ssr and self._short_det is not None:
             s_short = stack_intensities_for_detector(df, self._short_det)
-            short_od = nsp.intensities_to_od_changes(s_short, refs=self._ref_short)
+            short_od = intensities_to_od_changes(s_short, refs=self._ref_short)
             corrected = long_od - self._beta[:, np.newaxis] * (
                 short_od - self._short_mean[:, np.newaxis]
             )
