@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pandas as pd
 
+from config import with_channel_suffix
+
 from .baseline_state import MutableBaseline
-from .batch_builder import IncrementalBatchBuilder
 from .batch_recorder import AndroidLiveOutputRecorder
 from .buffer import OnlineSampleBuffer
-from .causal_processor import IncrementalCausalProcessor
+from .channel_dispatcher import ChannelDispatcher
 from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
 from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
 from .reporter import AndroidReporter
@@ -32,11 +33,12 @@ class OnlineCaptureSession:
     buffer: OnlineSampleBuffer
     worker: OnlineAnalysisWorker
     reporter: AndroidReporter
-    batch_builder: IncrementalBatchBuilder | IncrementalCausalProcessor
+    dispatcher: ChannelDispatcher
     prepare_interleaved: PrepareInterleavedFn
     calculate_series: CalculateSeriesFn
     plotter: LiveAndroidBatchPlotter | None = None
-    recorder: AndroidLiveOutputRecorder | None = None
+    # {通道码: 录制器}，采集结束时逐通道 flush。
+    recorders: dict[int, AndroidLiveOutputRecorder] = field(default_factory=dict)
 
     def feed_sample(
         self,
@@ -45,15 +47,18 @@ class OnlineCaptureSession:
         value: float,
         wavelength_code: int,
         channel_name: str = "",
+        acq_channel_code: int = 0x01,
     ) -> None:
-        self.buffer.append(elapsed_time, detector_id, value, wavelength_code, channel_name)
+        self.buffer.append(
+            elapsed_time, detector_id, value, wavelength_code, channel_name, acq_channel_code
+        )
 
     def stop(self) -> None:
         self.worker.stop()
-        if self.recorder is not None:
-            # 落盘的是「实际回传安卓的曲线」本身（μM、已锚定、因果），
-            # 不再用离线终算覆盖，确保 android_live_output.csv 与安卓所见一致。
-            self.recorder.flush()
+        # 逐通道落盘「实际回传安卓的曲线」本身（μM/M、已锚定、因果），
+        # 每个采集通道各写一份 android_live_output_ch{n}.csv，与安卓所见一致。
+        for recorder in self.recorders.values():
+            recorder.flush()
 
 
 def create_online_session(
@@ -67,28 +72,13 @@ def create_online_session(
     live_plot_rso2_window_s: float = RSO2_WINDOW_S,
     android_live_output_path: str | None = None,
 ) -> OnlineCaptureSession:
-    """创建并启动在线分析会话（buffer + worker）。"""
+    """创建并启动在线分析会话（buffer + 按通道分发的 worker）。"""
     baseline = MutableBaseline(
         rso2_pct=settings.rso2_baseline_rso2_pct,
         hbt_uM=settings.rso2_baseline_hbt_uM,
     )
     buffer = OnlineSampleBuffer(settings)
-    if settings.online_mode == "causal_incremental":
-        batch_builder = IncrementalCausalProcessor(
-            settings,
-            prepare_interleaved=prepare_interleaved,
-            calculate_series=calculate_series,
-            baseline=baseline,
-        )
-        print("Online mode: causal_incremental (causal IIR + append-only).")
-    else:
-        batch_builder = IncrementalBatchBuilder(
-            settings,
-            prepare_interleaved=prepare_interleaved,
-            calculate_series=calculate_series,
-            baseline=baseline,
-        )
-        print("Online mode: full_replace (non-causal, full-series replace).")
+
     plotter: LiveAndroidBatchPlotter | None = None
     if live_plot:
         plotter = LiveAndroidBatchPlotter(
@@ -98,18 +88,37 @@ def create_online_session(
         print(
             "Live plot enabled: "
             f"HbO/HbR window={live_plot_hbo_hbr_window_s:.0f}s, "
-            f"rSO2 window={live_plot_rso2_window_s:.0f}s."
+            f"rSO2 window={live_plot_rso2_window_s:.0f}s (per acquisition channel)."
         )
-    recorder = (
-        AndroidLiveOutputRecorder(android_live_output_path)
-        if android_live_output_path
-        else None
+
+    recorders: dict[int, AndroidLiveOutputRecorder] = {}
+    reporter = AndroidReporter(bridge, settings, plotter=plotter, recorders=recorders)
+
+    def on_new_channel(code: int) -> None:
+        """某个采集通道首次出现：建立它自己的落盘录制器。"""
+        if android_live_output_path:
+            # recorders 与 reporter.recorders 是同一对象，写一处即可。
+            recorders[code] = AndroidLiveOutputRecorder(
+                with_channel_suffix(android_live_output_path, code)
+            )
+        print(f"Acquisition channel {int(code)} detected; online analysis started for it.")
+
+    dispatcher = ChannelDispatcher(
+        settings,
+        prepare_interleaved=prepare_interleaved,
+        calculate_series=calculate_series,
+        baseline=baseline,
+        on_new_channel=on_new_channel,
     )
-    reporter = AndroidReporter(bridge, settings, plotter=plotter, recorder=recorder)
+    if settings.online_mode == "causal_incremental":
+        print("Online mode: causal_incremental (causal IIR + append-only), per channel.")
+    else:
+        print("Online mode: full_replace (non-causal, full-series replace), per channel.")
+
     worker = OnlineAnalysisWorker(
         buffer,
         bridge,
-        batch_builder,
+        dispatcher,
         settings=settings,
         reporter=reporter,
     )
@@ -119,9 +128,9 @@ def create_online_session(
         buffer=buffer,
         worker=worker,
         reporter=reporter,
-        batch_builder=batch_builder,
+        dispatcher=dispatcher,
         prepare_interleaved=prepare_interleaved,
         calculate_series=calculate_series,
         plotter=plotter,
-        recorder=recorder,
+        recorders=recorders,
     )

@@ -64,7 +64,7 @@ def capture_data(
 
         with open(csv_filename, mode="w", newline="", encoding="utf-8") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(["Time (s)", "DetectorId", "Channel", "Wavelength", "Value"])
+            writer.writerow(["Time (s)", "ChannelId", "DetectorId", "Channel", "Wavelength", "Value"])
 
             print("Starting dual-detector five-wavelength raw ADC logging (seconds elapsed)...")
             start_time = time.time()
@@ -94,10 +94,12 @@ def capture_data(
                     sample.value,
                     sample.wavelength_code,
                     sample.channel_name,
+                    sample.acq_channel_code,
                 )
                 writer.writerow(
                     [
                         elapsed_time,
+                        sample.acq_channel_code,
                         sample.detector_code,
                         sample.channel_name or "",
                         sample.wavelength_code,
@@ -109,6 +111,7 @@ def capture_data(
                     f"{elapsed_time:.3f}s - value={sample.value} "
                     f"wl={int(sample.wavelength_code)} "
                     f"detector={int(sample.detector_code)} "
+                    f"acq_ch={int(sample.acq_channel_code)} "
                     f"channel={sample.channel_name or 'unknown'}"
                 )
     finally:

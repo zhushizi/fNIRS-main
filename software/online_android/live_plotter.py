@@ -28,9 +28,11 @@ class _LivePlotWindow(QtWidgets.QWidget):
         self,
         hbo_hbr_window_s: float = HBO_HBR_WINDOW_S,
         rso2_window_s: float = RSO2_WINDOW_S,
+        channel_code: int | None = None,
     ) -> None:
         super().__init__()
         self.resize(1100, 800)
+        self.channel_code = channel_code
         self.hbo_hbr_window_s = hbo_hbr_window_s
         self.rso2_window_s = rso2_window_s
         self._retention_s = max(hbo_hbr_window_s, rso2_window_s) + RETENTION_BUFFER_S
@@ -43,7 +45,8 @@ class _LivePlotWindow(QtWidgets.QWidget):
         self._rso2_times: list[float] = []
         self._rso2: list[float] = []
 
-        self.setWindowTitle("Live Android Batch Mirror")
+        channel_label = f" [channel {int(channel_code)}]" if channel_code is not None else ""
+        self.setWindowTitle(f"Live Android Batch Mirror{channel_label}")
         layout = QtWidgets.QVBoxLayout(self)
 
         self.hbo_hbr_plot = pg.PlotWidget(
@@ -209,6 +212,36 @@ class _LivePlotWindow(QtWidgets.QWidget):
             self.rso2_plot.setXRange(t_rso2[0], t_rso2[-1], padding=0.02)
 
 
+class _PlotManager(QtCore.QObject):
+    """驻留在 Qt 线程内：按采集通道懒创建/更新绘图窗口。"""
+
+    def __init__(
+        self,
+        hbo_hbr_window_s: float,
+        rso2_window_s: float,
+    ) -> None:
+        super().__init__()
+        self._hbo_hbr_window_s = hbo_hbr_window_s
+        self._rso2_window_s = rso2_window_s
+        self._windows: dict[int, _LivePlotWindow] = {}
+
+    def on_batch(self, payload: tuple[int, LiveAnalysisBatch]) -> None:
+        channel_code, batch = payload
+        window = self._windows.get(channel_code)
+        if window is None:
+            window = _LivePlotWindow(
+                self._hbo_hbr_window_s,
+                self._rso2_window_s,
+                channel_code=channel_code,
+            )
+            # 多通道窗口稍微错开，避免完全重叠。
+            offset = 40 * len(self._windows)
+            window.move(80 + offset, 80 + offset)
+            window.show()
+            self._windows[channel_code] = window
+        window.append_batch(batch)
+
+
 class _LivePlotThread(QtCore.QThread):
     """专用 QThread：所有 Qt / pyqtgraph 对象只在此线程创建与更新。"""
 
@@ -232,12 +265,13 @@ class _LivePlotThread(QtCore.QThread):
             app = QtWidgets.QApplication([])
 
         signals = _PlotSignals()
-        window = _LivePlotWindow(self._hbo_hbr_window_s, self._rso2_window_s)
+        manager = _PlotManager(self._hbo_hbr_window_s, self._rso2_window_s)
+        # manager 必须与 signals 一同存活，否则会被 GC。
+        self._manager = manager
         signals.batch_received.connect(
-            window.append_batch,
+            manager.on_batch,
             QtCore.Qt.QueuedConnection,
         )
-        window.show()
 
         self._signals_holder.append(signals)
         self._ready_event.set()
@@ -245,7 +279,7 @@ class _LivePlotThread(QtCore.QThread):
 
 
 class LiveAndroidBatchPlotter:
-    """在独立 QThread 中实时绘制发往安卓的 live_analysis_batch。"""
+    """在独立 QThread 中按采集通道实时绘制发往安卓的 live_analysis_batch。"""
 
     def __init__(
         self,
@@ -264,8 +298,8 @@ class LiveAndroidBatchPlotter:
         if not self._ready.wait(timeout=10.0):
             raise RuntimeError("Live plot window failed to start within 10s.")
 
-    def update(self, batch: LiveAnalysisBatch) -> None:
+    def update(self, channel_code: int, batch: LiveAnalysisBatch) -> None:
         if not self._signals_holder:
             return
-        # 从在线分析线程跨线程投递；由 QueuedConnection 在 QThread 内刷新 UI。
-        self._signals_holder[0].batch_received.emit(batch)
+        # 从在线分析线程跨线程投递；由 QueuedConnection 在 QThread 内刷新对应通道窗口。
+        self._signals_holder[0].batch_received.emit((int(channel_code), batch))

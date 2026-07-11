@@ -70,10 +70,14 @@
 | 0 | 波长编号：`0x00=未点亮`，`0x01=850`，`0x02=810`，`0x03=770`，`0x04=730`，`0x05=700` nm |
 | 1 | 接收源编号：`0x01=S1_D1`，`0x02=S1_D2` |
 | 2-5 | 采集值（4 字节大端无符号） |
-| 6-20 | 保留 |
+| 6 | 采集通道编号：`0x01=通道1`，`0x02=通道2`（`0x00`/缺省归入通道1） |
+| 7-20 | 保留 |
 
-单帧只携带 **一个接收源、一个波长下的一次采样值**。
+单帧只携带 **一个采集通道、一个接收源、一个波长下的一次采样值**。
 `Wavelength=0x00`（OFF）行在配对前丢弃，不参与 RMS 切段与多波长配对。
+**采集通道（byte6）与接收源、波长正交**：PC 先按通道拆分数据流，每个通道内部各有
+完整的双接收源×五波长，整条 配对 → SSR → MBLL → rSO₂ 链路在每个通道内各跑一套，
+在线/离线结果都按通道分别输出。
 
 ---
 
@@ -91,14 +95,20 @@
 ### `all_groups.csv` 结构
 
 ```text
-Time (s),DetectorId,Channel,Wavelength,Value
+Time (s),ChannelId,DetectorId,Channel,Wavelength,Value
 ```
 
 - `Time (s)`：相对接收时间
+- `ChannelId`：采集通道编号（`1=通道1`，`2=通道2`；离线按此列拆分成 `*_ch{n}.csv`）
 - `DetectorId`：接收源编号（`1=S1_D1`，`2=S1_D2`）
 - `Channel`：接收源名（`S1_D1` / `S1_D2`）
 - `Wavelength`：波长编号（`0=OFF`，`1..5` 对应五波长；流水线中去掉 `0`）
 - `Value`：4 字节采样值
+
+> 离线终算 `run_pipeline` 读入 `all_groups.csv` 后按 `ChannelId` 分组，对每个通道分别写
+> `interleaved_output_ch{n}.csv` / `processed_output_ch{n}.csv`，并各发一条带 `channel` 字段的
+> `analysis_result`。在线 `OnlineAnalysisWorker` 经 `ChannelDispatcher` 为每个通道各维护一个
+> 处理器，逐通道回传 `live_analysis_batch`（含 `channel`）。
 
 ---
 

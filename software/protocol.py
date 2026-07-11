@@ -28,6 +28,7 @@ from config import (
     MAX_RETRIES,
     WAVELENGTH_BY_CODE,
     WAVELENGTH_OFF_CODE,
+    normalize_channel_code,
 )
 
 
@@ -47,6 +48,8 @@ class DataSample:
     detector_code: int
     channel_name: Optional[str]
     value: int
+    # 采集通道（硬件通道，payload byte6 归一化后）：通道1=0x01，通道2=0x02。
+    acq_channel_code: int = 0x01
 
 
 def calculate_checksum(length_byte: int, frame_type: int, payload: bytes) -> int:
@@ -87,6 +90,7 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
     - payload[0] = 光源波长编号（0x01..0x05）
     - payload[1] = 接收源编号（PD1=0x01，PD2=0x02）
     - payload[2:6] = 采样值（高字节在前，4 字节）
+    - payload[6] = 采集通道编号（通道1=0x01，通道2=0x02；0x00 归入默认通道）
 
     sensor_id 字段保留为 detector_code 的兼容别名。
     """
@@ -97,6 +101,7 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
     wavelength_code = payload[0]
     detector_code = payload[1]
     value = int.from_bytes(payload[2:6], byteorder="big", signed=False)
+    acq_channel_code = normalize_channel_code(payload[6])
     if wavelength_code == WAVELENGTH_OFF_CODE:
         wavelength_nm: Optional[float] = None
     else:
@@ -109,6 +114,7 @@ def parse_data_frame(frame: ParsedFrame) -> DataSample:
         detector_code=detector_code,
         channel_name=channel_name,
         value=value,
+        acq_channel_code=acq_channel_code,
     )
 
 

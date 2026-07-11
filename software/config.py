@@ -55,6 +55,11 @@ SOURCE_DETECTOR_DISTANCE_CM = 3.0
 WAVELENGTH_OFF_CODE = 0x00
 DETECTOR_OFF_CODE = 0x00
 
+# 数据帧 payload byte6（4 字节采样值之后的第一字节）：采集通道位。
+# 0x01=通道1，0x02=通道2。0x00（未带通道位/旧固件）归入 DEFAULT_CHANNEL_CODE。
+CHANNEL_OFF_CODE = 0x00
+DEFAULT_CHANNEL_CODE = 0x01
+
 # ---------------------------------------------------------------------------
 # 输出通道选择（离线 processed_output、在线回传安卓、live 曲线均使用此通道）
 # 可选: "S1_D1" | "S1_D2" | "S1_D1_ssr"
@@ -125,6 +130,22 @@ class DetectorChannel:
     distance_cm: float
 
 
+@dataclass(frozen=True)
+class AcquisitionChannel:
+    """
+    单个采集通道（硬件通道，数据帧 payload byte6 = ChannelId）。
+
+    与「接收源」(DetectorChannel) 正交：每个采集通道内部仍各自包含完整的
+    双接收源（S1_D1/S1_D2）× 五波长，整条反演链路在每个通道内各跑一套。
+
+    - code: 协议 ChannelId 取值（通道1=0x01，通道2=0x02）
+    - name: 输出文件名后缀 / 日志标识（ch1 / ch2）
+    """
+
+    code: int
+    name: str
+
+
 def intensity_column_name(emitter_nm: float, channel_name: str = CHANNEL_NAME) -> str:
     """由通道名和光源标称波长生成光强列名，如 S1_D1_850。"""
     return f"{channel_name}_{_nm_suffix(emitter_nm)}"
@@ -157,6 +178,12 @@ WAVELENGTH_CHANNELS: tuple[WavelengthChannel, ...] = (
     WavelengthChannel(code=0x05, emitter_nm=700.0, mbll_nm=700.0),
 )
 
+# 采集通道表（硬件通道，与接收源/波长正交）。数据帧 payload byte6 = ChannelId。
+ACQUISITION_CHANNELS: tuple[AcquisitionChannel, ...] = (
+    AcquisitionChannel(code=0x01, name="ch1"),
+    AcquisitionChannel(code=0x02, name="ch2"),
+)
+
 # 兼容旧代码的别名
 WAVELENGTH_850_CODE = WAVELENGTH_CHANNELS[0].code
 WAVELENGTH_810_CODE = WAVELENGTH_CHANNELS[1].code
@@ -174,6 +201,8 @@ ACTIVE_WAVELENGTH_CODES = frozenset(ch.code for ch in WAVELENGTH_CHANNELS)
 DETECTOR_BY_CODE = {ch.code: ch.name for ch in DETECTOR_CHANNELS}
 ACTIVE_DETECTOR_CODES = frozenset(ch.code for ch in DETECTOR_CHANNELS)
 CHANNEL_NAMES: tuple[str, ...] = tuple(ch.name for ch in DETECTOR_CHANNELS)
+ACQUISITION_CHANNEL_BY_CODE = {ch.code: ch for ch in ACQUISITION_CHANNELS}
+ACTIVE_CHANNEL_CODES = frozenset(ch.code for ch in ACQUISITION_CHANNELS)
 INTENSITY_COLUMNS: tuple[str, ...] = tuple(
     intensity_column_for(det.name, wl.emitter_nm)
     for det in DETECTOR_CHANNELS
@@ -212,6 +241,29 @@ def wavelength_channel_by_code(code: int) -> WavelengthChannel | None:
         if ch.code == code:
             return ch
     return None
+
+
+def acquisition_channel_by_code(code: int) -> AcquisitionChannel | None:
+    return ACQUISITION_CHANNEL_BY_CODE.get(int(code))
+
+
+def normalize_channel_code(code: int) -> int:
+    """把数据帧 payload byte6 的原始通道码归一化：未知/OFF(0x00) 归入默认通道。"""
+    return int(code) if int(code) in ACTIVE_CHANNEL_CODES else DEFAULT_CHANNEL_CODE
+
+
+def channel_name_for_code(code: int) -> str:
+    """通道码 → 文件名/日志后缀（如 ch1）。未知码回退成 ch{code}。"""
+    ch = acquisition_channel_by_code(code)
+    return ch.name if ch is not None else f"ch{int(code)}"
+
+
+def with_channel_suffix(path: str, code: int) -> str:
+    """在文件名扩展名前插入通道后缀，如 processed_output.csv → processed_output_ch1.csv。"""
+    import os
+
+    root, ext = os.path.splitext(path)
+    return f"{root}_{channel_name_for_code(code)}{ext}"
 
 
 def mbll_wavelengths_nm() -> list[float]:
@@ -257,6 +309,18 @@ def _validate_wavelength_channels() -> None:
     missing_cyt = [ch.mbll_nm for ch in WAVELENGTH_CHANNELS if ch.mbll_nm not in CYT_RELATIVE_EXTINCTION]
     if missing_cyt:
         raise ValueError(f"CYT_RELATIVE_EXTINCTION 缺少波长: {missing_cyt}")
+    if not ACQUISITION_CHANNELS:
+        raise ValueError("config.ACQUISITION_CHANNELS 至少需要一个采集通道。")
+    channel_codes = [ch.code for ch in ACQUISITION_CHANNELS]
+    if len(channel_codes) != len(set(channel_codes)):
+        raise ValueError("config.ACQUISITION_CHANNELS 中存在重复的协议 code。")
+    channel_names = [ch.name for ch in ACQUISITION_CHANNELS]
+    if len(channel_names) != len(set(channel_names)):
+        raise ValueError("config.ACQUISITION_CHANNELS 中存在重复的 name。")
+    if CHANNEL_OFF_CODE in channel_codes:
+        raise ValueError("CHANNEL_OFF_CODE 不能出现在 ACQUISITION_CHANNELS 中。")
+    if DEFAULT_CHANNEL_CODE not in channel_codes:
+        raise ValueError("DEFAULT_CHANNEL_CODE 必须是 ACQUISITION_CHANNELS 中的某个通道。")
 
 
 _validate_wavelength_channels()

@@ -180,8 +180,17 @@ class HostTcpSerialBridge:
         self,
         ok: bool,
         message: str | None = None,
+        *,
+        channel: int | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         body: dict[str, Any] = {"ok": ok}
+        if channel is not None:
+            body["channel"] = int(channel)
+        if extra:
+            for key, value in extra.items():
+                if value is not None:
+                    body[key] = value
         if message:
             body["message"] = message
         self._send_message("analysis_result", body)
@@ -205,6 +214,7 @@ class HostTcpSerialBridge:
         unit: str = "a.u.",
         thi: list[float] | None = None,
         delta_thi: list[float] | None = None,
+        channel: int | None = None,
     ) -> None:
         """为安卓端绘图发送一组在线 HbO/HbR/Cyt/rSO2 批次数据。"""
         times, hbo, hbr, cyt, rso2 = _align_live_series(times, hbo, hbr, cyt, rso2)
@@ -220,6 +230,8 @@ class HostTcpSerialBridge:
             "baseline_ready": baseline_ready,
             "replace_full_series": replace_full_series,
         }
+        if channel is not None:
+            body["channel"] = int(channel)
         if ok:
             payload: dict[str, Any] = {
                 "times": times,

@@ -34,6 +34,11 @@
   - `0x01`：`S1_D1`
   - `0x02`：`S1_D2`
 - **采样值**：payload `byte2:6`，4 字节大端无符号
+- **采集通道编码**（数据帧 payload byte6 = `ChannelId`，与接收源/波长正交）：
+  - `0x01`：通道1
+  - `0x02`：通道2
+  - `0x00`/缺省：归入通道1
+  - 每个采集通道内部各有完整的双接收源×五波长，反演链路在每个通道内各跑一套；回传安卓时用 `channel` 字段区分
 - **反演**：分步广义 MBLL 先解 HbO/HbR，再从残差投影估 Cyt（oxCCO，UCL-NIR 差分消光系数）
 - **rSO₂**：基于 30–60s 基线段假设（基线 HbT≈80μM、rSO₂≈65%）把 ΔHbO/ΔHbR 转成血氧饱和度
 - **输出通道**：由 `config.OUTPUT_CHANNEL` 选择，可选 `S1_D1` / `S1_D2` / `S1_D1_ssr`，默认 `S1_D1_ssr`（短距回归校正后的长距通道）
@@ -73,19 +78,21 @@ python fNIRS_processing.py --tcp_debug
 
 ## 输出文件
 
-每次采集在 `software/result_table/<时间戳>/` 下生成一组文件：
+每次采集在 `software/result_table/<时间戳>/` 下生成一组文件。**采集通道相关的文件按通道各写一份**（后缀 `_ch1` / `_ch2`），原始数据合写一份并带 `ChannelId` 列：
 
 - `all_groups.csv`
-  - 原始双接收源采集数据
-  - 列：`Time (s), DetectorId, Channel, Wavelength, Value`
-- `interleaved_output.csv`
-  - 2 接收源 × 5 波长配对后的光强宽表
+  - 原始采集数据（所有通道合写一份）
+  - 列：`Time (s), ChannelId, DetectorId, Channel, Wavelength, Value`
+- `interleaved_output_ch{n}.csv`
+  - 该通道 2 接收源 × 5 波长配对后的光强宽表
   - 列：`Time (s), S1_D1_850, S1_D1_810, ..., S1_D2_700`
-- `processed_output.csv`
-  - 广义 MBLL + SSR 输出（列前缀取自 `OUTPUT_CHANNEL`）
+- `processed_output_ch{n}.csv`
+  - 该通道广义 MBLL + SSR 输出（列前缀取自 `OUTPUT_CHANNEL`）
   - 列风格：`Time, S1_D1_ssr_hbo, S1_D1_ssr_hbr, S1_D1_ssr_cyt`
-- `android_live_output.csv`
-  - 在线分析过程中实际回传安卓的曲线副本
+- `android_live_output_ch{n}.csv`
+  - 该通道在线分析过程中实际回传安卓的曲线副本
+
+> 只出现一个通道时就只生成该通道那一套文件（例如仅通道1 时只有 `*_ch1.csv`）。
 
 ## 主要文件
 

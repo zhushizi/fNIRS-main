@@ -5,9 +5,8 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING, Any
 
-from .batch_builder import IncrementalBatchBuilder
 from .buffer import OnlineSampleBuffer
-from .causal_processor import IncrementalCausalProcessor
+from .channel_dispatcher import ChannelDispatcher
 from .config import OnlineSettings
 from .reporter import AndroidReporter
 
@@ -16,22 +15,23 @@ if TYPE_CHECKING:
 
 
 class OnlineAnalysisWorker:
-    """定时从缓冲取窗口 → 构建批次 → 回传安卓。"""
+    """定时从缓冲取全会话 → 按通道构建批次 → 分别回传安卓。"""
 
     def __init__(
         self,
         buffer: OnlineSampleBuffer,
         bridge: HostTcpSerialBridge,
-        batch_builder: IncrementalBatchBuilder | IncrementalCausalProcessor,
+        dispatcher: ChannelDispatcher,
         settings: OnlineSettings | None = None,
         reporter: AndroidReporter | None = None,
     ) -> None:
         self.buffer = buffer
         self.settings = settings or OnlineSettings()
-        self.batch_builder = batch_builder
+        self.dispatcher = dispatcher
         self.reporter = reporter or AndroidReporter(bridge, self.settings)
         self.stop_event = threading.Event()
         self._baseline_lock = threading.Lock()
+        self._last_sent_channels: set[int] = set()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -51,7 +51,7 @@ class OnlineAnalysisWorker:
     def _run(self) -> None:
         print(
             "Online analysis enabled: "
-            "full-session interleaved, full-series replace, "
+            "per-channel full-session interleaved, "
             f"interval={self.settings.update_interval_seconds:.1f}s."
         )
         while not self.stop_event.wait(self.settings.update_interval_seconds):
@@ -61,15 +61,24 @@ class OnlineAnalysisWorker:
                 self._analyze_and_send_once()
             except Exception as exc:
                 print(f"Online analysis skipped one batch: {exc}")
+
     def _analyze_and_send_once(self, *, force_recompute: bool = False) -> None:
         raw_df = self.buffer.snapshot_all()
-        batch = self.batch_builder.try_build(raw_df, force_recompute=force_recompute)
-        if batch is None:
-            return
-        self.reporter.send_live_batch(batch)
+        batches = self.dispatcher.build_all(raw_df, force_recompute=force_recompute)
+        sent: set[int] = set()
+        for channel_code, batch in batches:
+            try:
+                self.reporter.send_live_batch(channel_code, batch)
+                sent.add(channel_code)
+            except Exception as exc:
+                # 单个通道回传失败不影响其它通道。
+                print(f"[online][channel {channel_code}] send failed: {exc}")
+        if sent != self._last_sent_channels:
+            print(f"[online] live batch channels now sending -> {sorted(sent)}")
+            self._last_sent_channels = sent
 
     def handle_set_baseline(self, body: dict[str, Any]) -> dict[str, Any]:
-        """安卓 set_baseline：更新 BL 并重算当前全会话后回传 live_analysis_batch。"""
+        """安卓 set_baseline：更新 BL 并对每个通道全会话重算后分别回传 live_analysis_batch。"""
         rso2_raw = body.get("baseline_rso2_pct")
         if rso2_raw is None:
             return {"ok": False, "message": "baseline_rso2_pct is required"}
@@ -98,22 +107,25 @@ class OnlineAnalysisWorker:
                 }
 
         with self._baseline_lock:
-            bl_pct, bl_hbt = self.batch_builder.update_baseline(rso2_pct, hbt_uM)
+            bl_pct, bl_hbt = self.dispatcher.update_baseline(rso2_pct, hbt_uM)
             raw_df = self.buffer.snapshot_all()
-            batch = self.batch_builder.apply_baseline_and_rebuild(raw_df)
+            results = self.dispatcher.apply_baseline_and_rebuild_all(raw_df)
 
-        if batch is not None:
-            self.reporter.send_live_batch(batch)
+        for channel_code, batch in results:
+            self.reporter.send_live_batch(channel_code, batch)
 
+        recomputed = len(results) > 0
+        baseline_ready = any(batch.baseline_ready for _, batch in results)
+        total_samples = sum(len(batch.times) for _, batch in results)
         result: dict[str, Any] = {
             "ok": True,
             "baseline_rso2_pct": bl_pct,
             "baseline_hbt_uM": bl_hbt,
-            "recomputed": batch is not None,
-            "baseline_ready": batch.baseline_ready if batch is not None else False,
-            "sample_count": len(batch.times) if batch is not None else 0,
+            "recomputed": recomputed,
+            "baseline_ready": baseline_ready,
+            "sample_count": total_samples,
+            "channels": [int(code) for code, _ in results],
         }
-        if batch is None:
+        if not recomputed:
             result["message"] = "insufficient samples for recompute"
         return result
-

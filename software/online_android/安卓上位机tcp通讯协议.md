@@ -216,12 +216,16 @@ PC 收到 `bye` 后立即回复，表示已经结束采集循环并即将开始�
 | `ok` | bool | 是 | 是否接受并重算 |
 | `baseline_rso2_pct` | number | 成功时是 | 已生效的 BL（%） |
 | `baseline_hbt_uM` | number | 成功时是 | 已生效的基线 HbT（µM） |
-| `recomputed` | bool | 否 | 是否已产出新曲线并发送 `live_analysis_batch` |
-| `baseline_ready` | bool | 否 | 重算后是否已有 rSO2 |
-| `sample_count` | int | 否 | 重算批次的点数 |
+| `recomputed` | bool | 否 | 是否已产出新曲线并发送 `live_analysis_batch`（任一通道产出即为 true） |
+| `baseline_ready` | bool | 否 | 重算后是否已有 rSO2（任一通道就绪即为 true） |
+| `sample_count` | int | 否 | 重算批次的点数（各通道之和） |
+| `channels` | int[] | 否 | 本次重算并回填的采集通道列表，如 `[1, 2]`；单通道时如 `[1]` |
 | `message` | string | 否 | 失败原因 |
 
-成功示例：
+> BL 假设对**所有采集通道统一生效**。PC 在回 `set_baseline_ack` 后，会对每个通道**各发一条**
+> `live_analysis_batch`（`replace_full_series=true`，带各自 `channel`）整段回填。
+
+成功示例（两个通道都在采）：
 
 ```json
 {
@@ -236,7 +240,8 @@ PC 收到 `bye` 后立即回复，表示已经结束采集循环并即将开始�
     "baseline_hbt_uM": 80.0,
     "recomputed": true,
     "baseline_ready": true,
-    "sample_count": 120
+    "sample_count": 240,
+    "channels": [1, 2]
   }
 }
 ```
@@ -261,7 +266,7 @@ PC 收到 `bye` 后立即回复，表示已经结束采集循环并即将开始�
 }
 ```
 
-> **安卓侧注意**：`set_baseline_ack` 之后紧接一条 `live_analysis_batch`（`replace_full_series=true`）时，应**清空旧曲线再绘制**，不要与历史批次拼接。
+> **安卓侧注意**：`set_baseline_ack` 之后每个通道紧接一条 `live_analysis_batch`（`replace_full_series=true`）时，应**按 `channel` 分别清空旧曲线再绘制**，不要与历史批次拼接、也不要跨通道混用。
 
 ### 5.6 `live_analysis_batch`（PC -> 安卓）
 
@@ -270,6 +275,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 | `body` 字段 | 类型 | 必填 | 说明 |
 |-------------|------|------|------|
 | `ok` | bool | 是 | 是否成功生成本批在线结果 |
+| `channel` | int | 否 | 采集通道（硬件通道）：`1`=通道1，`2`=通道2。多通道时每个通道各发一条 `live_analysis_batch`，安卓应按 `channel` 分别维护曲线；单通道采集时只出现该通道 |
 | `replace_full_series` | bool | 否 | 默认 `false`。为 `true` 时用本批全部序列（`times/hbo/hbr/cyt/delta_thb/thi/delta_thi/rso2`，以实际携带者为准）**整段覆盖**曲线，而非追加 |
 | `times` | number[] | 成功时是 | 曲线点时间，单位秒，相对本次采集开始 |
 | `hbo` | number[] | 成功时是 | 与 `times` 对齐的 HbO 序列（浓度变化量，单位见 `unit`） |
@@ -314,6 +320,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
   "ts_ms": 1717234569000,
   "body": {
     "ok": true,
+    "channel": 1,
     "times": [60.125, 61.126, 62.127],
     "hbo": [0.0000012, 0.0000014, 0.0000015],
     "hbr": [-0.0000004, -0.0000005, -0.0000006],
@@ -334,6 +341,9 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 }
 ```
 
+> 两个通道都在采时，PC 会**分别发两条** `live_analysis_batch`：一条 `"channel": 1`、一条 `"channel": 2`；
+> 安卓按 `channel` 各自维护曲线。只点亮一个通道时，只会收到该通道那一条。
+
 基线建立前的示例（有 `delta_thb`，但无 `thi/delta_thi/rso2`）：
 
 ```json
@@ -343,6 +353,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
   "seq": 2,
   "body": {
     "ok": true,
+    "channel": 1,
     "times": [30.125, 31.126],
     "hbo": [0.0000010, 0.0000011],
     "hbr": [-0.0000003, -0.0000004],
@@ -359,6 +370,7 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 
 说明：
 
+- **`channel`（采集通道）**：`1`=通道1，`2`=通道2，来自 26B 数据帧 payload[6]。多通道时每个通道各发一条本消息，安卓须按 `channel` 分别维护/绘制曲线；`replace_full_series`、`baseline_ready`、`rso2` 等语义都是**针对该 `channel` 独立**判断的。缺省（旧固件未带通道位）时统一为 `1`。
 - PC 端有两种在线分析模式（`config.ONLINE_MODE`），对安卓透明，只影响发批节奏与 `replace_full_series` 语义：
   - `causal_incremental`（默认）：因果 IIR + 增量。热身期（默认前 60 s）用 `replace_full_series=true` 发临时曲线（`baseline_ready=false`）；基线冻结后先整段回填一次（`replace_full_series=true`），随后**只追加新点**（`replace_full_series=false`）。历史点量纲固定、不再改写。
   - `full_replace`（旧逻辑）：每次对全会话重算并整段重发（恒 `replace_full_series=true`），历史曲线每批被改写。
@@ -370,9 +382,19 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 
 ### 5.7 `analysis_result`（PC -> 安卓）
 
-PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值；采集时长覆盖 rSO2 基线窗（默认 30~60 s）时还附带 rSO2 摘要。
+PC 完成本次后处理后发送测试结果，包含 HbO/HbR 平均值；采集时长覆盖 rSO2 基线窗（默认 30~60 s）时还附带 rSO2 摘要。**每个采集通道各发一条**，用 `channel` 字段区分。
 
-成功示例：
+| `body` 字段 | 类型 | 必填 | 说明 |
+|-------------|------|------|------|
+| `ok` | bool | 是 | 该通道后处理是否成功 |
+| `channel` | int | 否 | 采集通道：`1`=通道1，`2`=通道2。单通道采集时只出现该通道那一条 |
+| `output_channel` | string | 否 | 反演输出通道（接收源级），默认 `S1_D1_ssr` |
+| `mean_hbo` / `mean_hbr` / `mean_cyt` | number | 否 | 该通道浓度均值 |
+| `mean_rso2_pct` / `latest_rso2_pct` / `baseline_rso2_pct` | number | 否 | rSO2 摘要（基线窗有样本时） |
+| `sample_count` | int | 否 | 有效点数 |
+| `message` | string | 否 | 失败原因 |
+
+成功示例（通道1）：
 
 ```json
 {
@@ -382,19 +404,19 @@ PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值�
   "ts_ms": 1717234572000,
   "body": {
     "ok": true,
+    "channel": 1,
+    "output_channel": "S1_D1_ssr",
     "mean_hbo": 0.0000123,
     "mean_hbr": -0.0000045,
     "mean_rso2_pct": 67.5,
     "latest_rso2_pct": 68.2,
     "baseline_rso2_pct": 65.0,
-    "sample_count": 128,
-    "unit": "a.u.",
-    "rso2_unit": "%"
+    "sample_count": 128
   }
 }
 ```
 
-失败示例：
+失败示例（某通道无完整配对；单通道采集失败时 `channel` 也随该通道下发）：
 
 ```json
 {
@@ -403,7 +425,8 @@ PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值�
   "seq": 3,
   "body": {
     "ok": false,
-    "message": "No complete wavelength cycles were formed."
+    "channel": 2,
+    "message": "channel 2: no complete wavelength cycles were formed."
   }
 }
 ```
@@ -451,8 +474,14 @@ PC 完成本次后处理后发送一条测试结果，包含 HbO/HbR 平均值�
 | 数据 payload[0] | 波长码：`0x00` OFF，`0x01` 850，`0x02` 810，`0x03` 770，`0x04` 730，`0x05` 700 nm |
 | 数据 payload[1] | 接收源码：`0x01` S1_D1（长距 3.0cm），`0x02` S1_D2（短距 1.0cm） |
 | 数据 payload[2:6] | 采集值：4 字节大端无符号 |
+| 数据 payload[6] | 采集通道码：`0x01` 通道1，`0x02` 通道2（`0x00`/缺省归入通道1）。与接收源、波长正交，每个通道内部各有完整的双接收源×五波长 |
 
 启流/停流命令帧由安卓本地生成并写入 UART，PC 不通过 TCP 下发。
+
+> **采集通道（通道1/通道2）** 是新增的正交维度，PC 按 payload[6] 把数据流拆成多个通道，
+> 每个通道各跑一整套反演，并在回传的 `live_analysis_batch` / `analysis_result` 里用 `channel`
+> 字段区分。若某次采集只出现通道1，则只回传 `channel=1` 的结果；只出现通道2 则只回 `channel=2`；
+> 两个都出现则分别发送各自的消息。
 
 ---
 
@@ -492,7 +521,8 @@ sequenceDiagram
 - [ ] 连接后发送 `hello`
 - [ ] 收到 `hello_ack.ok=true` 后允许 UI 启流
 - [ ] 串口 `read()` 到的原始字节用 `serial_data.payload_b64` 上报
-- [ ] 采集过程中接收 `live_analysis_batch` 并按 `replace_full_series` 整段替换或追加曲线
+- [ ] 采集过程中接收 `live_analysis_batch` 并按 `channel` 分通道、再按 `replace_full_series` 整段替换或追加曲线
+- [ ] 按 `channel`（1/2）分别维护/展示通道1、通道2 的曲线（单通道采集时只有一路）
 - [ ] 需要重设 BL 时发送 `set_baseline`；收到 `set_baseline_ack.ok=true` 后等待 `live_analysis_batch` 整段替换
 - [ ] 解析 `delta_thb`（若存在）并绘制 ΔtHb 曲线
 - [ ] `baseline_ready=true` 后解析 `rso2` / `latest_rso2_pct` 并显示 rSO2
@@ -526,3 +556,4 @@ PC：
 | 2026-06-30 | `live_analysis_batch` 增加 `cyt` 字段（与 HbO/HbR 对齐的三色团在线曲线） |
 | 2026-07-02 | `live_analysis_batch` 增加 `delta_thb`（ΔtHb）/ `thi`（tHi）/ `delta_thi`（ΔtHi）字段；`unit` 改由 `LIVE_CONC_UNIT` 决定（默认 `"M"`）；补充双在线模式（`causal_incremental` / `full_replace`）说明；更新第二层 26B 协议为双接收源五波长 |
 | 2026-07-03 | 增加 `set_baseline` / `set_baseline_ack`：安卓可动态重设 BL，PC 全会话重算并整段回填 |
+| 2026-07-11 | 26B 数据帧 payload[6] 新增采集通道位（通道1=0x01/通道2=0x02）；`live_analysis_batch` 与 `analysis_result` 新增 `channel` 字段，PC 按通道拆分处理并分别回传；单通道采集只回传对应通道 |

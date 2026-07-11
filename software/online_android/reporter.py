@@ -12,27 +12,49 @@ from .tcp_bridge import HostTcpSerialBridge
 from .types import AnalysisResult, LiveAnalysisBatch
 
 
+# analysis_result 里除 ok/message/channel 外要转发给安卓的摘要字段。
+_ANALYSIS_RESULT_FORWARD_KEYS = (
+    "output_channel",
+    "mean_hbo",
+    "mean_hbr",
+    "mean_cyt",
+    "mean_rso2_pct",
+    "latest_rso2_pct",
+    "baseline_rso2_pct",
+    "sample_count",
+)
+
+
 class AndroidReporter:
-    """封装 live_analysis_batch 与 analysis_result 的发送。"""
+    """封装 live_analysis_batch 与 analysis_result 的发送（按采集通道区分）。"""
 
     def __init__(
         self,
         bridge: HostTcpSerialBridge,
         settings: OnlineSettings | None = None,
         plotter: LiveAndroidBatchPlotter | None = None,
-        recorder: AndroidLiveOutputRecorder | None = None,
+        recorders: dict[int, AndroidLiveOutputRecorder] | None = None,
     ) -> None:
         self.bridge = bridge
         self.settings = settings or OnlineSettings()
         self.plotter = plotter
-        self.recorder = recorder
+        # {通道码: 录制器}，每个采集通道各自落盘 android_live_output_ch{n}.csv。
+        # 用 is-not-None 而非 `or`：调用方传入的空 dict 需保持同一对象引用，
+        # 以便 session 端 on_new_channel 往里加录制器后这里也能看到。
+        self.recorders: dict[int, AndroidLiveOutputRecorder] = (
+            recorders if recorders is not None else {}
+        )
 
-    def send_live_batch(self, batch: LiveAnalysisBatch) -> None:
-        if self.recorder is not None:
-            self.recorder.append_batch(batch)
+    def send_live_batch(self, channel_code: int, batch: LiveAnalysisBatch) -> None:
+        recorder = self.recorders.get(channel_code)
+        if recorder is not None:
+            try:
+                recorder.append_batch(batch)
+            except Exception as exc:
+                print(f"Live recorder append skipped (channel {channel_code}): {exc}")
         if self.plotter is not None:
             try:
-                self.plotter.update(batch)
+                self.plotter.update(channel_code, batch)
             except Exception as exc:
                 print(f"Live plot update skipped: {exc}")
         try:
@@ -52,6 +74,7 @@ class AndroidReporter:
                 unit=batch.unit,
                 thi=batch.thi,
                 delta_thi=batch.delta_thi,
+                channel=channel_code,
             )
         except Exception as exc:
             print(f"Failed to send live_analysis_batch to Android: {exc}")
@@ -59,10 +82,14 @@ class AndroidReporter:
     def send_final_result(self, result: AnalysisResult) -> None:
         if self.bridge is None:
             return
+        channel = result.get("channel")
+        extra = {key: result.get(key) for key in _ANALYSIS_RESULT_FORWARD_KEYS if key in result}
         try:
             self.bridge.send_analysis_result(
                 ok=bool(result.get("ok")),
                 message=str(result["message"]) if result.get("message") is not None else None,
+                channel=int(channel) if channel is not None else None,
+                extra=extra or None,
             )
         except Exception as exc:
             print(f"Failed to send analysis_result to Android: {exc}")

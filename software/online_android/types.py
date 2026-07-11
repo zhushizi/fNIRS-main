@@ -37,6 +37,8 @@ class LiveAnalysisBatch:
     baseline_rso2_pct: float | None = None
     replace_full_series: bool = False
     unit: str = "a.u."
+    # 采集通道（硬件通道）：通道1=1，通道2=2。回传安卓时作为 channel 字段区分不同通道曲线。
+    channel: int = 0x01
     # 固定基线伪绝对总血红蛋白（与 hbo/hbr 同单位、同缩放）。
     # thi = HbO_abs + HbR_abs（绝对量，≈ 基线 HbT）；delta_thi = thi − 基线 HbT（≈0 起算）。
     # 仅在基线冻结（baseline_ready=True）后才有值，热身期为 None。
