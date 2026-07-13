@@ -25,7 +25,10 @@ from .baseline_state import MutableBaseline
 from .batch_builder import IncrementalBatchBuilder
 from .causal_processor import IncrementalCausalProcessor
 from .config import OnlineSettings
+from .logging_utils import get_logger
 from .types import LiveAnalysisBatch
+
+log = get_logger("dispatcher")
 
 PrepareInterleavedFn = Callable[[pd.DataFrame, bool], pd.DataFrame]
 CalculateSeriesFn = Callable[
@@ -84,8 +87,9 @@ class ChannelDispatcher:
                     batch = self._get_processor(code).try_build(
                         sub, force_recompute=force_recompute
                     )
-                except Exception as exc:
-                    print(f"[online][channel {code}] build failed, skipped this tick: {exc}")
+                except Exception:
+                    # 带堆栈落盘，方便定位某通道的根因；不影响其它通道。
+                    log.exception("[channel %s] build failed, skipped this tick", code)
                     continue
                 if batch is not None:
                     out.append((code, replace(batch, channel=code)))
@@ -112,8 +116,8 @@ class ChannelDispatcher:
                     continue
                 try:
                     batch = self._get_processor(code).apply_baseline_and_rebuild(sub)
-                except Exception as exc:
-                    print(f"[online][channel {code}] baseline rebuild failed, skipped: {exc}")
+                except Exception:
+                    log.exception("[channel %s] baseline rebuild failed, skipped", code)
                     continue
                 if batch is not None:
                     out.append((code, replace(batch, channel=code)))

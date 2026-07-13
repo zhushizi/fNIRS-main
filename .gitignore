@@ -79,3 +79,6 @@ exports/*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+
+# Decoder runtime logs (online_android.logging_utils)
+software/online_android/logs/

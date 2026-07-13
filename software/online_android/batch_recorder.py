@@ -12,7 +12,10 @@ import pandas as pd
 
 from config import OUTPUT_CHANNEL, processed_column_names
 
+from .logging_utils import get_logger
 from .types import LiveAnalysisBatch, compute_delta_thb
+
+log = get_logger("recorder")
 
 PrepareInterleavedFn = Callable[[pd.DataFrame, bool], pd.DataFrame]
 CalculateSeriesFn = Callable[
@@ -150,8 +153,10 @@ class AndroidLiveOutputRecorder:
                 )
 
         path_str = str(self.output_path)
-        print(
-            f"Android live output ({OUTPUT_CHANNEL}) saved to '{path_str}' "
-            f"({len(self._times)} samples, exactly as streamed to Android)."
+        log.info(
+            "Android live output (%s) saved to '%s' (%d samples, exactly as streamed to Android).",
+            OUTPUT_CHANNEL,
+            path_str,
+            len(self._times),
         )
         return path_str

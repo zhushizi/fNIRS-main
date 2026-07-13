@@ -16,7 +16,7 @@ from config import (
     channel_name_for_code,
     with_channel_suffix,
 )
-from online_android import HostTcpSerialBridge
+from online_android import HostTcpSerialBridge, configure_logging
 
 from .capture import capture_data, send_analysis_result_to_android
 from .mbll import process_csv_dataset
@@ -82,6 +82,7 @@ def run_pipeline(
     live_plot: bool = False,
 ) -> None:
     """一键跑完整链路：安卓 TCP 采集 -> 按通道拆分 -> 预处理 -> 配对 -> 广义 MBLL/SSR -> CSV。"""
+    configure_logging()  # PC 入口：控制台 + 默认 online_android/logs/ 文件
     os.makedirs(RESULT_TABLE_DIR, exist_ok=True)
     run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = os.path.join(RESULT_TABLE_DIR, run_id)

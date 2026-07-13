@@ -2,6 +2,7 @@
 
 from .causal_processor import IncrementalCausalProcessor
 from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
+from .logging_utils import configure_logging, get_logger, log_file_path
 from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
 from .reporter import AndroidReporter, enrich_result_with_rso2
 from .rso2 import (
@@ -35,6 +36,9 @@ __all__ = [
     "OnlineSettings",
     "compute_rso2_series",
     "compute_thi_series",
+    "configure_logging",
     "create_online_session",
     "enrich_result_with_rso2",
+    "get_logger",
+    "log_file_path",
 ]

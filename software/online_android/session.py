@@ -16,11 +16,14 @@ from .buffer import OnlineSampleBuffer
 from .channel_dispatcher import ChannelDispatcher
 from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
 from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
+from .logging_utils import get_logger
 from .reporter import AndroidReporter
 from .worker import OnlineAnalysisWorker
 
 if TYPE_CHECKING:
     from .tcp_bridge import HostTcpSerialBridge
+
+log = get_logger("session")
 
 PrepareInterleavedFn = Callable[[pd.DataFrame, bool], pd.DataFrame]
 CalculateSeriesFn = Callable[[pd.DataFrame], object]
@@ -85,10 +88,10 @@ def create_online_session(
             hbo_hbr_window_s=live_plot_hbo_hbr_window_s,
             rso2_window_s=live_plot_rso2_window_s,
         )
-        print(
-            "Live plot enabled: "
-            f"HbO/HbR window={live_plot_hbo_hbr_window_s:.0f}s, "
-            f"rSO2 window={live_plot_rso2_window_s:.0f}s (per acquisition channel)."
+        log.info(
+            "Live plot enabled: HbO/HbR window=%.0fs, rSO2 window=%.0fs (per acquisition channel).",
+            live_plot_hbo_hbr_window_s,
+            live_plot_rso2_window_s,
         )
 
     recorders: dict[int, AndroidLiveOutputRecorder] = {}
@@ -101,7 +104,7 @@ def create_online_session(
             recorders[code] = AndroidLiveOutputRecorder(
                 with_channel_suffix(android_live_output_path, code)
             )
-        print(f"Acquisition channel {int(code)} detected; online analysis started for it.")
+        log.info("Acquisition channel %s detected; online analysis started for it.", int(code))
 
     dispatcher = ChannelDispatcher(
         settings,
@@ -111,9 +114,9 @@ def create_online_session(
         on_new_channel=on_new_channel,
     )
     if settings.online_mode == "causal_incremental":
-        print("Online mode: causal_incremental (causal IIR + append-only), per channel.")
+        log.info("Online mode: causal_incremental (causal IIR + append-only), per channel.")
     else:
-        print("Online mode: full_replace (non-causal, full-series replace), per channel.")
+        log.info("Online mode: full_replace (non-causal, full-series replace), per channel.")
 
     worker = OnlineAnalysisWorker(
         buffer,

@@ -24,7 +24,10 @@ from config import (
     TIMEOUT,
 )
 
+from .logging_utils import get_logger
 from .types import compute_delta_thb
+
+log = get_logger("tcp_bridge")
 
 
 def _json_safe_float(value: float) -> float:
@@ -88,14 +91,14 @@ class HostTcpSerialBridge:
         self._server_sock.listen(1)
         self._server_sock.settimeout(0.5)
 
-        print(f"Waiting for Android TCP client on {self.host}:{self.port} ...")
+        log.info("Waiting for Android TCP client on %s:%s ...", self.host, self.port)
         try:
             self._client_sock, client_addr = self._accept_client()
         except KeyboardInterrupt:
             self._server_sock.close()
             raise
         self._client_sock.settimeout(None)
-        print(f"Android TCP client connected from {client_addr[0]}:{client_addr[1]}")
+        log.info("Android TCP client connected from %s:%s", client_addr[0], client_addr[1])
 
         self._rx_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._rx_thread.start()
@@ -296,9 +299,11 @@ class HostTcpSerialBridge:
         with self._send_lock:
             self._client_sock.sendall(packet)
         if self.debug:
-            print(
-                f"[TCP->Android] type={msg_type} seq={message['seq']} "
-                f"byte_len={body.get('byte_len', '-')}"
+            log.info(
+                "[TCP->Android] type=%s seq=%s byte_len=%s",
+                msg_type,
+                message["seq"],
+                body.get("byte_len", "-"),
             )
 
     def _send_error(self, code: str, message: str, ref_seq: int | None = None) -> None:
@@ -317,7 +322,7 @@ class HostTcpSerialBridge:
                 self._handle_message(message)
         except (OSError, HostTcpProtocolError) as exc:
             if not self._closed:
-                print(f"Android TCP connection closed: {exc}")
+                log.warning("Android TCP connection closed: %s", exc)
         finally:
             self._mark_closed()
 
@@ -353,7 +358,7 @@ class HostTcpSerialBridge:
             payload_len = "-"
             if isinstance(body, dict):
                 payload_len = body.get("byte_len", "-")
-            print(f"[Android->TCP] type={msg_type} seq={seq} byte_len={payload_len}")
+            log.info("[Android->TCP] type=%s seq=%s byte_len=%s", msg_type, seq, payload_len)
 
         if message.get("ver") != HOST_TCP_PROTOCOL_VERSION:
             self._send_error("VERSION_MISMATCH", "Unsupported protocol version.", seq)
@@ -371,13 +376,13 @@ class HostTcpSerialBridge:
         elif msg_type == "set_baseline":
             self._handle_set_baseline(body, seq)
         elif msg_type == "bye":
-            print(f"Android TCP client sent bye: {body.get('reason', '')}")
+            log.info("Android TCP client sent bye: %s", body.get("reason", ""))
             self._send_message("bye_ack", {"ref_seq": seq, "ok": True})
             with self._buffer_cond:
                 self._capture_finished = True
                 self._buffer_cond.notify_all()
         elif msg_type == "error":
-            print(f"Android TCP error: {body}")
+            log.warning("Android TCP error: %s", body)
         else:
             self._send_error("UNSUPPORTED_TYPE", f"Unsupported message type: {msg_type}", seq)
 
@@ -391,7 +396,7 @@ class HostTcpSerialBridge:
         try:
             result = self._set_baseline_handler(body)
         except Exception as exc:
-            print(f"set_baseline failed: {exc}")
+            log.exception("set_baseline failed: %s", exc)
             self.send_set_baseline_ack(
                 {"ok": False, "message": str(exc)},
                 ref_seq=seq,

@@ -7,9 +7,12 @@ import numpy as np
 from .batch_recorder import AndroidLiveOutputRecorder
 from .config import OnlineSettings
 from .live_plotter import LiveAndroidBatchPlotter
+from .logging_utils import get_logger
 from .rso2 import compute_rso2_series
 from .tcp_bridge import HostTcpSerialBridge
 from .types import AnalysisResult, LiveAnalysisBatch
+
+log = get_logger("reporter")
 
 
 # analysis_result 里除 ok/message/channel 外要转发给安卓的摘要字段。
@@ -51,12 +54,12 @@ class AndroidReporter:
             try:
                 recorder.append_batch(batch)
             except Exception as exc:
-                print(f"Live recorder append skipped (channel {channel_code}): {exc}")
+                log.warning("Live recorder append skipped (channel %s): %s", channel_code, exc)
         if self.plotter is not None:
             try:
                 self.plotter.update(channel_code, batch)
             except Exception as exc:
-                print(f"Live plot update skipped: {exc}")
+                log.warning("Live plot update skipped (channel %s): %s", channel_code, exc)
         try:
             self.bridge.send_live_analysis_batch(
                 times=batch.times,
@@ -77,7 +80,7 @@ class AndroidReporter:
                 channel=channel_code,
             )
         except Exception as exc:
-            print(f"Failed to send live_analysis_batch to Android: {exc}")
+            log.warning("Failed to send live_analysis_batch to Android (channel %s): %s", channel_code, exc)
 
     def send_final_result(self, result: AnalysisResult) -> None:
         if self.bridge is None:
@@ -92,7 +95,7 @@ class AndroidReporter:
                 extra=extra or None,
             )
         except Exception as exc:
-            print(f"Failed to send analysis_result to Android: {exc}")
+            log.warning("Failed to send analysis_result to Android: %s", exc)
 
 
 def enrich_result_with_rso2(
