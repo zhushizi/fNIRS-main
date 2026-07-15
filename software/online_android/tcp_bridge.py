@@ -20,6 +20,7 @@ from config import (
     HOST_TCP_MAX_BODY_BYTES,
     HOST_TCP_PROTOCOL_VERSION,
     LIVE_SEND_DELTA_THB,
+    LIVE_SEND_SKIN_CONTACT,
     LIVE_SEND_THI,
     TIMEOUT,
 )
@@ -218,6 +219,8 @@ class HostTcpSerialBridge:
         thi: list[float] | None = None,
         delta_thi: list[float] | None = None,
         channel: int | None = None,
+        skin_contact: bool | None = None,
+        skin_contact_detail: dict[str, Any] | None = None,
     ) -> None:
         """为安卓端绘图发送一组在线 HbO/HbR/Cyt/rSO2 批次数据。"""
         times, hbo, hbr, cyt, rso2 = _align_live_series(times, hbo, hbr, cyt, rso2)
@@ -235,6 +238,11 @@ class HostTcpSerialBridge:
         }
         if channel is not None:
             body["channel"] = int(channel)
+        # 贴肤状态：与浓度曲线是否就绪无关，始终随批次带上（null=未知）。
+        if LIVE_SEND_SKIN_CONTACT:
+            body["skin_contact"] = skin_contact
+            if skin_contact_detail is not None:
+                body["skin_contact_detail"] = skin_contact_detail
         if ok:
             payload: dict[str, Any] = {
                 "times": times,

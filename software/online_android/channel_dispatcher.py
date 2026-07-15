@@ -26,6 +26,7 @@ from .batch_builder import IncrementalBatchBuilder
 from .causal_processor import IncrementalCausalProcessor
 from .config import OnlineSettings
 from .logging_utils import get_logger
+from .skin_contact import SkinContactDebouncer, SkinContactSettings, evaluate_skin_contact
 from .types import LiveAnalysisBatch
 
 log = get_logger("dispatcher")
@@ -60,6 +61,9 @@ class ChannelDispatcher:
         self._baseline = baseline
         self._on_new_channel = on_new_channel
         self._processors: dict[int, Processor] = {}
+        # 每个采集通道各持一个贴肤防抖器，状态互不影响。
+        self._skin_settings = SkinContactSettings.from_config()
+        self._skin: dict[int, SkinContactDebouncer] = {}
         # 采集(worker)线程周期性 build_all 与 rx 线程的 set_baseline 会并发访问处理器，
         # 统一用一把锁串行化，避免并发创建/改写处理器内部增量状态。
         self._lock = threading.Lock()
@@ -92,7 +96,7 @@ class ChannelDispatcher:
                     log.exception("[channel %s] build failed, skipped this tick", code)
                     continue
                 if batch is not None:
-                    out.append((code, replace(batch, channel=code)))
+                    out.append((code, self._attach_skin(code, sub, batch, advance=True)))
         return out
 
     def update_baseline(
@@ -120,7 +124,8 @@ class ChannelDispatcher:
                     log.exception("[channel %s] baseline rebuild failed, skipped", code)
                     continue
                 if batch is not None:
-                    out.append((code, replace(batch, channel=code)))
+                    # 整段回填是只读场景：附当前贴肤状态但不推进防抖。
+                    out.append((code, self._attach_skin(code, sub, batch, advance=False)))
         return out
 
     @property
@@ -156,6 +161,25 @@ class ChannelDispatcher:
             if self._on_new_channel is not None:
                 self._on_new_channel(code)
         return proc
+
+    def _attach_skin(
+        self,
+        code: int,
+        sub: pd.DataFrame,
+        batch: LiveAnalysisBatch,
+        *,
+        advance: bool,
+    ) -> LiveAnalysisBatch:
+        """给某通道的 batch 打上贴肤状态。advance=True 推进防抖，False 只读当前状态。"""
+        raw_state, detail, now_t = evaluate_skin_contact(sub, self._skin_settings)
+        deb = self._skin.get(code)
+        if deb is None:
+            deb = SkinContactDebouncer(self._skin_settings)
+            self._skin[code] = deb
+        committed = deb.update(raw_state, now_t) if advance else deb.peek()
+        return replace(
+            batch, channel=code, skin_contact=committed, skin_contact_detail=detail
+        )
 
     def _make_processor(self) -> Processor:
         if self._settings.online_mode == "causal_incremental":

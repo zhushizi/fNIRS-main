@@ -44,3 +44,7 @@ class LiveAnalysisBatch:
     # 仅在基线冻结（baseline_ready=True）后才有值，热身期为 None。
     thi: list[float] | None = None
     delta_thi: list[float] | None = None
+    # 贴肤/未贴实时状态（该采集通道）：True=贴肤，False=未贴，None=未知（样本不足）。
+    # 与 MBLL 无关，仅看原始光强近窗中位数 + 防抖，见 skin_contact.py。
+    skin_contact: bool | None = None
+    skin_contact_detail: dict[str, Any] | None = None

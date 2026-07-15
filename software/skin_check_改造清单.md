@@ -1,8 +1,14 @@
 # 皮肤检查（佩戴质量检测）改造清单
 
-> **文档版本**：2026-07-06 v2  
+> **文档版本**：2026-07-13 v3  
 > **适用仓库**：`fNIRS-main/software`  
 > **读者**：PC 开发、安卓开发、测试、产品  
+>
+> ⚠️ **v3 关键更新**：本文 v2 写于**双通道改造之前**（2026-07-11 才落地双采集通道 ch1/ch2）。
+> 现在原始数据、在线回传、离线落盘都已升级为**按采集通道各跑一套**。皮肤检查也**必须按采集通道
+> 逐通道评估**（每个采集通道内部仍是完整的 2 接收源 × 5 波长 = 10 路）。凡涉及原始格式、
+> `evaluate_skin_check` 接口、`skin_check_result` 协议、PC 编排的地方，v3 均已补上 `ChannelId` /
+> `channel` 维度，语义对齐 `live_analysis_batch`（每个采集通道各发一条、按 `channel` 区分）。
 
 ---
 
@@ -52,9 +58,16 @@
 
 | 功能 | 目的 | 时长 | 看几条曲线 | 当前是否已有 |
 |------|------|------|------------|--------------|
-| **皮肤检查** | 探头是否贴好、10 路光强是否正常 | 3～5 s | **10 路**（2 接收源 × 5 波长） | ❌ 无 |
+| **皮肤检查** | 探头是否贴好、每个采集通道 10 路光强是否正常 | 3～5 s | **每采集通道 10 路**（2 接收源 × 5 波长） | ❌ 无 |
 | **VOT** | 缺血-再灌注激发试验，算 OS/RS 斜率 | 数分钟 | **1 路** rSO₂（如 `S1_D1_ssr`） | ❌ 无 |
-| **正式采集** | 监护 / 实验 / 离线分析 | 用户定 | 在线 HbO/HbR/Cyt/rSO₂ | ✅ 已有 |
+| **正式采集** | 监护 / 实验 / 离线分析 | 用户定 | 在线 HbO/HbR/Cyt/rSO₂（按采集通道各一套） | ✅ 已有 |
+
+> **两个正交的"通道"概念，务必分清（双通道改造后尤其重要）：**
+>
+> - **接收源**（`DetectorChannel`）：`S1_D1`（长距 3.0 cm）/ `S1_D2`（短距 1.0 cm），用于 SSR。皮肤检查的"10 路"= 2 接收源 × 5 波长。
+> - **采集通道**（`AcquisitionChannel`，数据帧 payload byte6 = `ChannelId`）：硬件通道 `ch1`(0x01) / `ch2`(0x02)，与接收源/波长正交。**每个采集通道内部各含完整的 10 路**，反演与皮肤检查都在每个采集通道内各跑一套。
+>
+> 因此双通道同采时皮肤检查最多要评估 **2 采集通道 × 10 路 = 20 路**，`skin_check_result` 用 `channel` 字段区分 ch1/ch2（与 `live_analysis_batch` 完全一致）。
 
 ```text
 建议产品流程：
@@ -81,17 +94,18 @@
 | **第 2 层** | 3～5 秒内光强是否稳定（CV） | 贴紧了应较稳，松了会乱跳 |
 | **第 3 层** | 10 路是否都有数据 | 2 接收源 × 5 波长是否齐全 |
 
-汇总输出：
+汇总输出（**按采集通道各一份**，用 `channel` 字段区分 ch1/ch2）：
 
 - 每路通道：`pass` / `warn` / `fail` / `missing`  
 - 每个接收源：是否通过（**S1_D1 与 S1_D2 都必须过**）  
-- 总体：**SSI 1～5 格** + `ok: true/false`  
+- 每个采集通道：**SSI 1～5 格** + `ok: true/false`  
+- 会话级放行：**所有出现过的采集通道都 `ok=true` 才允许进入正式采集**（安卓聚合，见 [§6.6](#66-ssi-总分1-5-格)）  
 
 ### 3.2 分工：PC 算、安卓展示（推荐）
 
 ```text
 安卓：启流 3～5 s → 发 serial_data → 显示结果、引导调整
-PC：  收原始帧 → 算 10 路光强/CV → 回传 skin_check_result
+PC：  收原始帧 → 按 ChannelId 拆分 → 每采集通道各算 10 路光强/CV → 各回传一条 skin_check_result
 ```
 
 **不建议**安卓本地再实现一套光强判定（易与 PC 离线标准不一致）。  
@@ -114,21 +128,24 @@ SCI/SQI 可作为 **「深度检查 15～30 s」** 的可选二期功能，不�
 
 ```text
 online_android/
-├── skin_check.py            # 纯算法：evaluate_skin_check()
-├── skin_check_session.py    # 预检状态机：定时评估、发结果
+├── skin_check.py            # 纯算法：evaluate_skin_check()，输入单采集通道 sub_df
+├── skin_check_session.py    # 预检状态机：定时评估、按通道拆分、发结果
 ├── skin_check_reporter.py   # 可选：发 skin_check_result（或并入 reporter.py）
 ├── tcp_bridge.py            # 只加分发，不写算法
-├── buffer.py                  # 复用 OnlineSampleBuffer
+├── buffer.py                  # 复用 OnlineSampleBuffer（已带 ChannelId 列）
+├── channel_dispatcher.py      # 参考其"按 ChannelId 拆分、每通道各建处理器"的模式
 └── session.py / capture.py    # 编排：先预检 → 再正式采集
 ```
 
 | 要做 | 不要做 |
 |------|--------|
 | `online_android` 内 2～3 个新文件 | 单独 `skin_check_server.py` |
+| **按 `ChannelId` 拆分、每采集通道各评一套**（复用 `ChannelDispatcher` 思路） | 把 ch1/ch2 混成一池算"10 路" |
 | 预检阶段不启 `OnlineAnalysisWorker` | 预检跑 MBLL / 回传 `live_analysis_batch` |
 | 预检不写正式 `all_groups.csv` | 把逻辑全塞进 `tcp_bridge.py` |
 
-与现有分工对齐：`rso2.py`（算法）→ `worker.py`（调度）→ `reporter.py`（发送）。
+与现有分工对齐：`rso2.py`（算法）→ `worker.py`（调度）→ `reporter.py`（发送）；
+按通道拆分则对齐 `channel_dispatcher.py`（每个采集通道各维护一个处理器、逐通道隔离异常）。
 
 ---
 
@@ -170,22 +187,23 @@ online_android/
 
 ### 6.1 输入
 
-预检窗口内（默认最近 **5 s**）的原始采样，格式同 `all_groups.csv`：
+预检窗口内（默认最近 **5 s**）的原始采样，格式同 `all_groups.csv` / `OnlineSampleBuffer.snapshot_all()`
+（**双通道改造后为 6 列，`Time (s)` 后多了 `ChannelId`**）：
 
 ```text
-Time (s), DetectorId, Channel, Wavelength, Value
+Time (s), ChannelId, DetectorId, Channel, Wavelength, Value
 ```
 
-按 `(DetectorId, Wavelength)` 分为 **10 组**：
+**先按 `ChannelId` 拆成各采集通道（ch1/ch2）**，每个采集通道内部再按 `(DetectorId, Wavelength)` 分为 **10 组**：
 
 | 接收源 | 波长（nm） |
 |--------|------------|
 | S1_D1（长距 3.0 cm） | 850 / 810 / 770 / 730 / 700 |
 | S1_D2（短距 1.0 cm） | 850 / 810 / 770 / 730 / 700 |
 
-`Wavelength = 0x00`（OFF）**不参与**计算（与主链路一致）。
-
-列名示例：`S1_D1_850`、`S1_D2_700`（与 `config.intensity_column_for` 一致）。
+- `Wavelength = 0x00`（OFF）**不参与**计算（与主链路一致）。
+- `ChannelId` 归一化沿用 `config.normalize_channel_code`（未知/0x00 归入 `DEFAULT_CHANNEL_CODE`）；`snapshot_all()` 已写入归一化后的 `ChannelId`。
+- 列名示例：`S1_D1_850`、`S1_D2_700`（与 `config.intensity_column_for` 一致）。
 
 ---
 
@@ -256,6 +274,8 @@ CV = std(I) / mean(I)
 
 ### 6.6 SSI 总分（1～5 格）
 
+**SSI 与 `ok` 都是「每个采集通道各算一份」**（ch1 一份、ch2 一份），下表针对**单个采集通道内的 10 路**：
+
 | SSI | 建议条件 |
 |-----|----------|
 | **5** | 10/10 路 `pass`，CV 均 < 0.02，双接收源均过 |
@@ -264,13 +284,17 @@ CV = std(I) / mean(I)
 | **2** | 6～7 路 pass，或短距未全过 |
 | **1** | 多路 fail / missing |
 
-**总体 `ok: true` 建议：**
+**单采集通道 `ok: true` 建议：**
 
 ```text
 SSI >= 4（可配置 SKIN_CHECK_MIN_SSI_PASS）
 且 S1_D1 五波长全部 pass
 且 S1_D2 五波长全部 pass
 ```
+
+**会话级放行（安卓聚合）：** 双通道同采时，PC 对 ch1/ch2 **各发一条** `skin_check_result`（各带自己的 `ssi`/`ok`/`channel`）。
+安卓「开始正式采集」按钮应在**所有出现过的采集通道都 `ok=true`** 时才启用（只点亮一个通道时，只需该通道通过）。
+是否要求两通道都在、以及缺通道如何提示，由安卓按产品策略决定。
 
 ---
 
@@ -290,13 +314,25 @@ class SkinCheckSettings:
     min_ssi_pass: int = 4
 
 def evaluate_skin_check(
-    raw_df: pd.DataFrame,
+    channel_df: pd.DataFrame,          # 单个采集通道的 sub_df（已按 ChannelId 拆过）
     settings: SkinCheckSettings | None = None,
 ) -> dict[str, Any]:
-    """返回 skin_check_result 的 body，可直接 JSON 序列化。"""
+    """对**单个采集通道**评估 10 路，返回该通道 skin_check_result body（不含 channel 字段）。"""
+
+def evaluate_skin_check_all(
+    raw_df: pd.DataFrame,              # 含 ChannelId 列的整段快照
+    settings: SkinCheckSettings | None = None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """按 ChannelId 拆分，逐采集通道评估，返回 [(channel_code, body), ...]。
+
+    拆分/排序/未知码兜底复用 ChannelDispatcher._channels_present 同款逻辑；
+    逐通道 try/except 隔离异常，一路失败不影响其它通道（对齐 build_all）。
+    """
 ```
 
-**不调用：** `prepare_interleaved_dataframe`、`process_csv_dataset`、MBLL、SSR。
+- `evaluate_skin_check` 处理**单通道**，便于单测；`evaluate_skin_check_all` 负责按 `ChannelId` 分发。
+- 回传时由 reporter 给每条 body 补上 `channel` 字段并各发一条（与 `send_live_batch(channel_code, batch)` 一致）。
+- **不调用：** `prepare_interleaved_dataframe`、`process_csv_dataset`、MBLL、SSR。
 
 ---
 
@@ -349,6 +385,8 @@ def evaluate_skin_check(
 ### 7.3 `skin_check_result`（PC → 安卓）
 
 **推荐：** PC 在预检期间每 **1 s** 主动推送（安卓无需反复 `request`）。
+**双通道同采时每个采集通道各发一条**（各带自己的 `channel`/`ssi`/`ok`），安卓按 `channel` 分别刷新 UI——
+与 `live_analysis_batch` 完全一致。
 
 ```json
 {
@@ -357,6 +395,7 @@ def evaluate_skin_check(
   "seq": 6,
   "ts_ms": 1717234568500,
   "body": {
+    "channel": 2,
     "ok": false,
     "ssi": 3,
     "window_s": 5.0,
@@ -390,11 +429,14 @@ def evaluate_skin_check(
 
 | 字段 | 说明 |
 |------|------|
-| `ok` | 是否允许进入正式采集 |
-| `ssi` | 1～5，仿 INVOS 信号强度条 |
-| `channels[].status` | `pass` / `warn` / `fail` / `missing` / `insufficient_data` |
+| `channel` | 采集通道：`1`=通道1，`2`=通道2；缺省（旧固件未带通道位）统一为 `1`。多通道时每个通道各发一条本消息 |
+| `ok` | **该采集通道**是否合格；会话级放行由安卓聚合所有通道 |
+| `ssi` | 1～5，仿 INVOS 信号强度条（该通道内 10 路） |
+| `channels[].status` | `pass` / `warn` / `fail` / `missing` / `insufficient_data`（此处 `channels` 指该采集通道内的 10 路光路，勿与采集通道 `channel` 混淆） |
 | `channels[].reason` | 失败原因码，安卓映射中文文案 |
 | `thresholds` | 当前阈值，便于调试页展示 |
+
+> **命名提醒**：body 里的 `channel`（单数）= **采集通道** ch1/ch2；`channels`（复数）= 该采集通道内的 **10 路光路**（接收源×波长）。二者不同层级，安卓解析时注意区分。
 
 ---
 
@@ -437,18 +479,19 @@ PC 收到 `proceed` 后：退出预检模式，启动 `create_online_session`，
 ### 8.1 新建 `online_android/skin_check.py`
 
 - [ ] `SkinCheckSettings` 数据类  
-- [ ] `evaluate_skin_check(raw_df) -> dict`  
-- [ ] 过滤 `WAVELENGTH_OFF_CODE`  
+- [ ] `evaluate_skin_check(channel_df) -> dict`（**单采集通道**，10 路）  
+- [ ] `evaluate_skin_check_all(raw_df) -> list[(channel_code, dict)]`（按 `ChannelId` 拆分并逐通道评估，异常逐通道隔离）  
+- [ ] 过滤 `WAVELENGTH_OFF_CODE`；`ChannelId` 用 `normalize_channel_code` 归一化  
 - [ ] 按 `DETECTOR_CHANNELS` × `WAVELENGTH_CHANNELS` 生成 10 路结果  
 - [ ] 算 median、CV、status、SSI、`ok`  
-- [ ] 单元测试用构造 `DataFrame`（见 [§10](#10-测试清单)）  
+- [ ] 单元测试用构造 `DataFrame`（含 `ChannelId` 列，见 [§10](#10-测试清单)）  
 
 ### 8.2 新建 `online_android/skin_check_session.py`
 
 - [ ] 状态：`idle` → `skin_checking` → `ready_for_capture`  
-- [ ] 复用 `OnlineSampleBuffer`，只 `append` 不写 MBLL  
-- [ ] 定时器每 `SKIN_CHECK_UPDATE_INTERVAL_S`（默认 1 s）调用 `evaluate_skin_check`  
-- [ ] 调用 `send_skin_check_result`  
+- [ ] 复用 `OnlineSampleBuffer`（已带 `ChannelId`），只 `append` 不写 MBLL  
+- [ ] 定时器每 `SKIN_CHECK_UPDATE_INTERVAL_S`（默认 1 s）取 `snapshot_recent(window_s)` → `evaluate_skin_check_all`  
+- [ ] 对返回的每个 `(channel_code, body)` 各调一次 `send_skin_check_result(channel_code, body)`  
 - [ ] 收到 `skin_check_done(proceed)` 后停止定时器，交棒正式 `OnlineCaptureSession`  
 
 ### 8.3 修改 `online_android/tcp_bridge.py`
@@ -495,6 +538,10 @@ SKIN_CHECK_MIN_SSI_PASS = 4
 | 现有代码 | 关系 |
 |----------|------|
 | `preprocessing.threshold_filter` | 光强上下限 **参考同一量级**，预检不调用该函数改数据 |
+| `ChannelDispatcher` | **复用其"按 `ChannelId` 拆分、每采集通道各建处理器、逐通道隔离异常"的模式**（皮肤检查是它的轻量版：不建增量处理器，只逐通道跑 `evaluate_skin_check`） |
+| `OnlineSampleBuffer` | 直接复用；`snapshot_recent/all` 已带 `ChannelId` 列，`append` 已收 `acq_channel_code` |
+| `config.normalize_channel_code` / `channel_name_for_code` | 归一化采集通道码、生成 `ch1/ch2` 标识，直接复用 |
+| `reporter.send_live_batch(channel_code, batch)` | `send_skin_check_result(channel_code, body)` **对齐同款「带 channel 逐通道发」签名** |
 | `adc_live.py` | 本地串口看光强，**仅调试**；产品路径走安卓 TCP |
 | `OnlineAnalysisWorker` | 预检阶段 **不得启动** |
 | `live_analysis_batch` | 预检阶段 **不得发送** |
@@ -506,8 +553,10 @@ SKIN_CHECK_MIN_SSI_PASS = 4
 ### 9.1 UI
 
 - [ ] 「皮肤检查」入口（正式采集前）  
-- [ ] **SSI 1～5 格**（可仿 INVOS 绿条）  
-- [ ] **两块区域**：S1_D1 / S1_D2，各 5 个波长圆点（绿/黄/红）  
+- [ ] **按采集通道分区**：ch1 / ch2 各一块（按 `skin_check_result.channel` 分别维护，与 `live_analysis_batch` 一致；只点亮一个通道时只显示那一块）  
+- [ ] 每个采集通道内：**SSI 1～5 格**（可仿 INVOS 绿条）  
+- [ ] 每个采集通道内 **两块区域**：S1_D1 / S1_D2，各 5 个波长圆点（绿/黄/红）  
+- [ ] 「开始正式采集」按钮：**所有出现过的采集通道都 `ok=true` 才启用**（会话级聚合）  
 - [ ] `ok=false` 时根据 `reason` 显示文案，例如：  
 
 | reason | 建议文案 |
@@ -542,6 +591,8 @@ SKIN_CHECK_MIN_SSI_PASS = 4
 
 ### 10.1 单元测试（`skin_check.py`）
 
+`evaluate_skin_check`（单采集通道）：
+
 | 用例 | 期望 |
 |------|------|
 | 10 路光强 ~17 万，CV 0.01 | `ok=true`, `ssi=5` |
@@ -551,12 +602,25 @@ SKIN_CHECK_MIN_SSI_PASS = 4
 | 每路仅 2 点 | `insufficient_data` |
 | 含 Wavelength=0x00 | 不参与计算 |
 
+`evaluate_skin_check_all`（多采集通道，含 `ChannelId` 列）：
+
+| 用例 | 期望 |
+|------|------|
+| ch1 全好 + ch2 全好 | 返回 2 条，各 `channel`=1/2、各 `ok=true` |
+| ch1 全好 + ch2 某路 fail | 返回 2 条，ch1 `ok=true`、ch2 `ok=false` |
+| 仅 ch1 有数据 | 只返回 1 条 `channel=1` |
+| 无 `ChannelId` 列（旧格式兜底） | 归入 `DEFAULT_CHANNEL_CODE`，返回 1 条 `channel=1` |
+| `ChannelId=0x00`（未带通道位） | 归一化进 `channel=1` |
+
 ### 10.2 联调（安卓 + PC）
 
 - [ ] `skin_check_start` → `skin_check_start_ack`  
 - [ ] 5 s 内 ≥1 条 `skin_check_result`  
+- [ ] **双通道同采：每 tick 收到 ch1、ch2 各一条 `skin_check_result`，`channel` 正确**  
+- [ ] **只点亮一个通道：只收到该通道那一条**  
 - [ ] 松动探头 → SSI 降、`ok=false`  
 - [ ] 贴紧静止 → `ok=true`  
+- [ ] **一个通道好、另一个坏：安卓放行按钮保持禁用（会话级需全通道 ok）**  
 - [ ] 预检通过后正式采集，`live_analysis_batch` 正常  
 - [ ] 预检阶段 **无** `live_analysis_batch`  
 
@@ -628,6 +692,12 @@ A：形态类似（1～5 格），但你们是 **10 路近红外光强 + CV**，
 **Q：没有 PC 能预检吗？**  
 A：安卓可对原始帧本地算光强门限，但当前产品架构是 **PC 解码端**，无 PC 则只能安卓简化版或不做预检。
 
+**Q：双通道（ch1/ch2）下皮肤检查怎么算？**  
+A：**按采集通道各跑一套**，和正式采集的反演一致。PC 先按 `ChannelId` 把原始帧拆成 ch1/ch2，每个采集通道内部再按 2 接收源 × 5 波长评 10 路，各自算 SSI/`ok`，用 `channel` 字段区分后**各发一条** `skin_check_result`。安卓按 `channel` 分区显示，放行按钮要求所有出现过的采集通道都 `ok=true`。
+
+**Q：为什么 body 里既有 `channel` 又有 `channels`？**  
+A：`channel`（单数）是**采集通道** ch1/ch2；`channels`（复数）是该采集通道内部的 **10 路光路**（接收源×波长）。两个不同层级，命名沿用了协议既有约定（`live_analysis_batch` 也用单数 `channel` 表示采集通道）。
+
 ---
 
 ## 14. 相关文件索引
@@ -638,7 +708,8 @@ A：安卓可对原始帧本地算光强门限，但当前产品架构是 **PC �
 | `config.py` | 几何、波长、阈值（待扩展皮肤检查块） |
 | `fnirs_pipeline/capture.py` | TCP 采集编排 |
 | `fnirs_pipeline/preprocessing.py` | `threshold_filter` 参考 |
-| `online_android/buffer.py` | 原始采样缓冲 |
+| `online_android/buffer.py` | 原始采样缓冲（含 `ChannelId` 列） |
+| `online_android/channel_dispatcher.py` | **按 `ChannelId` 拆分、每采集通道各建处理器的范式**（皮肤检查分发直接对齐） |
 | `online_android/tcp_bridge.py` | TCP 协议 |
 | `online_android/session.py` | 正式在线分析会话 |
 | `online_android/安卓上位机tcp通讯协议.md` | 协议文档（待更新） |
@@ -652,3 +723,4 @@ A：安卓可对原始帧本地算光强门限，但当前产品架构是 **PC �
 |------|------|------|
 | 2026-07-06 | v1 | 初稿：三层方案 + PC/安卓清单 + 协议草案 |
 | 2026-07-06 | v2 | 重写：明确与 VOT/正式采集边界；PC 算安卓展示；10 路 vs 单通道；模块架构；完整协议与 FAQ |
+| 2026-07-13 | v3 | **对齐双通道改造**（2026-07-11 落地）：原始格式补 `ChannelId` 列；皮肤检查改为**按采集通道 ch1/ch2 各评一套**；`evaluate_skin_check` 拆为单通道 + `_all` 分发（复用 `ChannelDispatcher` 范式）；`skin_check_result` 新增 `channel` 字段、逐通道发送；SSI/`ok` 分通道，会话级放行由安卓聚合；补双通道测试用例、FAQ、文件索引 |

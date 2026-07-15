@@ -292,6 +292,8 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 | `window_start_s` | number | 成功时是 | 本次分析会话起始时间（全会话模式通常为 `0`） |
 | `window_end_s` | number | 成功时是 | 本次分析会话结束时间 |
 | `unit` | string | 成功时是 | 所有浓度序列（`hbo/hbr/cyt/delta_thb/thi/delta_thi`）的统一单位，由 PC 端 `LIVE_CONC_UNIT` 决定：默认 `"M"`（摩尔），或 `"uM"`（微摩尔）；rSO2 恒为 `%` |
+| `skin_contact` | bool \| null | 否 | **该采集通道当前是否贴肤**：`true`=贴肤，`false`=未贴，`null`=未知（样本不足）。与 `baseline_ready`/浓度是否就绪无关，从热身期起就随每批下发。由 PC 端 `LIVE_SEND_SKIN_CONTACT` 开关控制 |
+| `skin_contact_detail` | object | 否 | 调试用：`{"median": {"S1_D1": 6270000, "S1_D2": 5290000}, "pass": {"S1_D1": true, "S1_D2": true}}`，各接收源近窗光强中位数（原始 ADC）与是否过阈 |
 | `message` | string | 否 | 失败或调试说明 |
 
 **rSO2 算法**（与 `data_analysis.plot_blood_oxygen_content` 一致）：
@@ -309,6 +311,13 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 - `delta_thi`（ΔtHi）= `thi − 基线HbT`，围绕 0 波动。
 - `thi` / `delta_thi` **只在 `baseline_ready=true`（基线冻结）后出现**，受 `LIVE_SEND_THI` 控制；基线建立前这两个字段缺省。
 - 安卓绘图提示：`thi` 量级（~80 µM）远大于其它 0 中心的 Δ 量，若同轴会把 Δ 曲线压平，建议 `thi` 用独立 Y 轴或单独子图。
+
+**`skin_contact`（贴肤/未贴实时判定）**：
+
+- 与 MBLL/SSR 无关，只看**原始光强**：近窗（默认 5 s）内每个接收源的光强中位数，与 PC 端 `config.SKIN_CONTACT_THRESHOLD` 该接收源门限比较；表中出现的接收源需**全部达标（AND 组合）**才判贴肤。单一接收源阈值挡不住「未贴但短距偶发高值」，双接收源联合才稳。
+- 经 `SKIN_CONTACT_DEBOUNCE_S`（默认 3 s）时间防抖：候选状态需连续保持够时长才翻转，避免贴/松开过渡的 2~3 s 抖动。
+- **按采集通道各判一次**，`skin_contact` 属于所在 `channel`；多通道时每条 `live_analysis_batch` 各带自己的 `skin_contact`。
+- 阈值为实采标定值（当前双通道复用 ch1 标定），是实时「贴没贴上」的指示，不等同于「戴得好不好」的合格评估。安卓可据此点亮/熄灭贴肤指示灯；`null` 时显示「检测中」。
 
 成功示例（基线已建立，`unit="M"`）：
 
@@ -336,7 +345,12 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
     "sample_count": 3,
     "window_start_s": 32.125,
     "window_end_s": 62.127,
-    "unit": "M"
+    "unit": "M",
+    "skin_contact": true,
+    "skin_contact_detail": {
+      "median": {"S1_D1": 6270000, "S1_D2": 5290000},
+      "pass": {"S1_D1": true, "S1_D2": true}
+    }
   }
 }
 ```
@@ -557,3 +571,4 @@ PC：
 | 2026-07-02 | `live_analysis_batch` 增加 `delta_thb`（ΔtHb）/ `thi`（tHi）/ `delta_thi`（ΔtHi）字段；`unit` 改由 `LIVE_CONC_UNIT` 决定（默认 `"M"`）；补充双在线模式（`causal_incremental` / `full_replace`）说明；更新第二层 26B 协议为双接收源五波长 |
 | 2026-07-03 | 增加 `set_baseline` / `set_baseline_ack`：安卓可动态重设 BL，PC 全会话重算并整段回填 |
 | 2026-07-11 | 26B 数据帧 payload[6] 新增采集通道位（通道1=0x01/通道2=0x02）；`live_analysis_batch` 与 `analysis_result` 新增 `channel` 字段，PC 按通道拆分处理并分别回传；单通道采集只回传对应通道 |
+| 2026-07-13 | `live_analysis_batch` 新增 `skin_contact`（贴肤/未贴实时状态，true/false/null）与 `skin_contact_detail`（各接收源近窗光强中位数/过阈）字段，按采集通道各判一次；只看原始光强近窗中位数（双接收源 AND 组合）+ 时间防抖，由 `LIVE_SEND_SKIN_CONTACT` 开关控制 |

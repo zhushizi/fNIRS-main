@@ -78,6 +78,8 @@ class AndroidReporter:
                 thi=batch.thi,
                 delta_thi=batch.delta_thi,
                 channel=channel_code,
+                skin_contact=batch.skin_contact,
+                skin_contact_detail=batch.skin_contact_detail,
             )
         except Exception as exc:
             log.warning("Failed to send live_analysis_batch to Android (channel %s): %s", channel_code, exc)

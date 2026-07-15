@@ -14,6 +14,11 @@ from .rso2 import (
     compute_thi_series,
 )
 from .session import OnlineCaptureSession, create_online_session
+from .skin_contact import (
+    SkinContactDebouncer,
+    SkinContactSettings,
+    evaluate_skin_contact,
+)
 from .tcp_bridge import HostTcpProtocolError, HostTcpSerialBridge
 from .types import AnalysisResult, LiveAnalysisBatch
 
@@ -34,7 +39,10 @@ __all__ = [
     "IncrementalCausalProcessor",
     "OnlineCaptureSession",
     "OnlineSettings",
+    "SkinContactDebouncer",
+    "SkinContactSettings",
     "compute_rso2_series",
+    "evaluate_skin_contact",
     "compute_thi_series",
     "configure_logging",
     "create_online_session",

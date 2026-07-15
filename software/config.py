@@ -89,6 +89,23 @@ LIVE_SEND_DELTA_THB = True
 # delta_thi = thi − 基线 HbT（相对基线的变化，≈0 起算）。安卓未升级解析前可设 False。
 LIVE_SEND_THI = True
 
+# ---------------------------------------------------------------------------
+# 贴肤/未贴实时判定（搭在 live_analysis_batch 上，按采集通道 ch1/ch2 各判一次）
+# ---------------------------------------------------------------------------
+# 判据：近窗（SKIN_CONTACT_WINDOW_S 秒）每个接收源的光强中位数，与下表该接收源阈值比较；
+# 表中出现的接收源需全部达标（AND 组合）才算贴肤。再经 SKIN_CONTACT_DEBOUNCE_S 时间防抖。
+# 只看原始光强，不做 MBLL/SSR。阈值取自实采标定（2026-07-13_15-15-18，通道1），偏严。
+SKIN_CONTACT_WINDOW_S = 5.0
+SKIN_CONTACT_MIN_SAMPLES = 5
+SKIN_CONTACT_DEBOUNCE_S = 3.0
+# 每个接收源一个门限（原始 ADC）。当前双采集通道复用同一套（仅 ch1 有标定数据）。
+SKIN_CONTACT_THRESHOLD = {
+    "S1_D1": 5_800_000,  # 长距 3cm：贴肤稳态 ≈6.27M，未贴 ≤4.4M
+    "S1_D2": 4_000_000,  # 短距 1cm：贴肤稳态 ≈5.29M，未贴多 ~1.5M
+}
+# 是否向安卓 live_analysis_batch 附带 skin_contact 字段。安卓未升级解析前可设 False。
+LIVE_SEND_SKIN_CONTACT = True
+
 
 def _nm_suffix(nm: float) -> str:
     if nm == int(nm):
