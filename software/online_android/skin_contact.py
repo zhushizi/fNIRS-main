@@ -1,29 +1,46 @@
-"""贴肤/未贴实时判定（搭在 live_analysis_batch 上，按采集通道各判一次）。
+"""贴肤（手臂/皮肤）实时判定（搭在 live_analysis_batch 上，按采集通道各判一次）。
 
-判据：近窗（默认 5s）内每个接收源的光强中位数，与 config 中该接收源阈值比较；
-配置里出现的接收源需全部达标（AND 组合）才算贴肤——单一接收源阈值挡不住
-「未贴但短距偶发高值」的情况，双接收源联合才稳。再经时间防抖，避免贴/松开
-过渡的 2~3s 抖动。只看原始光强，不做 MBLL/SSR，成本 O(近窗样本)。
+两级判据（近窗默认 5s，只看短距 S1_D2 原始光强，不做 MBLL/SSR）：
+
+  ① 压住？  S1_D2 近窗中位数 ≥ PRESS_MIN → 有东西贴住（否则悬空/未贴）
+  ② 是组织？S1_D2 810nm/700nm 中位数比 ≥ TISSUE_RATIO_MIN → 手臂/皮肤；
+            低于阈值 → 桌子/硬物，**不算贴肤**（返回 False）
+
+700nm 是脱氧血红蛋白强吸收带：组织里的血把 700 压低 → 810/700 升高；桌子无血 → 比值低。
+长距 S1_D1 当前采集处于饱和（对空气都满值、信息为零），故判据只用短距。再经时间防抖，
+避免贴/松开过渡抖动。成本 O(近窗样本)。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from config import (
+    CODE_BY_WAVELENGTH,
     DETECTOR_CHANNELS,
     SKIN_CONTACT_DEBOUNCE_S,
     SKIN_CONTACT_MIN_SAMPLES,
-    SKIN_CONTACT_THRESHOLD,
+    SKIN_CONTACT_PRESS_DETECTOR,
+    SKIN_CONTACT_PRESS_MIN,
+    SKIN_CONTACT_TISSUE_RATIO_HIGH_NM,
+    SKIN_CONTACT_TISSUE_RATIO_LOW_NM,
+    SKIN_CONTACT_TISSUE_RATIO_MIN,
     SKIN_CONTACT_WINDOW_S,
     WAVELENGTH_OFF_CODE,
 )
 
 _TIME = "Time (s)"
+
+
+def _detector_code(name: str) -> int | None:
+    for det in DETECTOR_CHANNELS:
+        if det.name == name:
+            return det.code
+    return None
 
 
 @dataclass(frozen=True)
@@ -33,9 +50,11 @@ class SkinContactSettings:
     window_s: float = SKIN_CONTACT_WINDOW_S
     min_samples: int = SKIN_CONTACT_MIN_SAMPLES
     debounce_s: float = SKIN_CONTACT_DEBOUNCE_S
-    thresholds: dict[str, float] = field(
-        default_factory=lambda: dict(SKIN_CONTACT_THRESHOLD)
-    )
+    press_detector: str = SKIN_CONTACT_PRESS_DETECTOR
+    press_min: float = SKIN_CONTACT_PRESS_MIN
+    ratio_high_nm: float = SKIN_CONTACT_TISSUE_RATIO_HIGH_NM
+    ratio_low_nm: float = SKIN_CONTACT_TISSUE_RATIO_LOW_NM
+    ratio_min: float = SKIN_CONTACT_TISSUE_RATIO_MIN
 
     @classmethod
     def from_config(cls) -> "SkinContactSettings":
@@ -49,8 +68,8 @@ def evaluate_skin_contact(
     """对单个采集通道的原始 df 做**未防抖**的瞬时贴肤判定。
 
     返回 (raw_state, detail, now_t)：
-    - raw_state: True=贴肤，False=未贴，None=样本不足/无法判定（不轻易报贴肤）
-    - detail: {"median": {det: 值}, "pass": {det: bool}}，供调试/回传，可能为 None
+    - raw_state: True=贴肤(手臂/皮肤)，False=未贴(悬空)或桌子/硬物，None=样本不足
+    - detail: {"press_median", "ratio", "ratio_min", "press_min", "reason"}，供调试/回传
     - now_t: 近窗最新样本时间（数据时钟，用于防抖）
     """
     if channel_df.empty or _TIME not in channel_df.columns:
@@ -58,31 +77,51 @@ def evaluate_skin_contact(
 
     t = channel_df[_TIME].to_numpy(dtype=float)
     now_t = float(t.max()) if t.size else 0.0
+
+    det_code = _detector_code(settings.press_detector)
+    hi_code = CODE_BY_WAVELENGTH.get(float(settings.ratio_high_nm))
+    lo_code = CODE_BY_WAVELENGTH.get(float(settings.ratio_low_nm))
+    if det_code is None or hi_code is None or lo_code is None:
+        return None, None, now_t
+
     recent = channel_df[
         (channel_df[_TIME] > now_t - settings.window_s)
         & (channel_df["Wavelength"] != WAVELENGTH_OFF_CODE)
+        & (channel_df["DetectorId"] == det_code)
     ]
 
-    medians: dict[str, float] = {}
-    passed: dict[str, bool] = {}
-    enough = True
-    for det in DETECTOR_CHANNELS:
-        thr = settings.thresholds.get(det.name)
-        if thr is None:
-            continue  # 未配置阈值的接收源不参与判定
-        vals = recent[recent["DetectorId"] == det.code]["Value"].to_numpy(dtype=float)
+    def _median(code: int | None) -> float | None:
+        if code is None:
+            vals = recent["Value"].to_numpy(dtype=float)
+        else:
+            vals = recent[recent["Wavelength"] == code]["Value"].to_numpy(dtype=float)
         if vals.size < settings.min_samples:
-            enough = False
-            continue
-        med = float(np.median(vals))
-        medians[det.name] = med
-        passed[det.name] = med >= float(thr)
+            return None
+        return float(np.median(vals))
 
-    detail = {"median": medians, "pass": passed} if medians else None
-    # 任一受约束接收源样本不足，或压根没有可判定的接收源 → 未知
-    if not passed or not enough:
+    press_med = _median(None)          # 短距全波长中位数：是否压住
+    hi_med = _median(hi_code)          # 810nm 中位数
+    lo_med = _median(lo_code)          # 700nm 中位数
+
+    ratio = hi_med / lo_med if (hi_med is not None and lo_med not in (None, 0.0)) else None
+    detail: dict[str, Any] = {
+        "press_median": press_med,
+        "ratio": ratio,
+        "ratio_min": settings.ratio_min,
+        "press_min": settings.press_min,
+    }
+
+    if press_med is None or ratio is None:
+        detail["reason"] = "insufficient_samples"
         return None, detail, now_t
-    return all(passed.values()), detail, now_t
+    if press_med < settings.press_min:
+        detail["reason"] = "not_pressed"          # 悬空/未贴
+        return False, detail, now_t
+    if ratio < settings.ratio_min:
+        detail["reason"] = "nonskin_surface"      # 桌子/硬物：压住但非组织
+        return False, detail, now_t
+    detail["reason"] = "skin"
+    return True, detail, now_t
 
 
 class SkinContactDebouncer:

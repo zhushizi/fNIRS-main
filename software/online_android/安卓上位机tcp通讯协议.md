@@ -292,8 +292,8 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 | `window_start_s` | number | 成功时是 | 本次分析会话起始时间（全会话模式通常为 `0`） |
 | `window_end_s` | number | 成功时是 | 本次分析会话结束时间 |
 | `unit` | string | 成功时是 | 所有浓度序列（`hbo/hbr/cyt/delta_thb/thi/delta_thi`）的统一单位，由 PC 端 `LIVE_CONC_UNIT` 决定：默认 `"M"`（摩尔），或 `"uM"`（微摩尔）；rSO2 恒为 `%` |
-| `skin_contact` | bool \| null | 否 | **该采集通道当前是否贴肤**：`true`=贴肤，`false`=未贴，`null`=未知（样本不足）。与 `baseline_ready`/浓度是否就绪无关，从热身期起就随每批下发。由 PC 端 `LIVE_SEND_SKIN_CONTACT` 开关控制 |
-| `skin_contact_detail` | object | 否 | 调试用：`{"median": {"S1_D1": 6270000, "S1_D2": 5290000}, "pass": {"S1_D1": true, "S1_D2": true}}`，各接收源近窗光强中位数（原始 ADC）与是否过阈 |
+| `skin_contact` | bool \| null | 否 | **该采集通道当前是否贴在皮肤/组织上**：`true`=贴皮肤（手臂等活体组织），`false`=未贴（悬空）**或贴在桌子/硬物上**，`null`=未知（样本不足）。**贴桌子不算贴肤**。与 `baseline_ready`/浓度是否就绪无关，从热身期起就随每批下发。由 PC 端 `LIVE_SEND_SKIN_CONTACT` 开关控制 |
+| `skin_contact_detail` | object | 否 | 调试用：`{"press_median": 3130000, "ratio": 0.795, "ratio_min": 0.72, "press_min": 2000000, "reason": "skin"}`。`press_median`=短距 S1_D2 近窗光强中位数（原始 ADC，判"压住"）；`ratio`=短距 810nm/700nm 中位数比（判"是组织"）；`reason` ∈ `skin`/`nonskin_surface`（桌子）/`not_pressed`（悬空）/`insufficient_samples` |
 | `message` | string | 否 | 失败或调试说明 |
 
 **rSO2 算法**（与 `data_analysis.plot_blood_oxygen_content` 一致）：
@@ -312,12 +312,16 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
 - `thi` / `delta_thi` **只在 `baseline_ready=true`（基线冻结）后出现**，受 `LIVE_SEND_THI` 控制；基线建立前这两个字段缺省。
 - 安卓绘图提示：`thi` 量级（~80 µM）远大于其它 0 中心的 Δ 量，若同轴会把 Δ 曲线压平，建议 `thi` 用独立 Y 轴或单独子图。
 
-**`skin_contact`（贴肤/未贴实时判定）**：
+**`skin_contact`（贴皮肤/组织 实时判定，桌子不算）**：
 
-- 与 MBLL/SSR 无关，只看**原始光强**：近窗（默认 5 s）内每个接收源的光强中位数，与 PC 端 `config.SKIN_CONTACT_THRESHOLD` 该接收源门限比较；表中出现的接收源需**全部达标（AND 组合）**才判贴肤。单一接收源阈值挡不住「未贴但短距偶发高值」，双接收源联合才稳。
+- 与 MBLL/SSR 无关，只看**原始光强**，两级判据（近窗默认 5 s，只用短距 S1_D2）：
+  1. **压住？** S1_D2 近窗光强中位数 ≥ `SKIN_CONTACT_PRESS_MIN` → 有东西贴住（否则悬空/未贴 → `false`）。
+  2. **是组织？** S1_D2 `810nm/700nm` 中位数比 ≥ `SKIN_CONTACT_TISSUE_RATIO_MIN` → 皮肤/手臂 → `true`；低于阈值 → **桌子/硬物 → `false`**。
+- 原理：700nm 是脱氧血红蛋白强吸收带，组织里的血把 700 压低 → 810/700 升高；桌子无血 → 比值低。手臂 ~0.79、桌子 ~0.66，阈值取中点 0.72。
+- **只用短距 S1_D2**：长距 S1_D1 当前采集处于饱和（对空气都满值、信息为零），暂不参与；待其脱离饱和后可加长/短距衰减作第二重判据。
 - 经 `SKIN_CONTACT_DEBOUNCE_S`（默认 3 s）时间防抖：候选状态需连续保持够时长才翻转，避免贴/松开过渡的 2~3 s 抖动。
 - **按采集通道各判一次**，`skin_contact` 属于所在 `channel`；多通道时每条 `live_analysis_batch` 各带自己的 `skin_contact`。
-- 阈值为实采标定值（当前双通道复用 ch1 标定），是实时「贴没贴上」的指示，不等同于「戴得好不好」的合格评估。安卓可据此点亮/熄灭贴肤指示灯；`null` 时显示「检测中」。
+- 阈值为实采标定值（2026-07-16 系列，降增益后短距脱饱和），**换增益/肤色需复标**。安卓可据此点亮/熄灭贴肤指示灯；`null` 时显示「检测中」。
 
 成功示例（基线已建立，`unit="M"`）：
 
@@ -348,8 +352,11 @@ PC 在采集过程中周期性发送在线分析结果。该消息用于安卓�
     "unit": "M",
     "skin_contact": true,
     "skin_contact_detail": {
-      "median": {"S1_D1": 6270000, "S1_D2": 5290000},
-      "pass": {"S1_D1": true, "S1_D2": true}
+      "press_median": 3130000,
+      "ratio": 0.795,
+      "ratio_min": 0.72,
+      "press_min": 2000000,
+      "reason": "skin"
     }
   }
 }
@@ -572,3 +579,4 @@ PC：
 | 2026-07-03 | 增加 `set_baseline` / `set_baseline_ack`：安卓可动态重设 BL，PC 全会话重算并整段回填 |
 | 2026-07-11 | 26B 数据帧 payload[6] 新增采集通道位（通道1=0x01/通道2=0x02）；`live_analysis_batch` 与 `analysis_result` 新增 `channel` 字段，PC 按通道拆分处理并分别回传；单通道采集只回传对应通道 |
 | 2026-07-13 | `live_analysis_batch` 新增 `skin_contact`（贴肤/未贴实时状态，true/false/null）与 `skin_contact_detail`（各接收源近窗光强中位数/过阈）字段，按采集通道各判一次；只看原始光强近窗中位数（双接收源 AND 组合）+ 时间防抖，由 `LIVE_SEND_SKIN_CONTACT` 开关控制 |
+| 2026-07-16 | `skin_contact` 判据改为**两级**：短距 S1_D2 光强判"压住"+ S1_D2 810/700 比值判"是组织"，**贴桌子/硬物不再算贴肤**（返回 `false`）；因长距 S1_D1 采集饱和改为只用短距。`skin_contact_detail` 字段结构随之改为 `{press_median, ratio, ratio_min, press_min, reason}`。字段名与开关不变 |

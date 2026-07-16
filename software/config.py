@@ -92,17 +92,23 @@ LIVE_SEND_THI = True
 # ---------------------------------------------------------------------------
 # 贴肤/未贴实时判定（搭在 live_analysis_batch 上，按采集通道 ch1/ch2 各判一次）
 # ---------------------------------------------------------------------------
-# 判据：近窗（SKIN_CONTACT_WINDOW_S 秒）每个接收源的光强中位数，与下表该接收源阈值比较；
-# 表中出现的接收源需全部达标（AND 组合）才算贴肤。再经 SKIN_CONTACT_DEBOUNCE_S 时间防抖。
-# 只看原始光强，不做 MBLL/SSR。阈值取自实采标定（2026-07-13_15-15-18，通道1），偏严。
+# 两级判据（近窗 SKIN_CONTACT_WINDOW_S 秒，只看原始光强，不做 MBLL/SSR），经时间防抖：
+#   ① 压住？   短距 S1_D2 近窗中位数 ≥ SKIN_CONTACT_PRESS_MIN → 有贴住（否则悬空/未贴）
+#   ② 是组织？ 短距 810nm/700nm 中位数比 ≥ SKIN_CONTACT_TISSUE_RATIO_MIN → 手臂/皮肤
+#              低于阈值 → 桌子/硬物，**不算贴肤**（skin_contact=False）
+# 700nm 是脱氧血红蛋白强吸收带：组织里的血把 700 压低 → 810/700 升高；桌子无血 → 比值低。
+# 说明：长距 S1_D1 当前采集处于饱和（~6.6M 近常数、对空气也满值），信息为零，故判据只用短距。
+# 阈值取自实采标定（2026-07-16 系列，ch2，降增益后 S1_D2 五波长脱饱和）；换增益/肤色需复标。
 SKIN_CONTACT_WINDOW_S = 5.0
 SKIN_CONTACT_MIN_SAMPLES = 5
 SKIN_CONTACT_DEBOUNCE_S = 3.0
-# 每个接收源一个门限（原始 ADC）。当前双采集通道复用同一套（仅 ch1 有标定数据）。
-SKIN_CONTACT_THRESHOLD = {
-    "S1_D1": 5_800_000,  # 长距 3cm：贴肤稳态 ≈6.27M，未贴 ≤4.4M
-    "S1_D2": 4_000_000,  # 短距 1cm：贴肤稳态 ≈5.29M，未贴多 ~1.5M
-}
+# ① 压住下限（短距原始 ADC）：手臂/桌子压住时 S1_D2 中位 ~3–5M，悬空 ~0.3–1M。
+SKIN_CONTACT_PRESS_DETECTOR = "S1_D2"
+SKIN_CONTACT_PRESS_MIN = 2_000_000
+# ② 组织比值门（短距 810nm / 700nm 中位数）：手臂 ~0.79、桌子 ~0.66，阈值取中点。
+SKIN_CONTACT_TISSUE_RATIO_HIGH_NM = 810.0
+SKIN_CONTACT_TISSUE_RATIO_LOW_NM = 700.0
+SKIN_CONTACT_TISSUE_RATIO_MIN = 0.72
 # 是否向安卓 live_analysis_batch 附带 skin_contact 字段。安卓未升级解析前可设 False。
 LIVE_SEND_SKIN_CONTACT = True
 
