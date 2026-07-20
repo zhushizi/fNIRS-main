@@ -11,7 +11,7 @@ import pandas as pd
 from .rso2 import compute_rso2_series, compute_thi_series
 
 from .baseline_state import MutableBaseline
-from .config import OnlineSettings
+from .online_config import OnlineSettings
 from .types import LiveAnalysisBatch
 
 PrepareInterleavedFn = Callable[[pd.DataFrame, bool], pd.DataFrame]

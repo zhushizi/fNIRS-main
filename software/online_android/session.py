@@ -14,7 +14,7 @@ from .baseline_state import MutableBaseline
 from .batch_recorder import AndroidLiveOutputRecorder
 from .buffer import OnlineSampleBuffer
 from .channel_dispatcher import ChannelDispatcher
-from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
+from .online_config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
 from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
 from .logging_utils import get_logger
 from .reporter import AndroidReporter

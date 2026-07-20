@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from .buffer import OnlineSampleBuffer
 from .channel_dispatcher import ChannelDispatcher
-from .config import OnlineSettings
+from .online_config import OnlineSettings
 from .logging_utils import get_logger
 from .reporter import AndroidReporter
 

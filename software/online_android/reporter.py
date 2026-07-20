@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from .batch_recorder import AndroidLiveOutputRecorder
-from .config import OnlineSettings
+from .online_config import OnlineSettings
 from .live_plotter import LiveAndroidBatchPlotter
 from .logging_utils import get_logger
 from .rso2 import compute_rso2_series

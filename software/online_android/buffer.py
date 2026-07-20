@@ -8,7 +8,7 @@ from collections import deque
 import pandas as pd
 
 
-from .config import OnlineSettings
+from .online_config import OnlineSettings
 
 
 class OnlineSampleBuffer:

@@ -46,7 +46,7 @@ from config import (
 from fnirs_pipeline.mbll_core import get_dpf, intensities_to_od_changes
 
 from .baseline_state import MutableBaseline
-from .config import OnlineSettings
+from .online_config import OnlineSettings
 from .types import LiveAnalysisBatch
 
 PrepareInterleavedFn = Callable[[pd.DataFrame, bool], pd.DataFrame]

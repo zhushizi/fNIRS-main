@@ -24,7 +24,7 @@ from config import ACQUISITION_CHANNELS, DEFAULT_CHANNEL_CODE
 from .baseline_state import MutableBaseline
 from .batch_builder import IncrementalBatchBuilder
 from .causal_processor import IncrementalCausalProcessor
-from .config import OnlineSettings
+from .online_config import OnlineSettings
 from .logging_utils import get_logger
 from .skin_contact import SkinContactDebouncer, SkinContactSettings, evaluate_skin_contact
 from .types import LiveAnalysisBatch

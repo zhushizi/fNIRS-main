@@ -1,7 +1,7 @@
 """TCP 采集中在线分析并回传安卓上位机。"""
 
 from .causal_processor import IncrementalCausalProcessor
-from .config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
+from .online_config import DEFAULT_ONLINE_SETTINGS, OnlineSettings
 from .logging_utils import configure_logging, get_logger, log_file_path
 from .live_plotter import HBO_HBR_WINDOW_S, RSO2_WINDOW_S, LiveAndroidBatchPlotter
 from .reporter import AndroidReporter, enrich_result_with_rso2
