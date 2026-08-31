@@ -61,7 +61,14 @@ def smart_bandpass(
     if sos is None or data_ds.shape[1] < max(16, 3 * (order + 1) + 1):
         return data
 
-    padlen = min(data_ds.shape[1] - 1, 3 * (order + 1))
+    # 边界填充长度由最低截止频率决定：高通瞬态的特征时间约 1/lowcut，
+    # 需要 3 倍才衰减干净。scipy 通用默认值 3*(order+1) 只看阶数，对 fNIRS
+    # 这种极低截止频率短两个数量级（0.01 Hz @ 1 Hz 需 300 样本，原值恒为 15）。
+    # 注意用降采样后的 fs_ds，且 padlen 不得超过 n-1（样本不足时只能部分改善）。
+    want = 3 * (order + 1)
+    if lowcut > 0:
+        want = max(want, int(round(3.0 * fs_ds / lowcut)))
+    padlen = min(data_ds.shape[1] - 1, want)
     if padlen <= 0:
         return data
 

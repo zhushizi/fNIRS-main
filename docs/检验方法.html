@@ -1,0 +1,1092 @@
+<title>透射式检验方法</title>
+
+<style>
+/* ── tokens: light (bare :root = complete palette) ───────────────── */
+:root{
+  --ground:#F3F4F0;
+  --surface:#FFFFFF;
+  --surface-sunk:#EDEFE8;
+  --ink:#1B1E1A;
+  --ink-muted:#5C6259;
+  --ink-faint:#8A9084;
+  --rule:#D6D9D0;
+  --rule-strong:#B6BBAE;
+  --accent:#8A3524;
+  --accent-soft:#F3E3DE;
+  --warn:#7E5A0C;
+  --warn-soft:#F6EDD6;
+  --hbo:#B4442F;
+  --hbr:#2E5F6B;
+  --grp-a:#6B5A2E;
+  --grp-b:#3E6247;
+  --grp-p:#8A3524;
+  --grp-d:#4A5470;
+  --grp-c:#5C6259;
+
+  --f-head:"PingFang SC","Source Han Sans SC","Noto Sans CJK SC","Microsoft YaHei","Hiragino Sans GB",system-ui,sans-serif;
+  --f-body:"Songti SC","Source Han Serif SC","Noto Serif CJK SC","SimSun",Georgia,serif;
+  --f-data:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+
+  --w-content:47rem;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ground:#161814;
+    --surface:#1E211C;
+    --surface-sunk:#191C17;
+    --ink:#E7E9E1;
+    --ink-muted:#9BA392;
+    --ink-faint:#6E7668;
+    --rule:#333A2F;
+    --rule-strong:#4A5343;
+    --accent:#DD8064;
+    --accent-soft:#33231E;
+    --warn:#D3A93F;
+    --warn-soft:#2C2617;
+    --hbo:#E08A72;
+    --hbr:#6FA9B4;
+    --grp-a:#C4AC6C;
+    --grp-b:#7FB394;
+    --grp-p:#DD8064;
+    --grp-d:#9AA4C4;
+    --grp-c:#9BA392;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#161814;
+  --surface:#1E211C;
+  --surface-sunk:#191C17;
+  --ink:#E7E9E1;
+  --ink-muted:#9BA392;
+  --ink-faint:#6E7668;
+  --rule:#333A2F;
+  --rule-strong:#4A5343;
+  --accent:#DD8064;
+  --accent-soft:#33231E;
+  --warn:#D3A93F;
+  --warn-soft:#2C2617;
+  --hbo:#E08A72;
+  --hbr:#6FA9B4;
+  --grp-a:#C4AC6C;
+  --grp-b:#7FB394;
+  --grp-p:#DD8064;
+  --grp-d:#9AA4C4;
+  --grp-c:#9BA392;
+}
+
+*{box-sizing:border-box}
+
+body{
+  margin:0;
+  background:var(--ground);
+  color:var(--ink);
+  font-family:var(--f-body);
+  font-size:16.5px;
+  line-height:1.85;
+  -webkit-font-smoothing:antialiased;
+}
+
+.wrap{
+  display:grid;
+  grid-template-columns:minmax(0,1fr);
+  justify-content:center;
+  gap:0 3.5rem;
+  padding:0 1.25rem 6rem;
+}
+@media (min-width:1180px){
+  .wrap{grid-template-columns:minmax(0,var(--w-content)) 14rem;justify-content:center}
+}
+
+main{min-width:0;max-width:var(--w-content);width:100%}
+
+/* ── document header ─────────────────────────────────────────────── */
+.dochead{
+  border-bottom:2px solid var(--ink);
+  padding:3.5rem 0 1.5rem;
+  margin-bottom:2.5rem;
+}
+.docmark{
+  font-family:var(--f-data);
+  font-size:.7rem;
+  letter-spacing:.18em;
+  text-transform:uppercase;
+  color:var(--accent);
+  margin:0 0 1.1rem;
+}
+h1{
+  font-family:var(--f-head);
+  font-size:clamp(1.6rem,4.4vw,2.25rem);
+  font-weight:700;
+  line-height:1.35;
+  letter-spacing:-.01em;
+  text-wrap:balance;
+  margin:0 0 1.4rem;
+}
+.docmeta{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
+  gap:.9rem 1.6rem;
+  margin:0;
+  font-family:var(--f-head);
+  font-size:.82rem;
+}
+.docmeta dt{
+  font-family:var(--f-data);
+  font-size:.66rem;
+  letter-spacing:.14em;
+  text-transform:uppercase;
+  color:var(--ink-faint);
+  margin-bottom:.15rem;
+}
+.docmeta dd{margin:0;color:var(--ink-muted)}
+
+/* ── headings ────────────────────────────────────────────────────── */
+h2,h3,h4{font-family:var(--f-head);text-wrap:balance;line-height:1.4}
+h2{
+  font-size:1.3rem;font-weight:700;
+  margin:3.4rem 0 1.3rem;padding-top:1.5rem;
+  border-top:1px solid var(--rule-strong);
+}
+h2:first-of-type{border-top:none;padding-top:0}
+h3{font-size:1.03rem;font-weight:600;margin:2.4rem 0 .85rem;color:var(--ink)}
+h4{
+  font-size:.82rem;font-weight:600;margin:1.7rem 0 .6rem;
+  font-family:var(--f-data);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint);
+}
+.num{font-family:var(--f-data);color:var(--accent);font-weight:400;margin-right:.5em;font-size:.9em}
+
+p{margin:0 0 1.15rem}
+strong{font-weight:700;color:var(--ink)}
+code{
+  font-family:var(--f-data);font-size:.86em;
+  background:var(--surface-sunk);padding:.08em .32em;border-radius:2px;
+  color:var(--ink);
+}
+a{color:var(--accent)}
+
+blockquote{
+  margin:0 0 1.4rem;padding:.2rem 0 .2rem 1.1rem;
+  border-left:2px solid var(--rule-strong);
+  color:var(--ink-muted);font-size:.95rem;
+}
+blockquote>:last-child{margin-bottom:0}
+
+/* ── tables ──────────────────────────────────────────────────────── */
+.tw{overflow-x:auto;margin:0 0 1.4rem;border:1px solid var(--rule);background:var(--surface);border-radius:2px}
+table{border-collapse:collapse;width:100%;font-family:var(--f-head);font-size:.87rem;line-height:1.65}
+th,td{padding:.66rem .85rem;text-align:left;vertical-align:top;border-bottom:1px solid var(--rule)}
+thead th{
+  font-family:var(--f-data);font-size:.7rem;font-weight:600;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);
+  background:var(--surface-sunk);
+  border-bottom:1px solid var(--rule-strong);
+}
+tbody tr:last-child td{border-bottom:none}
+td{color:var(--ink-muted)}
+td strong{color:var(--ink)}
+.nowrap{white-space:nowrap}
+.num-col{font-family:var(--f-data);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* criterion id chip */
+.cid{
+  display:inline-block;font-family:var(--f-data);font-size:.78rem;font-weight:600;
+  letter-spacing:.04em;padding:.1rem .42rem;border-radius:2px;
+  border:1px solid currentColor;white-space:nowrap;
+}
+.cid-a{color:var(--grp-a)} .cid-b{color:var(--grp-b)} .cid-p{color:var(--grp-p)}
+.cid-d{color:var(--grp-d)} .cid-c{color:var(--grp-c)} .cid-r{color:var(--grp-d)}
+
+.hbo{color:var(--hbo);font-weight:700}
+.hbr{color:var(--hbr);font-weight:700}
+
+.req{font-family:var(--f-data);font-size:.74rem;letter-spacing:.06em;white-space:nowrap}
+.req-must{color:var(--accent)}
+.req-opt{color:var(--ink-faint)}
+.no{color:var(--ink-faint)}
+.ok{color:var(--grp-b);font-weight:700}
+.bad{color:var(--accent);font-weight:700}
+
+/* ── callouts ────────────────────────────────────────────────────── */
+.note,.warn{
+  border-left:3px solid var(--rule-strong);
+  background:var(--surface);
+  padding:.95rem 1.1rem;
+  margin:0 0 1.4rem;
+  font-size:.94rem;
+  line-height:1.75;
+}
+.note>:last-child,.warn>:last-child{margin-bottom:0}
+.warn{border-left-color:var(--warn);background:var(--warn-soft)}
+.klabel{
+  display:block;font-family:var(--f-data);font-size:.66rem;letter-spacing:.16em;
+  text-transform:uppercase;margin-bottom:.4rem;
+}
+.note .klabel{color:var(--ink-faint)}
+.warn .klabel{color:var(--warn)}
+
+.keystone{
+  border:1px solid var(--accent);
+  background:var(--accent-soft);
+  padding:1.1rem 1.2rem;
+  margin:0 0 1.4rem;
+  border-radius:2px;
+}
+.keystone .klabel{color:var(--accent)}
+.keystone>:last-child{margin-bottom:0}
+
+/* ── formulas ────────────────────────────────────────────────────── */
+.fml{
+  background:var(--surface);border:1px solid var(--rule);border-radius:2px;
+  padding:1rem 1.15rem;margin:0 0 1.4rem;overflow-x:auto;
+  font-family:var(--f-data);font-size:.93rem;line-height:2.05;
+  display:flex;align-items:center;gap:1rem;
+}
+.fml .fbody{flex:1;min-width:0}
+.fml .eqn{font-size:.76rem;color:var(--ink-faint);white-space:nowrap}
+.frac{display:inline-flex;flex-direction:column;vertical-align:middle;text-align:center;margin:0 .25em}
+.frac .n{border-bottom:1px solid currentColor;padding:0 .45em .1em}
+.frac .d{padding:.1em .45em 0}
+.rad{border-top:1px solid currentColor;padding:.2em .3em 0;display:inline-block}
+sub,sup{font-size:.7em}
+
+.flow{
+  background:var(--surface-sunk);border:1px solid var(--rule);border-radius:2px;
+  padding:.95rem 1.15rem;margin:0 0 1.4rem;overflow-x:auto;
+  font-family:var(--f-data);font-size:.82rem;line-height:1.75;white-space:pre;
+  color:var(--ink-muted);
+}
+
+/* ── toc ─────────────────────────────────────────────────────────── */
+.toc{display:none}
+@media (min-width:1180px){
+  .toc{
+    display:block;position:sticky;top:2.5rem;align-self:start;
+    max-height:calc(100vh - 5rem);overflow-y:auto;
+    font-family:var(--f-head);font-size:.79rem;line-height:1.5;
+    padding-top:6.2rem;
+  }
+  .toc .klabel{color:var(--ink-faint);margin-bottom:.7rem}
+  .toc ol{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.42rem}
+  .toc a{display:block;color:var(--ink-muted);text-decoration:none;padding-left:.6rem;border-left:1px solid var(--rule)}
+  .toc a:hover{color:var(--accent);border-left-color:var(--accent)}
+  .toc .sub{padding-left:1.5rem;font-size:.75rem}
+}
+.toc-inline{
+  font-family:var(--f-head);font-size:.86rem;
+  background:var(--surface);border:1px solid var(--rule);
+  padding:1rem 1.2rem;margin:0 0 2.4rem;border-radius:2px;
+}
+@media (min-width:1180px){.toc-inline{display:none}}
+.toc-inline ol{margin:0;padding-left:1.2rem;columns:2;column-gap:1.5rem}
+.toc-inline li{margin-bottom:.3rem;break-inside:avoid}
+.toc-inline a{color:var(--ink-muted);text-decoration:none}
+
+footer{
+  margin-top:4rem;padding-top:1.4rem;border-top:1px solid var(--rule);
+  font-family:var(--f-head);font-size:.76rem;color:var(--ink-faint);line-height:1.7;
+}
+
+@media (prefers-reduced-motion:no-preference){
+  a{transition:color .15s ease,border-color .15s ease}
+}
+
+@media print{
+  body{background:#fff;color:#000;font-size:10.5pt;line-height:1.6}
+  .toc,.toc-inline{display:none}
+  .wrap{display:block;padding:0}
+  main{max-width:none}
+  h2{break-after:avoid;page-break-after:avoid}
+  .tw,table,.note,.warn,.keystone,.fml,.flow{break-inside:avoid;page-break-inside:avoid}
+  a{color:#000;text-decoration:none}
+}
+</style>
+
+<div class="wrap">
+<main>
+
+<header class="dochead">
+  <p class="docmark">检验方法 · 附录 BB 透射式</p>
+  <h1>路径长度依赖的血红蛋白变化量<br>透射式检验方法</h1>
+  <dl class="docmeta">
+    <div><dt>依据</dt><dd>GB 9706.271—2022 附录 BB（规范性）</dd></div>
+    <div><dt>被检设备</dt><dd>双通道双接收源五波长 fNIRS 采集系统</dd></div>
+    <div><dt>波长</dt><dd class="num-col">850 / 810 / 770 / 730 / 700 nm</dd></div>
+    <div><dt>核心判据</dt><dd class="num-col">设备值与参考值差 &lt; 5%</dd></div>
+  </dl>
+</header>
+
+<nav class="toc-inline" aria-label="目录">
+  <ol>
+    <li><a href="#s1">1. 被检性能与测量量</a></li>
+    <li><a href="#s2">2. 前置条件</a></li>
+    <li><a href="#s3">3. 试验装置</a></li>
+    <li><a href="#s4">4. 【101.5】血红蛋白变化量</a></li>
+    <li><a href="#s5">5. 【101.6】信号稳定性</a></li>
+    <li><a href="#s6">6. 【101.7】响应时间</a></li>
+    <li><a href="#s7">7. 【101.8】信噪比</a></li>
+    <li><a href="#s8">8. 离线核验工具</a></li>
+    <li><a href="#s9">9. 记录与报告</a></li>
+    <li><a href="#a1">附 A：公式汇总</a></li>
+    <li><a href="#a2">附 B：判据索引</a></li>
+    <li><a href="#a3">附 C：出处</a></li>
+    <li><a href="#a4">附 D：注意事项</a></li>
+  </ol>
+</nav>
+
+<div class="note"><p>本文只涵盖<strong>透射式体模试验</strong>（101.5 / .6 / .7 / .8）及其前置条件。反射式工程验证、合成输入的软件层验证、人体生理试验均不在本文范围。</p></div>
+
+
+<!-- ══ 1 ══ -->
+<h2 id="s1"><span class="num">1</span>被检性能与测量量</h2>
+
+<h3>1.1　测量量是 Δc·L</h3>
+
+<p>本设备基于修正比尔-朗伯定律（MBLL）测量<strong>路径长度依赖的血红蛋白变化量 Δc·L</strong>，<strong>不测量绝对血氧饱和度</strong>。</p>
+
+<blockquote>
+<p><strong>附录 BB.2 原文：</strong>「Δμ<sub>a</sub> 和 L 的值<strong>不能单独从连续光的测量中得到</strong>，而是得到它们的乘积 μ<sub>a</sub>(λ)·L。」</p>
+<p>「平均光程长 L 目前<strong>很难被测量</strong>。因此，测量的物理量 Δc<sub>O₂Hb</sub>L 和 Δc<sub>HHb</sub>L 是血红蛋白浓度变化和平均光程长的乘积，它们的单位用浓度和距离的乘积表示，如 (mmol/L)·mm。」</p>
+</blockquote>
+
+<p>平均光程 L 为假设值（DPF 公式与年龄参数须在说明书披露），<strong>不在本方法的验证范围内</strong>。</p>
+
+<h3>1.2　为什么用透射法</h3>
+
+<blockquote><p><strong>BB.3.1 原文：</strong>「采用<strong>透射法</strong>是因为它容易改变光的衰减，<strong>测量精度好</strong>；而反射法通常用于较厚的人体组织。」</p></blockquote>
+
+<p>附录 BB 为<strong>规范性</strong>附录，201.12.1.101.5 全文即指向它，其试验构型为透射。</p>
+
+<h3>1.3　本方法能验证什么</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>命题</th><th class="nowrap">能否</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><strong>Δc·L 幅度是否准确</strong></td><td><span class="ok">✓</span></td><td><strong>判据 &lt; 5%</strong>，规范性条文</td></tr>
+<tr><td><strong><span class="hbo">HbO</span>/<span class="hbr">HbR</span> 能否正常升降</strong></td><td><span class="ok">✓</span></td><td>A→B 双双上升，B→A 双双下降，方向与量值均可判</td></tr>
+<tr><td>波长间增益一致性</td><td><span class="ok">✓</span></td><td>判据 <span class="cid cid-a">A2</span></td></tr>
+<tr><td>响应时间、信号稳定性、信噪比</td><td><span class="ok">✓</span></td><td>101.6 / .7 / .8</td></tr>
+<tr><td><strong><span class="hbo">HbO</span>↑ 同时 <span class="hbr">HbR</span>↓ 的生理反相</strong></td><td><span class="bad">✗</span></td><td class="no">见下方警示</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+  <span class="klabel">必须理解，否则会误判结果</span>
+  <p><strong>体模验不出生理反相，这是标准自己写明的。</strong>孔径是几何机制，五波长 ΔA 相等，解出必同号：</p>
+  <p><strong>BB.3.1 算例注 1：</strong>「在 690 nm 和 830 nm 衰减增加 3 dB 时，模拟的路径长度依赖的血红蛋白变化量<strong>均为阳性</strong>。」</p>
+  <p><strong>注 3：</strong>「在人体脑激活中发现的典型的衰减变化和相关的路径长度依赖的血红蛋白变化量在<strong>大小和方向上都要小得多</strong>。」</p>
+  <p><strong>标准接受这一点</strong>——本试验检的是数值准确度，不是生理仿真。生理反相需人体试验，不在本文范围。</p>
+</div>
+
+
+<!-- ══ 2 ══ -->
+<h2 id="s2"><span class="num">2</span>前置条件</h2>
+
+<h3>2.1　★ 增益整定与饱和排查</h3>
+
+<div class="keystone">
+  <span class="klabel">整个方案的第一步</span>
+  <p>长距通道当前处于<strong>饱和</strong>状态（实测光强 std/mean = <span class="num-col">0.00043</span>），此时所有下游读数无效。<strong>本项未完成不得进入第 4 节。</strong></p>
+</div>
+
+<p><strong>装置</strong>：稳定的组织类固态体模（μs′ 约 10 cm⁻¹ @800 nm，30 mm 处光损耗约 40 dB），涂折射率匹配介质消除空气间隙。</p>
+
+<p><strong>步骤</strong>：从最低增益逐档上调，记录各探测器 × 各波长的原始 ADC 值，找到「远离满量程且信噪比足够」的档位，对每个探测器<strong>分别</strong>整定。</p>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">序号</th><th>判据</th></tr></thead>
+<tbody>
+<tr><td><span class="cid cid-r">R1</span></td><td>所有探测器、所有波长原始值<strong>远离满量程</strong>（建议 ≤ 70%），且 std/mean <strong>&gt; 0.001</strong></td></tr>
+<tr><td><span class="cid cid-r">R2</span></td><td>各探测器<strong>支持独立增益档位</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+  <span class="klabel">量程</span>
+  <p><strong>透射式的光强量级与反射式贴肤完全不同</strong>：101.5 要求 &gt; 40 dB、101.8 要求 &gt; 60 dB 衰减，同一套试验内可能需换档。<strong>「每探测器独立增益且可配置」是必需项。</strong></p>
+  <p>增益变更后，<code>config.py</code> 中的贴肤检测阈值（<code>SKIN_CONTACT_PRESS_MIN</code> 等）全部作废，须重新标定。</p>
+</div>
+
+<h3>2.2　遮光验证</h3>
+
+<p>遮挡发射探头出光面，采集 <strong>60 s</strong>。</p>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">序号</th><th>判据</th></tr></thead>
+<tbody>
+<tr><td><span class="cid cid-r">R4</span></td><td>输出落至噪声水平，验证无环境光泄漏。<strong>本项是 §3.2 透射式遮光有效性的前置验证，必须先通过</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>2.3　【101.2 / .3 / .4】光源参数</h3>
+
+<p>不需要体模，但 <strong>101.3 必须最先做</strong>——后续查 ε(λ) 要用实测峰值波长。</p>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">条款</th><th>项目</th><th>方法</th></tr></thead>
+<tbody>
+<tr><td class="num-col">101.2</td><td>平均光功率</td><td>发射探头对准<strong>功率计</strong>（图 201.102）；须在 GB 7247.1 皮肤 MPE 限值内</td></tr>
+<tr><td class="num-col"><strong>101.3</strong></td><td><strong>峰值波长</strong></td><td>对准<strong>分光光度计／光谱分析仪</strong>（图 201.103），每个光源各测</td></tr>
+<tr><td class="num-col">101.4</td><td>光谱功率分布 FWHM</td><td>同上装置</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="fml"><div class="fbody">P<sub>av</sub> = P<sub>peak</sub> × τ × f</div><div class="eqn">公式 1</div></div>
+
+<p>本设备为五波长时分轮转（脉冲调制），此式适用。</p>
+
+<div class="warn"><p><strong>ε 须按实测峰值波长查表。</strong>若实测 848 nm 而按标称 850 查表，整条链路的定量都会偏。</p></div>
+
+<h3>2.4　探头组合的选择与记录</h3>
+
+<blockquote><p><strong>201.12.1.101.1 总则：</strong>「在以下性能试验项目中，如果有多个发射探头和接收探头，则应根据每个制造商定义的风险管理，<strong>选择发射探头和接收探头的组合。应记录所选的组合。</strong>」</p></blockquote>
+
+<p>本设备含两个硬件采集通道（<code>ACQUISITION_CHANNELS</code> = ch1 / ch2，与探测器、波长正交），每通道各有独立光源与探测器，据此选择：</p>
+
+<div class="tw">
+<table>
+<tbody>
+<tr><td><strong>发射探头</strong></td><td><strong>ch1 的五波长 LED 光源</strong></td></tr>
+<tr><td><strong>接收探头</strong></td><td><strong>ch2 的长距探测器（S1_D1，3.0 cm）</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<p>两组探头分列体模两侧，构成透射构型。<strong>器件为同批 LED 与 PD，与量产状态光学等效。</strong></p>
+
+<h4>记录格式（须写入报告）</h4>
+
+<div class="tw">
+<table>
+<thead><tr><th>项</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td>发射探头</td><td>ch1，五波长 LED（850/810/770/730/700 nm，峰值按 101.3 实测填写）</td></tr>
+<tr><td>接收探头</td><td>ch2，S1_D1（长距 PD）</td></tr>
+<tr><td>未使用</td><td>ch1 全部 PD、ch2 光源、ch2 短距 PD</td></tr>
+<tr><td>选择依据</td><td>风险管理文件编号 ______</td></tr>
+<tr><td>等效性说明</td><td>与量产探头同批器件，NA、有效受光面积、耦合方式一致</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn">
+  <span class="klabel">实施前必须确认</span>
+  <div class="tw" style="margin-top:.6rem">
+  <table>
+  <thead><tr><th class="nowrap">#</th><th>待确认</th><th>不满足的后果</th></tr></thead>
+  <tbody>
+  <tr><td>1</td><td>固件中 ch1 与 ch2 的时序是否同步</td><td>独立时 ch2 的 PD 不在 ch1 的 LED 点亮时刻采样</td></tr>
+  <tr><td>2</td><td><strong>能否只点亮 ch1 光源、只读 ch2 探测器</strong></td><td>否则 ch2 自身光源会淹没透射信号</td></tr>
+  <tr><td>3</td><td>时间戳精度能否支持跨通道对齐</td><td>PC 侧时间戳为收包时刻，带 TCP 抖动，应依赖设备侧时序</td></tr>
+  </tbody>
+  </table>
+  </div>
+</div>
+
+<p><strong>若第 1、3 项不满足</strong>，可用<strong>静态点亮模式</strong>绕过：</p>
+
+<div class="flow">① ch1 只点亮 850 nm，保持常亮
+② ch2 的 PD 持续采样
+③ 切换体模状态 A → B，分别记录 I_A、I_B
+④ 依次换 810 / 770 / 730 / 700 nm 重复</div>
+
+<p>静态点亮下不需要任何跨通道同步。<strong>例外</strong>：101.8 要求「ME 设备处于最高采样率时」，该项应在正常轮转模式下进行，否则须在报告中说明。</p>
+
+<p><strong>若第 2 项也不满足</strong>：改做可分离的送检专用探头（同批器件，仅机械载体可分开）。101.1 总则本身允许并要求记录探头组合，此路径合规。</p>
+
+
+<!-- ══ 3 ══ -->
+<h2 id="s3"><span class="num">3</span>试验装置</h2>
+
+<h3>3.1　体模（图 201.BB.1）</h3>
+
+<div class="flow">        入射 I₀ (10)
+          ↓
+    ┌───────────┐
+    │  衰减器6  │  ← 足够厚的散射吸收材料
+    ├─────┬─────┤
+    │     │孔径9│  ← 可变，面积 S_apA / S_apB (12)
+    ├─────┴─────┤
+    │  衰减器6  │
+    └───────────┘
+          ↓
+   检测光强 I_A / I_B (11)</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>参数</th><th>要求</th><th class="nowrap">出处</th></tr></thead>
+<tbody>
+<tr><td>状态 A 光损耗</td><td><strong>&gt; 40 dB</strong>（信噪比试验时 <strong>&gt; 60 dB</strong>）</td><td class="num-col">BB.3.2 · 表 201.101</td></tr>
+<tr><td>状态 B 光损耗</td><td>比状态 A <strong>大 3~4 dB</strong>，<strong>在 ME 设备的每个波长上</strong></td><td class="num-col">BB.3.2</td></tr>
+<tr><td>出口侧圆形孔径</td><td><strong>2r<sub>ex</sub> = 8 mm</strong></td><td class="num-col">BB.3.2</td></tr>
+<tr><td>材料</td><td>散射与吸收特性与人体组织相似；孔径<strong>前后</strong>均需足够厚的散射吸收材料</td><td class="num-col">BB.3.1</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="fml"><div class="fbody">OL = P<sub>ex,total</sub> / P<sub>in</sub>　　　　OL<sub>dB</sub> = 10 log<sub>10</sub>(OL)</div><div class="eqn">BB.6</div></div>
+
+<div class="warn">
+  <span class="klabel">BB.3.2 提示</span>
+  <p>功率计因传感器面积限制与表面有限距离可能无法采集总功率，<strong>导致对光损耗的高估</strong>，需确定矫正系数。</p>
+  <p><strong>单位换算</strong>：X dB 光损耗 = 透过比例 10<sup>−X/10</sup>。40 dB 即万分之一，60 dB 即百万分之一。<strong>1 OD = 10 dB。</strong></p>
+</div>
+
+<p><strong>孔径面积设计</strong>：按 <code>S_apB/S_apA = I_B/I_A</code>，3.5 dB → 面积比 0.447。</p>
+
+<div class="note"><p><strong>采购</strong>：可购买符合 IEC 80601-2-71 的商品体模（如 BioPixS fNIRS Phantom，含 ≥ 60 dB 加装件）。<strong>采购时须问清是否附带各状态的认证光损耗数据/参考值</strong>——若附带可省去自建参考系统。</p></div>
+
+<h3>3.2　遮光</h3>
+
+<div class="warn">
+  <span class="klabel">关键</span>
+  <p>状态 A 衰减 40~60 dB，真实信号只剩万分之一到百万分之一，<strong>任何绕过体模的漏光都会完全淹没有效信号</strong>。</p>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>部位</th><th>要求</th></tr></thead>
+<tbody>
+<tr><td>探头与体模贴合面</td><td>完全遮光，黑色遮光垫圈</td></tr>
+<tr><td>体模四周</td><td>全封闭，防侧向绕射</td></tr>
+<tr><td>整体</td><td>置于遮光箱内</td></tr>
+<tr><td><strong>验证</strong></td><td><strong>§2.2 的 <span class="cid cid-r">R4</span> 必须先通过</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>3.3　参考系统（图 BB.2）</h3>
+
+<div class="flow">[稳定光源 13] → [发射探头 2] → [体模 8（含可变孔径 9）] → [校准功率计 14]</div>
+
+<blockquote><p><strong>BB.3.1 原文：</strong>「需要评估产生状态 A 和状态 B 的功能性近红外光谱体模以及能够测量参考光强度变化的参考系统来执行这些程序。<strong>该参考系统由一个稳定的光源和一个校准的功率计组成。</strong>」</p></blockquote>
+
+<h4>LED 集成探头的适配</h4>
+
+<div class="keystone">
+  <span class="klabel">必读</span>
+  <p>图 BB.2 中稳定光源经光纤注入发射探头。<strong>本设备为 LED 集成探头，外部光注不进去。</strong></p>
+  <p><strong>适配方案：用设备自己的 LED 作源（逐个点亮），校准功率计放在接收探头位置。</strong></p>
+  <p><strong>理由</strong>：BB.2 只用 I<sub>A</sub>/I<sub>B</sub> 的<strong>比值</strong>，同波长取比值时光源输出与功率计波长响应度均自动约掉；被独立验证的是<strong>探测链</strong>，正是本试验要检的部分。此适配须写进方案并说明理由。</p>
+</div>
+
+<div class="tw">
+<table>
+<thead><tr><th>对参考系统的要求</th><th>为什么</th></tr></thead>
+<tbody>
+<tr><td>光源在 A、B 两次测量间<strong>稳定</strong></td><td>漂移直接进入比值</td></tr>
+<tr><td>功率计<strong>线性</strong>、在有效校准期内</td><td>需跨 nW~mW 多个数量级</td></tr>
+<tr><td>校准证书可溯源</td><td>送检必需，仪器编号与证书号须写入试验记录</td></tr>
+</tbody>
+</table>
+</div>
+
+
+<!-- ══ 4 ══ -->
+<h2 id="s4"><span class="num">4</span>【101.5】路径长度依赖的血红蛋白变化量</h2>
+
+<blockquote><p><strong>101.5 全文：</strong>「应对路径长度依赖的血红蛋白变化量进行测量并在使用说明书中给出。通过检查使用说明书和<strong>附录 BB 中描述的试验</strong>来检验是否符合要求。」</p></blockquote>
+
+<h3>4.1　原理</h3>
+
+<blockquote><p><strong>BB.3.1 原文：</strong>「通过改变光学孔径面积来改变透射光强，<strong>相当于改变了整个功能性近红外光谱体模的吸收系数 μ<sub>a</sub></strong>。孔径面积的比值 (S<sub>apB</sub>/S<sub>apA</sub>) 表示透射光强的比值 (I<sub>B</sub>/I<sub>A</sub>)。光的方向性丢失是由于在光学孔径的<strong>前后放置了足够厚的散射和吸收材料</strong>，导致 S<sub>apB</sub>/S<sub>apA</sub> 等于 I<sub>B</sub>/I<sub>A</sub>。」</p></blockquote>
+
+<div class="fml"><div class="fbody"><span class="frac"><span class="n">S<sub>apB</sub></span><span class="d">S<sub>apA</sub></span></span> = <span class="frac"><span class="n">I<sub>B</sub></span><span class="d">I<sub>A</sub></span></span></div><div class="eqn">BB.3.1</div></div>
+
+<div class="keystone">
+  <p><strong>孔径面积比精确等于透射光强比——几何即溯源，不需要体模的任何光学属性</strong>（μ<sub>a</sub>、μs′、厚度、折射率均不需要）。</p>
+</div>
+
+<div class="note">
+  <p>孔径改变的是几何遮挡，<strong>并未改变体模材料的 μ<sub>a</sub></strong>。但设备只能看到探测光强 I，无法区分「介质吸收变强」与「一部分光被挡住」，二者产生的 ΔA 完全相同。故标准称其「<strong>相当于</strong>改变了吸收系数」——这是<strong>等效</strong>，不是物理改变。</p>
+  <p>与真实组织的差别：真实 μ<sub>a</sub> 变化时有效光程 L 也会微变；孔径变化时 <strong>L 完全恒定</strong>。因此本试验是对反演链路更「干净」的检验。</p>
+</div>
+
+<h3>4.2　公式（附录 BB 原文）</h3>
+
+<div class="fml"><div class="fbody"><span class="frac"><span class="n">I<sub>B</sub>(λ<sub>i</sub>)</span><span class="d">I<sub>A</sub>(λ<sub>i</sub>)</span></span> = exp[ −Δμ<sub>a</sub>(λ<sub>i</sub>) · L(λ<sub>i</sub>) ]</div><div class="eqn">BB.1</div></div>
+
+<div class="fml"><div class="fbody">ΔA(λ<sub>i</sub>) = log<sub>10</sub> [ I<sub>A</sub>(λ<sub>i</sub>) / I<sub>B</sub>(λ<sub>i</sub>) ]</div><div class="eqn">BB.2</div></div>
+
+<div class="note">
+  <p>原始定义为 A = log₁₀(I₀/I)，但入射光强 I₀ 无法测量。<strong>取两状态之差后 I₀ 约掉</strong>——这正是 MBLL 能在不知入射光强下工作的原因，也是它只能给变化量的原因。</p>
+  <p>ΔA &gt; 0 表示光变暗（吸收增加），设备解读为浓度上升。</p>
+</div>
+
+<div class="fml"><div class="fbody">ΔA(λ<sub>i</sub>) = ε<sub>O₂Hb</sub>(λ<sub>i</sub>) · Δc<sub>O₂Hb</sub> · L + ε<sub>HHb</sub>(λ<sub>i</sub>) · Δc<sub>HHb</sub> · L</div><div class="eqn">BB.3</div></div>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">符号</th><th>含义</th><th class="nowrap">单位</th></tr></thead>
+<tbody>
+<tr><td class="num-col">ΔA(λᵢ)</td><td>波长 λᵢ 处的衰减变化</td><td class="num-col">OD</td></tr>
+<tr><td class="num-col">ε</td><td>摩尔（十进）消光系数</td><td class="num-col">M⁻¹·cm⁻¹ 或 L/(mmol·cm)</td></tr>
+<tr><td class="num-col"><strong>Δc·L</strong></td><td><strong>被测量</strong></td><td class="num-col">M·cm，或 (mmol/L)·mm</td></tr>
+<tr><td class="num-col">L</td><td>平均光程，<strong>假设值，不验证</strong></td><td class="num-col">cm</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="fml"><div class="fbody">Δc<sub>O₂Hb</sub> · L =
+<span class="frac"><span class="n">ε<sub>HHb</sub>(λ₂)ΔA(λ₁) − ε<sub>HHb</sub>(λ₁)ΔA(λ₂)</span><span class="d">ε<sub>O₂Hb</sub>(λ₁)ε<sub>HHb</sub>(λ₂) − ε<sub>O₂Hb</sub>(λ₂)ε<sub>HHb</sub>(λ₁)</span></span></div><div class="eqn">BB.4</div></div>
+
+<h3>4.3　⚠️ BB.5 印刷有误 —— 实施时必须更正</h3>
+
+<div class="keystone">
+  <span class="klabel">实测确认</span>
+  <p><strong>标准原文 BB.5 的分子两项次序颠倒，直接实现会使 Δc<sub>HHb</sub>·L 反号。</strong></p>
+</div>
+
+<p>用标准自身的算例（BB.3.1，λ₁ = 690 nm、λ₂ = 830 nm、ΔA = log₁₀2 = 0.3010）复核：</p>
+
+<div class="tw">
+<table>
+<thead><tr><th></th><th class="nowrap">Δc<sub>O₂Hb</sub>·L</th><th class="nowrap">Δc<sub>HHb</sub>·L</th></tr></thead>
+<tbody>
+<tr><td><strong>标准给出的答案</strong></td><td class="num-col">204 μmol/L·cm</td><td class="num-col"><strong>111</strong>（注 1：均为阳性）</td></tr>
+<tr><td>BB.4 复算</td><td class="num-col"><strong>204.1</strong> <span class="ok">✓</span></td><td class="no">—</td></tr>
+<tr><td><strong>BB.5 按原文实现</strong></td><td class="no">—</td><td class="num-col"><strong>−111.0</strong> <span class="bad">✗ 反号</span></td></tr>
+<tr><td>BB.5 按克拉默法则</td><td class="no">—</td><td class="num-col"><strong>+111.0</strong> <span class="ok">✓</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>正确形式</strong>：</p>
+
+<div class="fml"><div class="fbody">Δc<sub>HHb</sub> · L =
+<span class="frac"><span class="n">ε<sub>O₂Hb</sub>(λ₁)ΔA(λ₂) − ε<sub>O₂Hb</sub>(λ₂)ΔA(λ₁)</span><span class="d">ε<sub>O₂Hb</sub>(λ₁)ε<sub>HHb</sub>(λ₂) − ε<sub>O₂Hb</sub>(λ₂)ε<sub>HHb</sub>(λ₁)</span></span></div><div class="eqn">BB.5 更正</div></div>
+
+<div class="note"><p>GB 前言已声明修正过 IEC 的另一处公式错误（101.8 的 δS），<strong>这一处未修正</strong>。</p>
+<p><strong>规避方法：直接用 x = pinv(E)·ΔA，天然正确，无需处理符号。</strong></p></div>
+
+<h3>4.4　五波长求解</h3>
+
+<div class="fml"><div class="fbody">ΔA = E · x　　　　x = pinv(E) · ΔA</div><div class="eqn">BB.4/.5 推广</div></div>
+
+<p><strong>E</strong> 为 5×2 消光系数矩阵（<strong>不含光程</strong>——L 已包含在未知数 x = Δc·L 中）。超定，取最小二乘解。</p>
+
+<p>实测 <code>cond(E) = 3.58</code>（奇异值 3232.9 / 902.6），条件数小，五波长冗余良好。单波长 +1% 增益误差 → Δc 误差约 <strong>1.06%</strong>，不放大。</p>
+
+<div class="note"><p>五个波长在最小二乘中<strong>等权</strong>，某个波长信噪比差会直接污染解——故须做判据 <span class="cid cid-a">A2</span> 的波长一致性检查。</p></div>
+
+<h3>4.5　本项目参考值</h3>
+
+<p>灰变化（五波长 ΔA 相等）下按 BB.2~BB.5 计算：</p>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">衰减增加</th><th class="nowrap">ΔA (OD)</th><th class="nowrap">Δc<sub>O₂Hb</sub>·L</th><th class="nowrap">Δc<sub>HHb</sub>·L</th></tr></thead>
+<tbody>
+<tr><td class="num-col">3.0 dB</td><td class="num-col">0.3000</td><td class="num-col"><strong>+198.2</strong> μmol/L·cm</td><td class="num-col"><strong>+125.7</strong> μmol/L·cm</td></tr>
+<tr><td class="num-col"><strong>3.5 dB</strong></td><td class="num-col">0.3500</td><td class="num-col"><strong>+231.3</strong></td><td class="num-col"><strong>+146.6</strong></td></tr>
+<tr><td class="num-col">4.0 dB</td><td class="num-col">0.4000</td><td class="num-col">+264.3</td><td class="num-col">+167.6</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>分别 = 1.98/1.26、2.31/1.47、2.64/1.68 (mmol/L)·mm。</p>
+
+<div class="warn"><p>上表为<strong>理论参考值</strong>，实际以参考系统实测的 I<sub>A</sub>、I<sub>B</sub> 为准。若实测五波长 ΔA 不完全相等，须逐波长代入求解。</p>
+<p><strong>BB.1 总则原文：</strong>「功能性近红外光谱设备的制造商并不使用相同的波长……因此，<strong>不同制造商的路径长度依赖的血红蛋白变化量的参考值可能不同</strong>。」</p></div>
+
+<h3>4.6　步骤</h3>
+
+<div class="flow">前置    1. 完成 §2 全部前置条件（R1、R2、R4，101.3 峰值波长）
+        2. 按 §2.4 选定并记录探头组合
+        3. 按 §3 搭建体模与遮光
+
+参考侧  4. 体模、光源、探测器固定在遮光箱内，位置一经确定全程不动
+（BB.2）5. 光源预热至稳定，记录 15 min 输出波动
+        6. 孔径置状态 A，逐波长测 I_A，重复 N≥10 次取均值
+        7. 孔径切状态 B，测 I_B，同样 N≥10 次（切孔径时不要碰体模和探测器）
+        8. 切回 A 再测一次（回差检查），与第 6 步差 >1% 则本轮作废
+        9. 整个 A→B→A 循环重复 ≥3 次
+       10. 按 BB.2 算 ΔA_ref，按 §4.4 算 x_ref
+
+设备侧 11. 同一块体模、同一位置，只把光源与功率计换成设备的两个探头
+（BB.3）12. 孔径 A→B→A，各采集 ≥60 s，切换时刻打事件标记
+       13. 重复 ≥5 次
+       14. 去掉切换后过渡段（前 10 s），取稳定段均值得 I_A、I_B
+       15. 按完全相同的公式与 E 矩阵算 x_dev
+
+比较   16. 计算相对偏差，判 A1~A4</div>
+
+<div class="warn">
+  <span class="klabel">三条不可违反</span>
+  <p><strong>不要用在线管线跑此试验。</strong><code>intensities_to_od_changes</code> 在 <code>refs=None</code> 时用本段时间均值做参考，因果模式下用热身窗冻结基线，<strong>两者都不是「状态 A 相对状态 B」</strong>；带通滤波还会削掉阶跃。<strong>应记录原始光强后离线计算。</strong></p>
+  <p><strong>量纲统一</strong>：<code>generalized_mbll</code> 中 <code>a_hb = hb_ex * pathlength[:,None]</code>，会除以 <code>pathlength = DPF × distance_cm</code> 输出摩尔浓度 Δc（μM）；而标准的被测量是 <strong>Δc·L</strong>。见 §8 的规避方法。</p>
+  <p><strong>ε 与波长必须两侧一致</strong>：参考侧与设备侧须用同一份消光系数表和同一组（101.3 实测的）峰值波长。</p>
+</div>
+
+<h3>4.7　判据</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">序号</th><th>判据</th><th class="nowrap">出处</th></tr></thead>
+<tbody>
+<tr><td><span class="cid cid-a">A1</span></td><td><strong>设备值与参考值的差值 &lt; 5%</strong>（<span class="hbo">HbO</span>、<span class="hbr">HbR</span> 各算一个，均须合格）</td><td><strong>BB.3.1<br>规范性</strong></td></tr>
+<tr><td><span class="cid cid-a">A2</span></td><td>五波长实测 ΔA(λ) 与参考值的逐波长偏差 ≤ 10%（<strong>波长间增益一致性</strong>）</td><td class="no">自定</td></tr>
+<tr><td><span class="cid cid-a">A3</span></td><td><span class="hbo">ΔHbO·L</span> 与 <span class="hbr">ΔHbR·L</span> <strong>同向</strong>；A→B 双双为正，B→A 双双为负</td><td>BB.3.1 注 1</td></tr>
+<tr><td><span class="cid cid-a">A4</span></td><td>5 次重复的 CV ≤ 10%</td><td class="no">自定</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>顺带校验（记录在案，反映体模质量）</h4>
+
+<div class="tw">
+<table>
+<thead><tr><th>校验</th><th class="nowrap">判据</th><th>意义</th></tr></thead>
+<tbody>
+<tr><td>五波长 ΔA<sub>ref</sub> 一致性</td><td class="num-col">CV ≤ 1%</td><td>孔径为几何机制，各波长应相同；偏差反映漫化是否充分</td></tr>
+<tr><td>ΔA 均值 vs log₁₀(孔径面积比)</td><td class="num-col">差 ≤ 5%</td><td>核对 BB.3.1 的几何溯源关系成立</td></tr>
+<tr><td>回差（A→B→A）</td><td class="num-col">≤ 1%</td><td>光源稳定性</td></tr>
+</tbody>
+</table>
+</div>
+
+
+<!-- ══ 5 ══ -->
+<h2 id="s5"><span class="num">5</span>【101.6】信号稳定性</h2>
+
+<p><strong>装置</strong>：发射探头 →〔衰减器 6〕→ 接收探头（图 201.104）。</p>
+
+<blockquote><p><strong>101.6 b) 原文：</strong>「衰减器由<strong>滤光片</strong>或散射、吸收的衰减材料制成，对<strong>每一适用波长</strong>有大于 40 dB 的光损耗。光损耗是预先用<strong>光功率计</strong>测量的，或者，<strong>如果是滤光片，则用分光光度计测量</strong>。」</p></blockquote>
+
+<p><strong>步骤</strong>：c) 充分预热 → d) <strong>功率设为最大</strong> → e) <strong>连续采集 &gt; 15 min</strong>，用<strong>时间常数 &lt; 5 s 的低通滤波器</strong>处理 → f) 针对氧合与脱氧血红蛋白分别计算。</p>
+
+<div class="fml"><div class="fbody">S<sub>stab</sub> = <span class="rad">√<span class="frac"><span class="n">Σ<sub>j=1..k</sub> { (Δc·L)<sub>j</sub> − <span style="text-decoration:overline">Δc·L</span> }²</span><span class="d">k − 1</span></span></span></div><div class="eqn">公式 2</div></div>
+
+<p>k 为时间序列中样本的个数。<strong>即 Δc·L 时间序列的样本标准差</strong>——衰减器全程不变，测的是设备自身的漂移与噪声。</p>
+
+<blockquote><p><strong>原文注：</strong>「Δc·L 与基线样本的变化有关，而与衰减的变化无关。」</p></blockquote>
+
+<p><strong>取氧合与脱氧血红蛋白两者中 S<sub>stab</sub> 的较大值作为信号稳定性。</strong></p>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">序号</th><th>判据</th></tr></thead>
+<tbody>
+<tr><td><span class="cid cid-b">B1</span></td><td>测量 S<sub>stab</sub> 并<strong>在使用说明书中给出</strong>（标准不设限值）</td></tr>
+</tbody>
+</table>
+</div>
+
+
+<!-- ══ 6 ══ -->
+<h2 id="s6"><span class="num">6</span>【101.7】响应时间</h2>
+
+<p><strong>装置</strong>：发射探头 →〔衰减器｜<strong>光学快门</strong>｜衰减器〕→ 接收探头（图 201.105）。快门关闭时光损耗无穷大，开启时 &gt; 40 dB。</p>
+
+<div class="warn"><p><strong>快门切换时间应小于 ME 设备的响应时间</strong>（GB 版新增，201.12.1.107）。</p></div>
+
+<p><strong>方法</strong>：测快门切换引起的 Δc·L 阶跃响应，取幅度在 <strong>10% 与 90% 之间</strong>的时间间隔（图 201.106）。</p>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">序号</th><th>判据</th></tr></thead>
+<tbody>
+<tr><td><span class="cid cid-c">C1</span></td><td>测量响应时间（上升时间／下降时间）并在使用说明书中给出</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="warn"><p><strong>当前配对采样率约 1 Hz</strong>，时间分辨率 1000 ms；且 <code>BP_HIGH_HZ = 0.1</code> 的带通会进一步拖慢阶跃。<strong>按实测值如实报告。</strong></p></div>
+
+
+<!-- ══ 7 ══ -->
+<h2 id="s7"><span class="num">7</span>【101.8】信噪比</h2>
+
+<p><strong>装置</strong>：ME 设备 + 一个光学孔径 + 两个衰减器（图 201.107）。</p>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">状态</th><th>光损耗</th></tr></thead>
+<tbody>
+<tr><td>A</td><td><strong>&gt; 60 dB</strong></td></tr>
+<tr><td>B</td><td>比 A <strong>大 3~4 dB</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<p><strong>步骤</strong>：c) <strong>ME 设备处于最高采样率</strong>；信号变化应进行 <strong>≥ 4 次重复测量</strong>，每次包括 <strong>≥ 10 个采样点</strong>。</p>
+
+<div class="fml"><div class="fbody">S<sub>A</sub> = <span style="text-decoration:overline">Δc·L<sub>A</sub></span> = <span class="frac"><span class="n">Σ<sub>j=1..m</sub> (Δc·L)<sub>j,A</sub></span><span class="d">m</span></span>　　　S = S<sub>A</sub> − S<sub>B</sub></div><div class="eqn">公式 4</div></div>
+
+<div class="fml"><div class="fbody">δS = <span class="rad">√<span class="frac"><span class="n">Σ<sub>i=1..n</sub> ( Σ<sub>j=1..m</sub> { (Δc·L)<sub>j,A</sub> − <span style="text-decoration:overline">Δc·L<sub>A</sub></span> }² )</span><span class="d">m · n − 1</span></span></span>　　信噪比 = S / δS</div><div class="eqn">公式 3</div></div>
+
+<p>m 为采样事件数（≥ 10），n 为重复次数（≥ 4）。</p>
+
+<div class="warn">
+  <p><strong>必须使用 GB 版公式。</strong>GB 9706.271 前言载明：「更改了信噪比中标准差 δS 的计算公式（见 201.12.1.101.8），<strong>国际标准公式编辑错误，对其进行更正</strong>」。</p>
+  <p><strong>注意本项为「自比」结构</strong>：(Δc·L) 全部来自 ME 设备自身输出，功率计不参与，检的是响应的稳定性与可重复性。</p>
+</div>
+
+<p><strong>101.8 e)</strong>：通过测量得到路径长度依赖的血红蛋白变化量、路径长度依赖的<strong>氧合</strong>血红蛋白变化量和路径长度依赖的<strong>脱氧</strong>血红蛋白变化量。</p>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">序号</th><th>判据</th></tr></thead>
+<tbody>
+<tr><td><span class="cid cid-d">D1</span></td><td>测量信噪比并在使用说明书中给出</td></tr>
+<tr><td><span class="cid cid-d">D2</span></td><td><strong>同时声称最大采样率</strong>（标准强制）</td></tr>
+</tbody>
+</table>
+</div>
+
+
+<!-- ══ 8 ══ -->
+<h2 id="s8"><span class="num">8</span>离线核验工具</h2>
+
+<div class="keystone">
+  <span class="klabel">只能离线</span>
+  <p>附录 BB 的流程本身就是两阶段（参考系统先测 → 设备后测 → 比较），参考侧还是功率计人工读数，不存在在线通路。101.6/.7/.8 同理：<strong>采集在线</strong>（101.8 还要求最高采样率），<strong>计算全部离线</strong>。</p>
+</div>
+
+<h3>8.1　不需要重写算法</h3>
+
+<p>项目里两个函数本身就是标准公式，只要传对参数：</p>
+
+<div class="flow">ΔA = intensities_to_od_changes(I_B.reshape(-1,1), refs=I_A)   # = BB.2
+x  = generalized_mbll(ΔA, WL, dpfs=[1.0]*5, distance_cm=1.0)  # = BB.3~BB.5</div>
+
+<p>实测与独立 numpy 实现差 <strong>0.000e+00</strong>（ΔA 和 Δc·L 都是）。</p>
+
+<div class="warn">
+  <span class="klabel">关键参数 dpfs=1, distance_cm=1</span>
+  <p><code>a_hb = hb_ex * pathlength[:,None]</code>，pathlength = DPF × d。令其为 1 时 <code>a_hb</code> 退化为纯 ε 矩阵，输出即标准的被测量 <strong>Δc·L</strong>，而非除过光程的 Δc。</p>
+  <p><strong>不能用实际 DPF 再乘回去换算</strong>——DPF 随波长变（15.44~18.68 cm），改变了最小二乘的加权，<strong>没有任何单一 L 能同时对上两条</strong>：用 850nm 的 15.44 cm 换算，HbO 偏 +4.22%、HbR 偏 <strong>−28.62%</strong>。</p>
+</div>
+
+<h3>8.2　组件取舍</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>组件</th><th class="nowrap">能否用</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td><code>intensities_to_od_changes(refs=I_A)</code></td><td><span class="ok">✓</span></td><td>传显式 refs 就是 BB.2</td></tr>
+<tr><td><code>intensities_to_od_changes(refs=None)</code></td><td><span class="bad">✗</span></td><td>会用<strong>本段时间均值</strong>做基线，不是「A 相对 B」</td></tr>
+<tr><td><code>generalized_mbll</code></td><td><span class="ok">✓</span></td><td>传 dpf=1, d=1</td></tr>
+<tr><td><code>hemoglobin_extinctions</code></td><td><span class="ok">✓</span></td><td>ε 表</td></tr>
+<tr><td><code>prepare_interleaved_dataframe</code></td><td><span class="ok">✓</span></td><td>只做配对重排</td></tr>
+<tr><td><code>smart_bandpass</code></td><td><span class="bad">✗</span></td><td>0.01~0.1 Hz 带通会把阶跃削掉</td></tr>
+<tr><td><code>compute_all_channel_concentrations</code></td><td><span class="bad">✗</span></td><td>内含带通 + 自动基线</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>8.3　交叉核对（必做）</h3>
+
+<div class="warn">
+  <p>参考侧和设备侧若都调同一个 <code>generalized_mbll</code>，<strong>反演代码里的 bug 会两边抵消</strong>，5% 判据对它是盲的。</p>
+  <p><strong>堵法</strong>：参考侧的 Δc·L 算两遍——一遍用项目函数，一遍用独立实现。一致就说明反演无误，之后放心两边都用项目函数。</p>
+  <p>这样 <strong>5% 判据检光强测量链，交叉核对检反演实现</strong>，两个洞都堵上。</p>
+</div>
+
+<h3>8.4　脚本</h3>
+
+<p><code>tools/verify_bb.py</code> 已实现上述全部内容。</p>
+
+<div class="flow">python tools/verify_bb.py --selftest
+
+python tools/verify_bb.py --ref ref.csv \
+    --raw result_table/xxx/all_groups.csv \
+    --acq-channel 2 --detector S1_D1 \
+    --seg-a 30:90 --seg-b 130:190 \
+    --aperture-ratio 0.447</div>
+
+<p>参考侧 CSV 三列：<code>wavelength_nm,I_A,I_B</code>，五行。输出 BB.2 的 ΔA、五波长一致性、孔径几何校验、反演交叉核对、Δc·L 参考值/设备值、A1~A4 判据。退出码 0/1。</p>
+
+<div class="note">
+  <p><strong>自检含元测试</strong>：850 nm 人为加 8% 增益偏差 → <span class="cid cid-a">A1</span> 判 FAIL（HbO 10.05%、HbR 5.64%）；无偏差时全 PASS。证明判据会咬。</p>
+  <p>由此反推：<strong>单波长增益一致性需优于约 4%</strong> 才能稳过 <span class="cid cid-a">A1</span>。建议整定增益时按此卡。</p>
+</div>
+
+
+<!-- ══ 9 ══ -->
+<h2 id="s9"><span class="num">9</span>记录与报告</h2>
+
+<h3>9.1　每次试验记录</h3>
+
+<ul>
+<li><strong>探头组合</strong>（§2.4 表格，强制）</li>
+<li><strong>参考系统的仪器编号与校准证书号</strong></li>
+<li>原始光强（<code>all_groups.csv</code>）、配对光强（<code>interleaved_output_ch{n}.csv</code>）、浓度输出（<code>processed_output_ch{n}.csv</code>）</li>
+<li>试验条件：环境温湿度、体模状态与实测光损耗、各探测器增益档</li>
+<li><strong>事件时间标记</strong>：孔径切换、快门动作时刻</li>
+<li>101.3 实测峰值波长与所用 ε 取值</li>
+</ul>
+
+<h3>9.2　报告应给出</h3>
+
+<p>1. 各判据（<span class="cid cid-r">R1</span>~<span class="cid cid-r">R2</span>、<span class="cid cid-r">R4</span>、<span class="cid cid-a">A1</span>~<span class="cid cid-a">A4</span>、<span class="cid cid-b">B1</span>、<span class="cid cid-c">C1</span>、<span class="cid cid-d">D1</span>~<span class="cid cid-d">D2</span>）的实测值与通过／不通过结论　　2. 全部曲线图</p>
+
+<div class="keystone">
+  <span class="klabel">3 · 测量量的定义与假设声明（必写）</span>
+  <p>本方法验证路径长度依赖的血红蛋白变化量 Δc·L 的幅度准确度。<strong>平均光程 L 为假设值</strong>（DPF 公式与年龄参数已在说明书披露），<strong>不在本试验验证范围内</strong>。</p>
+</div>
+
+<div class="keystone">
+  <span class="klabel">4 · 验证边界声明（必写）</span>
+  <p>本试验采用 GB 9706.271—2022 附录 BB 的变孔径体模。该体模产生的光强变化在各波长上相同，据 BB.3.1 注 1，解出的 Δc<sub>O₂Hb</sub>·L 与 Δc<sub>HHb</sub>·L <strong>同号</strong>；据注 3，其大小与方向<strong>与人体脑激活不同</strong>。本试验验证的是设备对已知光强变化的<strong>数值准确度</strong>（&lt; 5%），不涵盖生理条件下的方向性。</p>
+</div>
+
+<div class="keystone">
+  <span class="klabel">5 · BB.5 更正说明（必写）</span>
+  <p>计算中 Δc<sub>HHb</sub>·L 采用克拉默法则形式（等价于 pinv 最小二乘解）。GB 9706.271—2022 公式 BB.5 印刷的分子两项次序与其自身算例（BB.3.1，结果 +111 μmol/L·cm，注 1 载明「均为阳性」）不符，直接实现会导致符号相反。</p>
+</div>
+
+<p>6. <strong>参考系统适配说明</strong>（若采用 §3.3 的 LED 适配方案，必写）</p>
+
+
+<!-- ══ 附 A ══ -->
+<h2 id="a1">附 A：公式汇总</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">#</th><th>公式</th><th class="nowrap">出处</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td>1</td><td class="num-col">S<sub>apB</sub>/S<sub>apA</sub> = I<sub>B</sub>/I<sub>A</sub></td><td class="num-col">BB.3.1</td><td>孔径面积比 = 光强比，溯源基础</td></tr>
+<tr><td>2</td><td class="num-col">I<sub>B</sub>/I<sub>A</sub> = exp[−Δμ<sub>a</sub>·L]</td><td class="num-col">BB.1</td><td>修正比尔-朗伯的指数形式</td></tr>
+<tr><td>3</td><td class="num-col">ΔA(λ) = log₁₀[I<sub>A</sub>/I<sub>B</sub>]</td><td class="num-col">BB.2</td><td>衰减变化定义（I₀ 在此约掉）</td></tr>
+<tr><td>4</td><td class="num-col">ΔA = ε<sub>O₂Hb</sub>·Δc<sub>O₂Hb</sub>·L + ε<sub>HHb</sub>·Δc<sub>HHb</sub>·L</td><td class="num-col">BB.3</td><td>MBLL 展开</td></tr>
+<tr><td>5</td><td class="num-col">Δc<sub>O₂Hb</sub>·L 闭式解</td><td class="num-col">BB.4</td><td>双波长解</td></tr>
+<tr><td>6</td><td class="num-col">Δc<sub>HHb</sub>·L 闭式解 <strong class="bad">⚠ 原文有误</strong></td><td class="num-col">BB.5</td><td>见 §4.3</td></tr>
+<tr><td>7</td><td class="num-col">x = pinv(E)·ΔA</td><td class="num-col">BB.4/.5 推广</td><td><strong>五波长最小二乘解（推荐，天然正确）</strong></td></tr>
+<tr><td>8</td><td class="num-col">OL = P<sub>ex,total</sub>/P<sub>in</sub>，OL<sub>dB</sub> = 10log₁₀(OL)</td><td class="num-col">BB.6</td><td>光损耗</td></tr>
+<tr><td>9</td><td class="num-col">S<sub>stab</sub> = √[Σ(Δc·L − mean)²/(k−1)]</td><td class="num-col">公式 2</td><td>信号稳定性</td></tr>
+<tr><td>10</td><td class="num-col">δS、S = S<sub>A</sub> − S<sub>B</sub>、SNR = S/δS</td><td class="num-col">公式 3、4</td><td>信噪比（<strong>用 GB 版</strong>）</td></tr>
+<tr><td>11</td><td class="num-col">P<sub>av</sub> = P<sub>peak</sub> × τ × f</td><td class="num-col">公式 1</td><td>脉冲平均光功率</td></tr>
+<tr><td>—</td><td class="num-col">X dB 光损耗 = 10<sup>−X/10</sup>；1 OD = 10 dB</td><td class="num-col">3.209</td><td>单位换算</td></tr>
+</tbody>
+</table>
+</div>
+
+
+<!-- ══ 附 B ══ -->
+<h2 id="a2">附 B：判据编号索引</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">编号</th><th>所属</th><th class="nowrap">性质</th></tr></thead>
+<tbody>
+<tr><td><span class="cid cid-r">R1</span> <span class="cid cid-r">R2</span></td><td>§2.1 增益整定与饱和排查</td><td class="no">前置条件，自定</td></tr>
+<tr><td><span class="cid cid-r">R4</span></td><td>§2.2 遮光验证</td><td class="no">前置条件，自定</td></tr>
+<tr><td><span class="cid cid-a">A1</span></td><td>§4.7 血红蛋白变化量（101.5）</td><td><strong>规范性，&lt; 5%</strong></td></tr>
+<tr><td><span class="cid cid-a">A2</span>~<span class="cid cid-a">A4</span></td><td>§4.7</td><td class="no">自定</td></tr>
+<tr><td><span class="cid cid-b">B1</span></td><td>§5 信号稳定性（101.6）</td><td>声称项</td></tr>
+<tr><td><span class="cid cid-c">C1</span></td><td>§6 响应时间（101.7）</td><td>声称项</td></tr>
+<tr><td><span class="cid cid-d">D1</span> <span class="cid cid-d">D2</span></td><td>§7 信噪比（101.8）</td><td>声称项</td></tr>
+</tbody>
+</table>
+</div>
+
+
+<!-- ══ 附 C ══ -->
+<h2 id="a3">附 C：出处</h2>
+
+<h3>标准原文</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>内容</th><th class="nowrap">出处</th></tr></thead>
+<tbody>
+<tr><td>探头组合的选择与记录</td><td class="num-col">GB 9706.271—2022 <strong>201.12.1.101.1</strong></td></tr>
+<tr><td>平均光功率、峰值波长、FWHM；公式 1</td><td class="num-col"><strong>101.2 / .3 / .4</strong>，图 201.102、201.103</td></tr>
+<tr><td>血红蛋白变化量试验（全文指向附录 BB）</td><td class="num-col"><strong>201.12.1.101.5</strong></td></tr>
+<tr><td>Δc·L 为官方测量量、L 不可单独测得、BB.1~BB.5</td><td class="num-col"><strong>附录 BB.2</strong>（规范性）</td></tr>
+<tr><td>透射法的理由、孔径面积比关系、参考系统组成、<strong>&lt; 5% 判据</strong>、算例与注 1／注 3</td><td class="num-col"><strong>附录 BB.3.1</strong>，图 201.BB.1、BB.2、BB.3</td></tr>
+<tr><td>光损耗测量、40/60 dB、3~4 dB、8 mm 出口孔径、BB.6</td><td class="num-col"><strong>附录 BB.3.2</strong></td></tr>
+<tr><td>信号稳定性与公式 2；衰减器可为滤光片、用分光光度计测</td><td class="num-col"><strong>201.12.1.101.6</strong>，图 201.104</td></tr>
+<tr><td>响应时间与 10%~90% 定义</td><td class="num-col"><strong>201.12.1.101.7</strong>，图 201.105、201.106</td></tr>
+<tr><td>快门切换时间要求（GB 版新增）</td><td class="num-col"><strong>201.12.1.107</strong></td></tr>
+<tr><td>信噪比与公式 3、4（GB 版已更正国际标准的编辑错误）</td><td class="num-col"><strong>201.12.1.101.8</strong>，图 201.107</td></tr>
+<tr><td>体模／衰减器的光损耗要求汇总</td><td class="num-col"><strong>表 201.101</strong></td></tr>
+<tr><td>光损耗定义（X dB = 10<sup>−X/10</sup>，用光功率计测量）</td><td class="num-col">GB/T 44423—2024 <strong>3.7</strong></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>参考资料</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>内容</th><th class="nowrap">出处</th></tr></thead>
+<tbody>
+<tr><td>符合 IEC 80601-2-71 的商品体模</td><td><a href="https://biopixstandards.com/products/fnirs-phantom/">BioPixS fNIRS Phantom</a></td></tr>
+<tr><td>体模实现与使用（滑动条式可变孔径原型）</td><td><a href="https://pmc.ncbi.nlm.nih.gov/articles/PMC12680081/">PMC12680081</a></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>本项目实测</h3>
+
+<div class="tw">
+<table>
+<thead><tr><th>内容</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>长距饱和（std/mean = 0.00043）</td><td class="num-col"><code>result_table/2026-07-16_15-52-29</code>，ch2</td></tr>
+<tr><td>§4.3 BB.5 符号核验、§4.5 五波长参考值、cond(E) = 3.58</td><td>以 <code>tables/wray.csv</code> 与 <code>get_dpf()</code> 实算</td></tr>
+<tr><td>两通道结构（ch1 / ch2 与探测器、波长正交）</td><td class="num-col"><code>config.py:205</code> <code>ACQUISITION_CHANNELS</code></td></tr>
+<tr><td>§8 的组件取舍与 dpf=1 等价性</td><td class="num-col"><code>tools/verify_bb.py --selftest</code></td></tr>
+</tbody>
+</table>
+</div>
+
+
+<!-- ══ 附 D ══ -->
+<h2 id="a4">附 D：实施注意事项</h2>
+
+<div class="tw">
+<table>
+<thead><tr><th class="nowrap">#</th><th>事项</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><strong>§2.4 的三个同步问题必须先确认</strong>，尤其第 2 条（能否只点 ch1 光源），它决定走跨通道还是做分体工装</td></tr>
+<tr><td>2</td><td><strong>§2.1 增益整定是所有硬件试验的前提</strong>。当前长距 std/mean = 0.00043 属饱和，此时下游读数全部无效</td></tr>
+<tr><td>3</td><td><strong>各探测器须支持独立增益档位</strong>——101.5 的 &gt; 40 dB 与 101.8 的 &gt; 60 dB 信号量级相差百倍，共用一档无法覆盖</td></tr>
+<tr><td>4</td><td><strong>增益变更后贴肤检测阈值全部作废</strong>，须重标</td></tr>
+<tr><td>5</td><td><strong>101.3 峰值波长必须最先测</strong>，其结果决定 ε 查表取值，影响全部定量结果</td></tr>
+<tr><td>6</td><td><strong>BB.5 按原文实现会使 HbR 反号</strong>——用 <code>pinv</code> 规避，并在报告中声明（§9.2 第 5 条）</td></tr>
+<tr><td>7</td><td><strong>参考侧与设备侧必须用同一份 ε 表、同一组波长、同一 pathlength 约定</strong>，否则比较失去意义</td></tr>
+<tr><td>8</td><td><strong>当前有效采样率约 1 Hz</strong>。101.8 要求声称最大采样率，此数值将写入说明书</td></tr>
+<tr><td>9</td><td><strong>自定判据（A2、A4、R1 等）为建议值</strong>，送检前应自行试跑一轮，调整到合理区间</td></tr>
+<tr><td>10</td><td><strong>§9.2 第 3、4、5 条为必写内容</strong>，它们界定了本方法的验证边界</td></tr>
+</tbody>
+</table>
+</div>
+
+<footer>
+  <p>依据 GB 9706.271—2022《医用电气设备 第 2-71 部分：功能性近红外光谱(NIRS)设备的基本安全和基本性能专用要求》附录 BB（规范性）。<br>
+  标准原文引述均标注条款号。自定判据已明确标记，非标准要求。</p>
+</footer>
+
+</main>
+
+<nav class="toc" aria-label="目录">
+  <span class="klabel">目录</span>
+  <ol>
+    <li><a href="#s1">1. 被检性能与测量量</a></li>
+    <li><a href="#s2">2. 前置条件</a></li>
+    <li><a href="#s3">3. 试验装置</a></li>
+    <li><a href="#s4">4. 【101.5】血红蛋白变化量</a></li>
+    <li><a class="sub" href="#s4">　4.3 BB.5 印刷有误</a></li>
+    <li><a class="sub" href="#s4">　4.7 判据 A1~A4</a></li>
+    <li><a href="#s5">5. 【101.6】信号稳定性</a></li>
+    <li><a href="#s6">6. 【101.7】响应时间</a></li>
+    <li><a href="#s7">7. 【101.8】信噪比</a></li>
+    <li><a href="#s8">8. 离线核验工具</a></li>
+    <li><a href="#s9">9. 记录与报告</a></li>
+    <li><a href="#a1">附 A：公式汇总</a></li>
+    <li><a href="#a2">附 B：判据索引</a></li>
+    <li><a href="#a3">附 C：出处</a></li>
+    <li><a href="#a4">附 D：注意事项</a></li>
+  </ol>
+</nav>
+</div>
