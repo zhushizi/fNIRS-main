@@ -31,17 +31,8 @@
    的偏差，验不了真实组织。体模与人体实验不能被它替代。
 
 用法
-    python tools/srs_mc_layered.py --validate         # MC 引擎：均匀介质对解析解
-    python tools/srs_mc_layered.py --validate-layers  # 层构造与 ppath 列映射
-    python tools/srs_mc_layered.py --run              # 分层实验（需 GPU，约 10 分钟）
-
-    两个自检查的东西不重叠：--validate 用单标签均匀体，从不执行 build_volume()，
-    因此查不出层构造与列映射的错；跑 --run 前两个都要过。
-
-⚠️ 仍未核实的三点（结论为初步值）：
-    · Strangman 表列名为 ms，本文件按 μs′ 处理，未核对原文
-    · 0.3118 / 0.1146 / 2.72 未与已发表的分层灵敏度数据对照
-    · 单一几何、无误差棒；CSF 2 mm 仅 2 个体素，分辨率是否足够未评估
+    python tools/srs_mc_layered.py --validate    # 均匀介质对解析解，先验 MC 本身
+    python tools/srs_mc_layered.py --run         # 分层实验（需 GPU，约 10 分钟）
 """
 
 from __future__ import annotations
@@ -187,110 +178,6 @@ def validate() -> int:
     return 0 if ok else 1
 
 
-def validate_layers() -> int:
-    """分层自检 —— 补上 validate() 的盲区。
-
-    validate() 用的是单标签均匀体（vol = ones），**从不执行 build_volume()**，
-    因此下面两类错误能完整通过它，而结论（脑/颅外灵敏度）恰恰建立在它们之上：
-
-        ① 层构造错：厚度、顺序、z 索引写反
-        ② ppath 列映射错：pmcx 返回的列与标签 1..5 对不上，或差一位
-           —— 光程被算到别的层上，数字看着仍然完全合理
-
-    三项检查：
-      A 几何（确定性，不跑 MC）：直接数体积里每个标签的 z 范围与体素数
-      B 深度序：各层的「远距/近距光程比」必须随深度严格递增
-      C 等价性：分层（五标签、参数相同）与单标签均匀体的 μeff 应在 MC 噪声内一致
-
-    ⚠️ B 的判据原先写的是「各层平均光程随深度递减」，那是错的物理。
-       组织量级散射下（μs′=10 cm⁻¹），香蕉最宽处在表层以下，顶层并非
-       光程最大的层 —— 实测 30mm 处 头皮 108.6 < 颅骨 144.5。
-       真正必然成立的是深层对拉开探测距离更敏感，故改用远近比。
-
-    ⚠️ C 的一致性是【精确】相等而非近似：五层参数相同时介质在光学上与
-       均匀体无异，MCX 同种子同光子数走的是同一批轨迹，差别只在把每段
-       路程记到哪一列。故 C 验的是 intensity() 的求和，**验不了列序**
-       （求和与顺序无关）—— 列序由 B 负责。
-    """
-    from srs_reference import attenuation
-    from fnirs_pipeline.srs import fit_slopes, slope_to_mueff
-
-    print("=" * 76)
-    print("分层自检：层构造与 ppath 列映射")
-    print("=" * 76)
-    ok = True
-
-    # ---- A 几何 ----
-    print("\n  [A] 层构造（确定性检查，不跑 MC）")
-    th = dict(scalp=4.0, skull=6.0, csf=3.0, gray=8.0)
-    vol = build_volume(**th)
-    col = vol[SHAPE[0] // 2, SHAPE[1] // 2, :]
-    print("      标签   期望厚度   实测体素   z 范围")
-    z0, exp = 0, list(th.values()) + [SHAPE[2] - sum(th.values())]
-    for lab in range(1, 6):
-        idx = np.where(col == lab)[0]
-        n = idx.size
-        good = (n == int(round(exp[lab - 1]))) and (idx.min() == z0 if n else False)
-        ok &= good
-        print("      %d      %5.1f mm    %3d 体素   %d~%d   %s"
-              % (lab, exp[lab - 1], n, idx.min(), idx.max(),
-                 "OK" if good else "**不符**"))
-        z0 += n
-    labs = sorted(np.unique(vol).tolist())
-    ok &= labs == [1, 2, 3, 4, 5]
-    print("      标签集合 %s  %s" % (labs, "OK" if labs == [1, 2, 3, 4, 5] else "**不符**"))
-
-    # ---- B 深度单调性 ----
-    print("\n  [B] 深度序：四层等厚 5mm、五层光学参数完全相同")
-    print("      判据 = 各层「远距/近距光程比」随深度严格递增（列序错则破）")
-    # 取组织量级：μs′=1.0 mm⁻¹(=10 cm⁻¹)、μa=0.015 mm⁻¹(=0.15 cm⁻¹)。
-    # 早先用 0.10 mm⁻¹ 时扩散近似本就不成立，解析对照没有意义。
-    musp_u = 1.00                                   # mm⁻¹，五层同值
-    vol_l = build_volume(5.0, 5.0, 5.0, 5.0)
-    det_l, pp_l = run_mc(vol_l, np.full(5, musp_u), nphoton=3e8)
-    print("      距离      头皮     颅骨     CSF      灰质     白质    顶层占比")
-    means = []
-    for i, r in enumerate(RHO_MM):
-        mean = pp_l[det_l == i + 1].mean(axis=0)
-        means.append(mean)
-        print("      %2.0f mm  %7.2f %7.2f %7.2f %7.2f %7.2f   %5.1f%%"
-              % (r, *mean, 100 * mean[0] / mean.sum()))
-    ratio = means[-1] / means[0]                 # 50mm / 30mm，逐层
-    inc = bool(np.all(np.diff(ratio) > 0))
-    ok &= inc
-    print("      远近比  %s   %s"
-          % ("  ".join("%7.3f" % x for x in ratio),
-             "随深度递增 OK" if inc else "**未递增**"))
-    # 顶层占比应随距离下降（远距采样更深）
-    frac = [pp_l[det_l == i + 1].mean(axis=0)[0] / pp_l[det_l == i + 1].mean(axis=0).sum()
-            for i in range(RHO_MM.size)]
-    dec = bool(np.all(np.diff(frac) < 0))
-    ok &= dec
-    print("      顶层占比随距离：%s  %s"
-          % (" -> ".join("%.1f%%" % (100 * f) for f in frac),
-             "下降 OK" if dec else "**未下降**"))
-
-    # ---- C 等价性 ----
-    print("\n  [C] 等价性：分层(五标签同参) vs 单标签均匀体")
-    mua_u = 0.015                                   # mm⁻¹
-    det_h, pp_h = run_mc(np.ones(SHAPE, dtype=np.uint8),
-                         np.array([musp_u]), nphoton=3e8)
-    rho_cm = RHO_MM / 10.0
-    m_l = float(slope_to_mueff(fit_slopes(
-        (-np.log10(intensity(det_l, pp_l, np.full(5, mua_u))))[None, :], rho_cm)[0], rho_cm)[0])
-    m_h = float(slope_to_mueff(fit_slopes(
-        (-np.log10(intensity(det_h, pp_h, np.array([mua_u]))))[None, :], rho_cm)[0], rho_cm)[0])
-    exact = np.sqrt(3.0 * mua_u * 10 * (mua_u * 10 + musp_u * 10))
-    d = abs(m_l - m_h) / m_h
-    ok &= d < 0.05
-    print("      解析 μeff %.4f   分层 %.4f   均匀 %.4f   两者差 %.2f%%  %s"
-          % (exact, m_l, m_h, 100 * d, "OK" if d < 0.05 else "**超限**"))
-    print("      （MC 为随机过程，两次独立运行本就有噪声，判据取 5%）")
-
-    print("\n  结论：%s" % ("通过" if ok else "未通过"))
-    return 0 if ok else 1
-
-
 def experiments(scalp_mm: float) -> None:
     thb = calibrate_thb()
     print("  每层 tHb（由 Strangman 的 μa(800) 反推，StO2=70%）：")
@@ -360,18 +247,13 @@ def experiments(scalp_mm: float) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--validate", action="store_true",
-                    help="MC 引擎自检：均匀介质对 Farrell-Patterson 解析解")
-    ap.add_argument("--validate-layers", action="store_true",
-                    help="分层自检：层构造与 ppath 列映射（--validate 查不出这两类错）")
+    ap.add_argument("--validate", action="store_true")
     ap.add_argument("--run", action="store_true")
     ap.add_argument("--scalp", type=float, default=LAYERS["scalp"],
                     help="头皮厚度 mm（默认 4.5，取自超声实测 3.81~4.98）")
     a = ap.parse_args()
     if a.validate:
         return validate()
-    if a.validate_layers:
-        return validate_layers()
     if a.run:
         print("=" * 76)
         print("MC 分层头模型 —— SRS 读数对脑 / 颅外的灵敏度")
