@@ -1,5 +1,6 @@
 # Virtual env
 software/env
+software/.venv-mne/
 
 # Altium files
 *.PrjPCBStructure

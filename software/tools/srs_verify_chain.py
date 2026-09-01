@@ -351,8 +351,8 @@ def group_b(data_dir: Path) -> None:
     r = float(np.corrcoef(truth, read)[0, 1])
     e = read - truth
     print(f"      偏差 {e.mean():+.2f} ± {e.std():.2f} %O2   r = {r:.4f}   斜率 = {k:.3f}")
-    print(f"      真值跨度 {truth.min():.1f}~{truth.max():.1f}（{truth.ptp():.1f} 点），"
-          f"读数跨度 {read.ptp():.1f} 点")
+    print(f"      真值跨度 {truth.min():.1f}~{truth.max():.1f}（{np.ptp(truth):.1f} 点），"
+          f"读数跨度 {np.ptp(read):.1f} 点")
     _check("B1 真实光学参数下趋势保持", r > 0.9 and 0.8 < k < 1.3,
            f"r={r:.4f}，斜率={k:.3f}")
     print("      ⚠️ 这是受试者【间】差异，不是同一个人的时间变化；"

@@ -1,15 +1,41 @@
 """
 用 luhmann20synhrf 数据集验证本项目的短距回归（SSR）。
 
-数据：NITRC luhmann20synhrf / resting_state_1
-      14 被试 × {resting, hrf_20, hrf_50, hrf_100}
-      50 Hz · 690/830 nm · 短距 8 mm(8 通道) · 长距 30 mm(26 通道)
-      HRF 只注入长距，短距为纯生理噪声；部分长距未注入 -> 天然阴性对照
+数据来源
+    von Lühmann A 等, "Open Access Multimodal fNIRS Resting State Dataset
+    With and Without Synthetic Hemodynamic Responses",
+    Front Neurosci 14:579353, 2020.
+    下载 https://www.nitrc.org/projects/luhmann20synhrf/
+
+    仪器 TechEn CW6，50 Hz，690/830 nm，SNIRF v1.0（HDF5）。
+    每个被试 4 个文件：resting / resting_hrf_20 / _50 / _100。
+
+    ┌──────────────┬──────┬──────┬───────┬──────────┐
+    │              │ 长距 │ 短距 │ 时长  │ trial/人 │
+    ├──────────────┼──────┼──────┼───────┼──────────┤
+    │ Dataset I    │  26  │   2  │ 5 min │   ~15    │
+    │ Dataset II   │  48  │   8  │10 min │  29~38   │
+    └──────────────┴──────┴──────┴───────┴──────────┘
+    Dataset II 实测：16 源 / 32 探测器，112 条 measurement，
+    源探距离只有两种 —— 短距 8.0 mm、长距 30.5 mm，591 s，50 Hz。
+    两个 subset 的 SNIRF 结构完全一致。
+
+    ⚠️ 本文件早先写的是「长距 30 mm(26 通道)」，26 是 Dataset I 的数，
+       而 ROOT 当时又指向 resting_state_1（只有 2 个短距）—— 描述与实
+       际加载的 subset 对不上。短距 8 mm 这个数本身是对的。
+
+真值
+    合成 HRF 为 gamma 函数，峰值时间 6 s、总时长 16.5 s，在【光强域】注入，
+    因此会完整走过本项目的 MBLL 链路。三档幅度 100/50/20 %，
+    100 % 档对应 HbO +0.66 μM、HbR −0.23 μM。
+    每 20 s 窗内随机 onset(0~3.5 s)，且【只注入随机一半的长距通道】
+    —— 未注入的那一半是天然阴性对照。
 
 方法：对每个 hrf 文件用【它自己的 stim 向量】做事件锁定平均，
       比较「做 SSR」与「不做 SSR」两条路径的 HRF 恢复效果。
       不依赖文件相减（三档事件位置不同，基底也不同）。
 """
+import os
 import sys
 from pathlib import Path
 
@@ -22,7 +48,26 @@ sys.stdout.reconfigure(encoding="utf-8")
 from fnirs_pipeline.mbll import short_separation_regression, smart_bandpass
 from fnirs_pipeline.mbll_core import hemoglobin_extinctions, intensities_to_od_changes
 
-ROOT = Path(__file__).parent / "ssr" / "resting_state_1"
+# 数据集有 2.3 GB，不必搬进仓库 —— 用环境变量指到实际解压位置即可：
+#   PowerShell:  $env:SSR_DATA_ROOT = "D:\...\脑部_红外数据"
+#   bash      :  export SSR_DATA_ROOT=/d/.../脑部_红外数据
+# 该目录下应直接包含 resting_state_2/（和可选的 resting_state_1/）。
+# 不设时回落到 tools/ssr/。
+#
+# 默认走 Dataset II：ssr_v2.py 的「最好短距 vs 最差短距」阴性对照需要
+# 足够多的短距候选才有意义，Dataset I 只有 2 个，那个对照会退化成二选一。
+_SSR_BASE = Path(os.environ.get("SSR_DATA_ROOT") or (Path(__file__).parent / "ssr"))
+ROOT = _SSR_BASE / "resting_state_2"
+if not ROOT.exists() and (_SSR_BASE / "resting_state_1").exists():
+    ROOT = _SSR_BASE / "resting_state_1"    # 只下了 Dataset I 时回落
+    # 两个都没下时 ROOT 保持指向 resting_state_2，好让报错指向该下的那个
+
+# 合成 HRF 的真值峰值 (μM)，用于算幅度恢复率。
+# 100 % 档取自 von Lühmann 2020 正文，其余两档按标称比例缩放。
+HRF_TRUE_UM = {"100": {"HbO": 0.660, "HbR": -0.230},
+               "50":  {"HbO": 0.330, "HbR": -0.115},
+               "20":  {"HbO": 0.132, "HbR": -0.046}}
+
 PRE, POST = 5.0, 25.0          # 事件锁定窗口 (s)
 PPF, D_LONG = 6.0, 3.0         # DPF 与长距源探距离 (cm)
 SHORT_MM, LONG_MM = 15.0, 15.0  # <15mm 判为短距
@@ -47,9 +92,49 @@ def load(path):
             if k.startswith("stim") and "data" in n[k]:
                 st = np.array(n[k]["data"])
                 break
+        # 长短距分界写死为 15（见 SHORT_MM/LONG_MM），前提是坐标单位为 mm。
+        # 换成 cm 的文件会让全部通道被判成短距且不报错，故显式核对一次。
+        unit = None
+        try:
+            raw_u = np.array(n["metaDataTags"]["LengthUnit"]).ravel()[0]
+            unit = raw_u.decode() if isinstance(raw_u, bytes) else str(raw_u)
+        except (KeyError, IndexError):
+            pass
+        if unit is not None and unit.strip().lower() not in ("mm", "millimeter"):
+            raise ValueError(f"{path} 的 LengthUnit 是 {unit!r}，"
+                             f"但长短距判据按 mm 写死，需换算后再用")
     sep = np.linalg.norm(sp[ml[:, 0] - 1] - dp[ml[:, 1] - 1], axis=1)
     return dict(d=d, t=t, ml=ml, wl=wl, st=st, sep=sep,
                 fs=1.0 / float(np.median(np.diff(t))), sp=sp, dp=dp)
+
+
+def never_injected(sub, level="100", other="20"):
+    """定出【确定没有被注入 HRF】的长距通道，返回通道键集合。
+
+    三个 hrf_* 文件共享同一段静息底数据（实测：同被试跨档的短距通道相关
+    为 1.0，相减后逐点恒为零），因此 hrf_A − hrf_B 会把底数据精确抵消，
+    只剩两次注入。于是：
+
+        差恒为零  ->  A、B 两档都没注入这个通道  -> 确定阴性
+        差非零    ->  至少一档注入了
+
+    ⚠️ 只能定出「确定阴性」，定不出「确定阳性」。因为三档的注入 onset
+       只在各自 20 s 窗内抖动 0~3.5 s，事件窗大量重叠，锁 A 的 onset 也
+       能捞到 B 的注入（实测幅度比仅 1.1），无法据此分开 A、B 的注入集。
+       阳性组需另行判定，见 ssr_v2.py。
+
+    ⚠️ 不能用 resting.snirf 来做这件事：实测部分被试（如 Subj86）的
+       resting.snirf 与 hrf_* 相关仅 0.92，是另一段录音；Subj100 则为
+       0.9997。逐被试不一致，只有 hrf_* 之间才同底。
+    """
+    a = load(ROOT / sub / f"resting_hrf_{level}.snirf")
+    b = load(ROOT / sub / f"resting_hrf_{other}.snirf")
+    if a["d"].shape != b["d"].shape:
+        return set()
+    D = a["d"] - b["d"]
+    longs, _ = channels(a)
+    return {k for k, v in longs.items()
+            if not np.any(D[:, [v[w] for w in sorted(v)]])}
 
 
 def channels(rec):
