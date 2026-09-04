@@ -64,8 +64,15 @@ DEFAULT_CHANNEL_CODE = 0x01
 # 输出通道选择（离线 processed_output、在线回传安卓、live 曲线均使用此通道）
 # 可选: "S1_D1" | "S1_D2" | "S1_D1_ssr"
 # ---------------------------------------------------------------------------
+#
+# 定版为 "S1_D1"（不做短距回归）。两条理由：
+#   ① 探头已定版为 1 光源 + 2 个长距探测器 @ 3.0/4.0 cm，取消短距通道，
+#      SSR 失去输入。
+#   ② SSR 是在线/离线不一致的主因：在线 β 在热身末冻结（基线窗 30~60 s 算），
+#      离线 β 用全段算，两个 β 不同则修正量不同。实测切到 S1_D1 后，
+#      在线与离线的波形相关中位 由 HbO 0.849 / HbR 0.834 升到 0.967 / 0.964。
 OutputChannelName = Literal["S1_D1", "S1_D2", "S1_D1_ssr"]
-OUTPUT_CHANNEL: OutputChannelName = "S1_D1_ssr"
+OUTPUT_CHANNEL: OutputChannelName = "S1_D1"
 VALID_OUTPUT_CHANNELS: tuple[OutputChannelName, ...] = ("S1_D1", "S1_D2", "S1_D1_ssr")
 
 # ---------------------------------------------------------------------------

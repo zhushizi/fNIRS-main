@@ -95,8 +95,8 @@ class SrsGeometry:
     def __post_init__(self) -> None:
         self.rho_cm = np.asarray(self.rho_cm, dtype=float)
         self.wavelengths_nm = np.asarray(self.wavelengths_nm, dtype=float)
-        if self.rho_cm.size < 3:
-            raise ValueError("SRS 至少需要 3 个长距探测器：2 点残差恒为零，无法自检")
+        if self.rho_cm.size < 2:
+            raise ValueError("SRS 至少需要 2 个长距探测器才能定出斜率")
         if np.any(np.diff(self.rho_cm) <= 0):
             raise ValueError("rho_cm 必须严格升序")
 
@@ -307,7 +307,11 @@ def compute_toi(intensities: np.ndarray, geom: SrsGeometry,
     I = np.asarray(intensities, dtype=float)
     if np.nanmin(I[:, -1]) < MIN_COUNTS:
         flags.append("最远探测器计数不足")
-    if np.nanmax(resid) > SLOPE_RESIDUAL_MAX:
+    # 2 个探测器时残差恒为零，空间自检不可用 —— 必须显式标出来，
+    # 否则 residual=0 会被误读成「拟合极好」。改由光谱域自检承担，见下。
+    if rho.size < 3:
+        flags.append("仅 2 个长距：无空间残差自检，请依赖光谱残差")
+    elif np.nanmax(resid) > SLOPE_RESIDUAL_MAX:
         flags.append(f"斜率拟合残差 {np.nanmax(resid):.4f} 超限（理论 ≈0.018）")
 
     mueff = slope_to_mueff(slope, rho)

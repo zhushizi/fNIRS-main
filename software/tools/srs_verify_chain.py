@@ -221,11 +221,24 @@ def a5_quality_flags() -> None:
     print(f"      最远探测器暗   flags={r_dim.flags}")
     _check("A5 计数不足被抓到", any("计数" in f for f in r_dim.flags))
 
+    # 探头已定版为 1 光源 + 2 长距探测器 @ 3.0/4.0 cm，故两点几何必须【被接受】，
+    # 但要强制打出「无空间残差自检」的质量标志 —— 两点必共线，残差恒为零，
+    # 若不标出来，residual=0 会被误读成拟合极好。单点则无法定斜率，必须拒绝。
+    mua_2 = mua_of(SO2_TRUE, THB, WL)
+    musp_2 = musp_power_law(WL, 10.0, 1.0)
+    rho2 = np.array([3.0, 4.0])
+    I2 = np.array([10 ** (-attenuation(rho2, mua_2[i], musp_2[i], N_TISSUE))
+                   for i in range(WL.size)]) * SCALE
+    r2 = compute_toi(I2, SrsGeometry(rho_cm=rho2, wavelengths_nm=WL))
+    print(f"      两点几何 3/4cm  TOI={r2.toi_raw:.2f}%  flags={r2.flags}")
+    _check("A5 两点几何被接受且标注无自检",
+           np.isfinite(r2.toi_raw) and any("2 个长距" in f for f in r2.flags))
+
     try:
-        SrsGeometry(rho_cm=np.array([3.0, 4.0]), wavelengths_nm=WL)
-        _check("A5 两点几何被拒绝", False, "未抛异常")
+        SrsGeometry(rho_cm=np.array([3.0]), wavelengths_nm=WL)
+        _check("A5 单点几何被拒绝", False, "未抛异常")
     except ValueError as e:
-        _check("A5 两点几何被拒绝", True, str(e))
+        _check("A5 单点几何被拒绝", True, str(e))
 
 
 def a6_closure_and_range() -> None:

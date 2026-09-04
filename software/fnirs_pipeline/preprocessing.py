@@ -44,24 +44,41 @@ def butter_lowpass_filter(
     fs: float,
     order: int = 4,
     signal_col: str = "Value",
+    time_col: str = "Time (s)",
 ) -> pd.DataFrame:
-    """按接收源/波长组合分别低通，避免不同 LED/PD 的电平互相污染。"""
+    """按接收源/波长组合分别低通，避免不同 LED/PD 的电平互相污染。
+
+    ⚠️ 采样率必须按【组内】算。本函数是分组后各自滤波的，组内相邻样本相隔
+       一整个交织周期（双探测器 × 五波长时约 10 倍于原始流的间隔）。
+       此前调用方传的是整条交织流的 fs（≈10 Hz），而组内实为 ≈1 Hz，
+       归一化截止 0.2 被套到 1 Hz 数据上，实际截止变成 0.1 Hz ——
+       恰好压在 BP_HIGH_HZ=0.1 的带通上边沿，且 filtfilt 双向等效 |H|²，
+       等于在带通之外又多滤了一道。本意的 1 Hz 截止在 1 Hz 采样下高于
+       Nyquist，本就该按下面的判据直接跳过。
+
+       故当 df 带时间列时，一律用组内时间戳推算 fs，忽略传入值。
+    """
     if len(df) < max(12, order * 3):
         return df.copy()
 
     filtered = df.copy()
     if signal_col in filtered.columns:
         filtered[signal_col] = filtered[signal_col].astype(float)
-    nyquist = 0.5 * fs
-    if nyquist <= 0 or cutoff_hz >= nyquist:
-        return filtered
 
-    b, a = butter(order, cutoff_hz / nyquist, btype="low", analog=False)
     group_cols = [col for col in ("DetectorId", "Wavelength") if col in filtered.columns]
     grouped = filtered.groupby(group_cols, sort=False) if group_cols else [(None, filtered)]
     for _, group in grouped:
         if len(group) < max(12, order * 3):
             continue
+        fs_g = fs
+        if time_col in group.columns:
+            dt = group[time_col].astype(float).diff().mean()
+            if pd.notna(dt) and dt > 0:
+                fs_g = 1.0 / dt
+        nyquist = 0.5 * fs_g
+        if nyquist <= 0 or cutoff_hz >= nyquist:
+            continue                      # 截止高于 Nyquist：该组不滤，等同直通
+        b, a = butter(order, cutoff_hz / nyquist, btype="low", analog=False)
         padlen = min(len(group) - 1, 3 * (max(len(a), len(b)) - 1))
         if padlen <= 0:
             continue

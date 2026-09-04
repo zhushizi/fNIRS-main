@@ -123,6 +123,8 @@ class IncrementalCausalProcessor:
         self._beta: np.ndarray | None = None
         self._short_mean: np.ndarray | None = None
         self._sos: np.ndarray | None = None
+        self._fir: np.ndarray | None = None
+        self._fir_delay_s: float = 0.0
         self._zi: np.ndarray | None = None
         self._baseline_conc: np.ndarray | None = None  # (3,) 摩尔，显示锚定
         self._rso2_hbo_abs = 0.0
@@ -303,18 +305,8 @@ class IncrementalCausalProcessor:
         else:
             corrected_all = long_od
 
-        self._sos = butter_bandpass_sos(
-            self._bp_low_hz, self._bp_high_hz, fs, order=self._bp_order
-        )
-        if self._sos is not None:
-            zi0 = (
-                sosfilt_zi(self._sos)[:, np.newaxis, :]
-                * corrected_all[:, 0][np.newaxis, :, np.newaxis]
-            )
-            filtered_all, self._zi = sosfilt(self._sos, corrected_all, axis=1, zi=zi0)
-        else:
-            filtered_all = corrected_all
-            self._zi = None
+        self._design_filter(fs)
+        filtered_all = self._bandpass(corrected_all, reuse_zi=False)
 
         conc_all = self._mbll(filtered_all)  # (3, N) 摩尔
         self._baseline_conc = np.mean(conc_all[:, baseline_mask], axis=1)
@@ -363,17 +355,64 @@ class IncrementalCausalProcessor:
         else:
             corrected = long_od
 
+        return self._mbll(self._bandpass(corrected, reuse_zi=reuse_zi))
+
+    # ------------------------------------------------------------ 带通
+    def _design_filter(self, fs: float) -> None:
+        """按 settings.causal_filter_kind 设计在线带通。冻结时调用一次。
+
+        FIR：线性相位，群延迟恒为 (taps−1)/2 个样本，与频率无关 ——
+             在线 t 时刻的读数即离线 t−延迟 时刻的读数，波形不失真。
+             延迟【无法在实时中补偿】（补偿要用未来数据），但它是已知常数。
+        IIR：原四阶巴特沃斯。群延迟随频率变（实测 6.6~71.4 s），
+             波形被色散重塑，任何平移都对不齐。保留作回退。
+        """
+        self._sos = None
+        self._fir = None
+        self._zi = None
+        kind = str(getattr(self.settings, "causal_filter_kind", "iir")).lower()
+        if kind == "fir":
+            from scipy.signal import firwin
+
+            taps = int(getattr(self.settings, "causal_fir_taps", 141))
+            taps = taps + 1 if taps % 2 == 0 else taps      # 必须为奇数，群延迟才是整数
+            nyq = fs / 2.0
+            if 0 < self._bp_low_hz < self._bp_high_hz < nyq:
+                self._fir = firwin(taps, [self._bp_low_hz, self._bp_high_hz],
+                                   pass_zero=False, fs=fs)
+                self._fir_delay_s = (taps - 1) / 2.0 / fs
+            return
+        from fnirs_pipeline.mbll import butter_bandpass_sos
+
+        self._sos = butter_bandpass_sos(
+            self._bp_low_hz, self._bp_high_hz, fs, order=self._bp_order
+        )
+
+    def _bandpass(self, x: np.ndarray, *, reuse_zi: bool) -> np.ndarray:
+        """带通滤波。两种结构都带持久状态，故分块喂与一次喂结果逐位相同
+        （这正是 tools/online_replay.py 的 A 类不变量所验证的性质）。"""
+        if self._fir is not None:
+            from scipy.signal import lfilter, lfilter_zi
+
+            if reuse_zi and self._zi is not None:
+                zi = self._zi
+            else:
+                # 与 IIR 分支同一思路：把状态初始化成「输入恒为首样本」时的稳态，
+                # 避开从零状态启动的巨大跳变。
+                zi = lfilter_zi(self._fir, [1.0])[np.newaxis, :] * x[:, 0][:, np.newaxis]
+            out, self._zi = lfilter(self._fir, [1.0], x, axis=1, zi=zi)
+            return out
         if self._sos is None:
-            filtered = corrected
-        elif reuse_zi and self._zi is not None:
-            filtered, self._zi = sosfilt(self._sos, corrected, axis=1, zi=self._zi)
-        else:
-            zi0 = (
-                sosfilt_zi(self._sos)[:, np.newaxis, :]
-                * corrected[:, 0][np.newaxis, :, np.newaxis]
-            )
-            filtered, self._zi = sosfilt(self._sos, corrected, axis=1, zi=zi0)
-        return self._mbll(filtered)
+            return x
+        if reuse_zi and self._zi is not None:
+            out, self._zi = sosfilt(self._sos, x, axis=1, zi=self._zi)
+            return out
+        zi0 = (
+            sosfilt_zi(self._sos)[:, np.newaxis, :]
+            * x[:, 0][np.newaxis, :, np.newaxis]
+        )
+        out, self._zi = sosfilt(self._sos, x, axis=1, zi=zi0)
+        return out
 
     def _mbll(self, delta_od: np.ndarray) -> np.ndarray:
         from fnirs_pipeline.mbll import generalized_mbll
