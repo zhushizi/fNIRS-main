@@ -42,12 +42,35 @@ RHOS = [DISTANCE_BY_CODE[c] for c in sorted(DISTANCE_BY_CODE)]        # 3.0, 4.0
 # 新固件每周期自带暗时隙，软件不再**产生**这种记录，但仍要能**读**
 # 旧 xlsx（run_srs_v1 会用到），所以常量保留。
 DARK_CODE = "DARK"
+# 「空测」：LED 正常亮，但探头下面**没有体模**（悬空，或放在黑面上）。
+# 测的是光源经 PCB 板材/板面直接耦合到探测器的那条路 —— 它不经过介质，
+# 而暗时隙是 LED 全灭时采的，看不见它，所以逐周期扣暗扣不掉这一项。
+# 块名独立，且 run_srs_v1.load_measured 会跳过非体模块名，不会混进标定。
+AIR_CODE = "AIR"
 # 一个扫描周期的帧数：(1 暗槽 + 5 波长) × 2 距离。
 FRAMES_PER_CYCLE = (1 + len(WLS)) * len(RHOS)
 # 实时表的配色阈值：扣暗后低于此值标红（srs.py 的 MIN_COUNTS 是 2000），
-# 原始值高于此值标黄（接近有符号 int32 上限的量级，疑似饱和）。
+# 原始值高于此值标黄（疑似接近满量程）。
 MIN_NET_COUNTS = 2000
-SAT_WARN = 2_000_000_000
+# 满量程未经厂家确认，下面这个阈值是 2026-10-12 实测推出来的：
+#
+#   A2（最透的块）档位 130 → 150，950nm@3cm：
+#     实测比 1.1473，等比应为 1.1538 —— 线性度 99.4%，无压缩迹象。
+#     可用四路（670/770/850/950）线性度 97.6%~99.8%，而且**最亮的那路偏差
+#     最小**；饱和压缩的形状应当相反，故判定未饱和。
+#   该次逐帧 adc_raw 最大 2,883,734，最大值只出现 1 次、与次大值不相等
+#   （削顶会出现大量重复的同一个值），进一步确认未撞顶。
+#   暗读数为负（−56,230），故为有符号转换器；2,883,734 已超过 22 位有符号
+#   上限 2,097,151，所以至少是 23 位有符号。
+#
+# 取**最保守**的那个可能满量程（23 位有符号 4,194,303）的 90% 作阈值。
+# 这样：比实测过的最亮情形（2,883,734）高 30%，不会误报；
+# 又在最低可能的满量程之前就告警。
+#
+# ⚠️ 这是推断，不是厂家规格。应当向厂家确认 ADC 位数与满量程后改掉。
+# 注：A2 + 950nm + 3cm + 150档 是整个 12 块 × 5 波长 × 2 距离矩阵里
+#     最亮的一格，它既然不饱和，150 档对全部 12 块都安全。
+SAT_WARN = 3_750_000
 # 暗时隙状态条：统计最近多少帧，以及暗自身 std 的报警线。
 # 实测白噪声地板 474(3cm)/588(4cm)，留 3 倍余量。
 DARK_STAT_FRAMES = 600
@@ -321,6 +344,14 @@ class SimWorker(QtCore.QThread):
             if blk not in cache:
                 if blk == DARK_CODE:
                     cache[blk] = np.full((len(WLS), len(RHOS)), 150.0)
+                elif blk == AIR_CODE:
+                    # 空测：没有体模，读数只剩板内串扰 —— 与波长弱相关、
+                    # 与距离强相关。这里的量级是 2026-10-12 D4 数据拟
+                    # I = A·R + X(ρ) 得到的 X，**是推测值，只为排练时
+                    # 界面不至于空白，不可当实测**。
+                    cache[blk] = np.array(
+                        [[1.0e5, 2.8e3], [2.0e5, 6.3e3], [1.8e5, 6.0e3],
+                         [2.7e5, 9.8e3], [4.3e5, 1.6e4]])[:len(WLS)]
                 else:
                     i = phantom.BLOCK_CODES.index(blk)
                     mua, musp = phantom.interpolate_to(wl)
@@ -328,8 +359,8 @@ class SimWorker(QtCore.QThread):
                                                   phantom.REFRACTIVE_INDEX,
                                                   scale=SIM_SCALE)
             base = cache[blk]
-            # 暗时隙：每周期最前，两个探测器各一帧。模拟一个带慢漂移的
-            # 大正偏置 —— 真机实测约 +85 万，占原始读数的 90%+。
+            # 暗时隙：每周期最前，两个探测器各一帧。带慢漂移，量级取 SIM_DARK
+            # （实测 3cm 约 −4.4 万、4cm 约 +0.9 万；两个探测器符号相反）。
             self._dark_phase = getattr(self, "_dark_phase", 0.0) + 0.05
             blob = b""
             for b_, r in enumerate(RHOS):
@@ -542,11 +573,23 @@ class MainWindow(QtWidgets.QWidget):
         # 每个扫描周期自带一帧 LED 全灭的暗时隙，逐周期就近扣 —— 手动暗采
         # 既多余又误导（它当时的说明写着"本软件不关光源"）。已删除。
         # 取而代之的是下面这条常驻的暗时隙状态条。
+        # 空测按钮：探头悬空或放黑面，测板内光串扰。放在网格最后一行，
+        # 和 12 块分开 —— 它不是体模，不参与标定。
+        b_air = QtWidgets.QPushButton("空测（探头悬空／放黑面，测板内串扰）")
+        b_air.setMinimumHeight(40)
+        b_air.setStyleSheet("font-weight:bold;color:#8a5a00")
+        b_air.setToolTip(
+            "探头下面不放体模，LED 照常亮。采到的就是不经介质、\n"
+            "直接从板材耦合过来的那部分光。与同档位的体模读数相比，\n"
+            "即可知道体模读数里有多大比例不是穿过体模的。\n"
+            "不会进入标定。")
+        b_air.clicked.connect(lambda: self.start_capture(AIR_CODE))
+        bl.addWidget(b_air, 5, 0, 1, 4)
         self.lbl_darkstat = QtWidgets.QLabel("暗时隙：等待数据…")
         self.lbl_darkstat.setStyleSheet(
             "padding:6px;border:1px solid #cfe0f5;border-radius:4px;"
             "background:#f2f7fd;color:#2a78d6;font-family:Consolas,monospace")
-        bl.addWidget(self.lbl_darkstat, 5, 0, 1, 4)
+        bl.addWidget(self.lbl_darkstat, 6, 0, 1, 4)
         mid.addWidget(gb_blk, 3)
 
         # 进度 + 判定横幅

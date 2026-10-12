@@ -8,7 +8,7 @@
 和采集程序的分工
 ----------------
     acquire.py      体模标定【采数据】——  离线，12 块各点一次
-    run_srs_v1.py   体模标定【算 G】  ——  离线，产出 标定_v1.json
+    run_srs_v1.py   体模标定【算 G】  ——  离线，产出 标定参数/*.json
     online.py       这个           ——  在线，实时反演 TOI
 
 SRS 的在线反演【逐帧独立】，不依赖任何时间基线 —— 这正是它能出绝对值
@@ -39,6 +39,7 @@ import pyqtgraph as pg
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 _HERE = Path(__file__).resolve().parent
+CAL_DIR = _HERE / "标定参数"      # 标定 json 都放这里，由 run_srs_v1 --emit-cal 产出
 sys.path.insert(0, str(_HERE.parent))
 
 from srs_cal import hardware as hw                       # noqa: E402
@@ -490,8 +491,15 @@ def main(argv=None) -> int:
     cal = Calibration()
     if a.cal:
         p = Path(a.cal)
-        if not p.is_absolute():
-            p = _HERE / p
+        if not p.is_absolute() and not p.exists():
+            # 相对路径依次试：当前目录（符合直觉）→ 标定参数/ → srs_cal/。
+            # 只给文件名就能用，不必关心在哪个目录下启动。
+            for cand in (CAL_DIR / p, _HERE / p):
+                if cand.exists():
+                    p = cand
+                    break
+            else:
+                p = CAL_DIR / p          # 都不存在时，报错信息指向标定参数/
         cal = Calibration.load(p)
         print(f"已加载标定：{p}")
         for c in cal.doc.get("caveats", []):

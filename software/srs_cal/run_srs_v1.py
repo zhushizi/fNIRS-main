@@ -38,7 +38,9 @@ from srs_cal.forward import predicted_slope    # noqa: E402
 WL = hw.WAVELENGTHS_ACTIVE_NM                  # 670 / 770 / 850
 RHO = hw.RHO_CM
 N = phantom.REFRACTIVE_INDEX
-DATA_DIR = _HERE / "标定采集"
+DATA_DIR = _HERE / "标定采集"      # 原始采集 xlsx
+CAL_DIR = _HERE / "标定参数"       # 产出的标定 json（online.py 也从这里找）
+CAL_DIR.mkdir(exist_ok=True)
 DOCS_FIG = _HERE.parent.parent / "docs" / "验证图"
 
 
@@ -74,6 +76,7 @@ def load_measured(data_dir: Path = DATA_DIR,
     pend: list[tuple[str, dict]] = []     # 旧格式，待全局 DARK 到齐
     era: dict[str, set] = {}              # 块 -> {'slot','legacy'}
     seen: set = set()                     # (块, take, 时间戳) 全局去重
+    skipped_blk: set = set()              # 非体模块名（AIR 等诊断采集）
     for fp in sorted(data_dir.glob("标定采集_*.xlsx")):
         wb = openpyxl.load_workbook(fp, read_only=True, data_only=True)
         if "逐帧" not in wb.sheetnames:
@@ -117,6 +120,12 @@ def load_measured(data_dir: Path = DATA_DIR,
                     continue
                 this_dark.setdefault(float(r[ir]), []).append(float(r[src]))
                 continue
+            if r[ib] not in phantom.BLOCK_CODES:
+                # AIR（空测，探头悬空）等诊断用块名：不是体模，绝不能进标定。
+                # measured_slopes 会对块名做 BLOCK_CODES.index()，漏过去会抛
+                # ValueError；更糟的是若借用了真块名，会被静默当成真数据。
+                skipped_blk.add(str(r[ib]))
+                continue
             if (r[ib], r[1], stamp.get((r[ib], r[1]))) in seen:
                 continue                      # 这一次采集在前面的文件里已经收过
             this.setdefault(r[ib], {}).setdefault(
@@ -156,6 +165,8 @@ def load_measured(data_dir: Path = DATA_DIR,
                     off = d.get(rho, 0.0)
                     tgt.setdefault((w, rho), []).extend(v - off for v in vals)
                 era.setdefault(b, set()).add("legacy")
+    if skipped_blk and not quiet:
+        print(f"  ℹ️ 已排除非体模块名（不进标定）：{sorted(skipped_blk)}")
     # ⚠️ 同一块可能两个时代都有（旧固件采过、换固件后又采了）。
     #    **绝不能合并** —— 旧的 810 是坏的，合进来会把它拖回去。
     #    这里只返回原始的分时代结构，由调用方挑。
@@ -218,9 +229,19 @@ def main(argv=None) -> int:
     ap.add_argument("--legacy", action="store_true",
                     help="把旧固件（无暗时隙）的数据也算进来。仅供对照："
                          "两个时代的暗电平处理不同，810 尤其不可比。")
+    ap.add_argument("--exclude", metavar="CODES", default="",
+                    help="逗号分隔的块码，排除在标定之外（例：--exclude D4）。"
+                         "用于做受控对比 —— 只改一个变量再跑一遍。"
+                         "⚠️ 排除块必须有理由并写进标定文件的 caveats，"
+                         "不是用来挑好看的数。")
+    # 默认文件名刻意用「自动」而不是某个版本名：不带路径跑一次就会把它覆盖，
+    # 若默认指向 标定_v1.json，一次顺手的 --emit-cal 就会抹掉留档的版本
+    # （2026-10-12 连踩两次）。版本化的文件一律显式给路径。
     ap.add_argument("--emit-cal", metavar="PATH", nargs="?",
-                    const=str(_HERE / "标定_v1.json"),
-                    help="把 G(λ)+暗电平写成标定文件，供 online.py 加载")
+                    const=str(CAL_DIR / "标定_自动.json"),
+                    help=f"把 G(λ)+暗电平写成标定文件，供 online.py 加载。"
+                         f"不给路径则写 {CAL_DIR.name}/标定_自动.json（会被反复覆盖）；"
+                         f"要留档请显式给文件名")
     a = ap.parse_args(argv)
 
     # Windows 控制台默认 GBK，打不出 ²、λ 这类字符。报告里这些符号是内容
@@ -257,6 +278,16 @@ def main(argv=None) -> int:
     if not blocks:
         print(f"没找到采集数据：{a.data}")
         return 1
+    drop = [c.strip().upper() for c in a.exclude.split(",") if c.strip()]
+    if drop:
+        hit = [c for c in drop if c in blocks]
+        for c in hit:
+            del blocks[c]
+        miss = [c for c in drop if c not in hit]
+        print(f"\n  ⚠️ 已排除块：{hit}" + (f"（未找到：{miss}）" if miss else ""))
+        if not blocks:
+            print("  排除后一块不剩。")
+            return 1
     codes, S, U = measured_slopes(blocks, dark)
     mua_c, musp_c = phantom.interpolate_to(WL)
     sel = [phantom.BLOCK_CODES.index(c) for c in codes]
@@ -413,12 +444,13 @@ def main(argv=None) -> int:
     if a.fig:
         make_figure(codes, xs, ys, k, b, r2, per, disp, (s_flat, s_spec))
     if a.emit_cal:
-        emit_cal(Path(a.emit_cal), G, dark, codes, disp, s_flat, s_spec, tcost)
+        emit_cal(Path(a.emit_cal), G, dark, codes, disp, s_flat, s_spec, tcost,
+                 dropped=drop)
     return 0
 
 
 def emit_cal(path: Path, G, dark: dict, codes, disp, s_flat, s_spec,
-             tcost) -> None:
+             tcost, dropped=()) -> None:
     """写标定文件供 online.py 加载。
 
     刻意把**局限性一起写进文件**（`caveats`），而不是只写数值：
@@ -468,7 +500,8 @@ def emit_cal(path: Path, G, dark: dict, codes, disp, s_flat, s_spec,
             "k/b 未标定（=1/0）：TOI 的绝对值未经人体或血液体模对标，"
             "只能看趋势和相对变化，不能当绝对血氧读数",
             "体模上的贴合变异未必等于皮肤上的，该外推无证据支持",
-        ],
+        ] + ([f"人为排除了块 {', '.join(dropped)} —— 这不是自然结果，"
+              f"用它之前必须知道排除的理由"] if dropped else []),
     }
     path.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
                     encoding="utf-8")
