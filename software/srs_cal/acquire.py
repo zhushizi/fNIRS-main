@@ -47,6 +47,21 @@ DARK_CODE = "DARK"
 # 而暗时隙是 LED 全灭时采的，看不见它，所以逐周期扣暗扣不掉这一项。
 # 块名独立，且 run_srs_v1.load_measured 会跳过非体模块名，不会混进标定。
 AIR_CODE = "AIR"
+# 「手臂」：在体采集。和 AIR 一样不是体模，run_srs_v1 的加载器会跳过它。
+#
+# ⚠️ 体模的验收判据在这里**不适用**，所以 _add_row 对它走另一条分支：
+#    · 白噪声度 r：体模上 r<0.6 判为漂移。在体时心搏（约 1 Hz）本身就让
+#      相邻帧强相关，r 必然低 —— 那是真信号，不是故障。按体模标准会误报。
+#    · 标准误限值 0.7%：那是按体模的静态噪声定的，在体时搏动一项就超了。
+#    在体真正该看的是：4cm 够不够亮、**有没有心搏**。看得见心搏，才说明
+#    探头确实耦合到了活体组织上 —— 这是目前最直接的一条在体有效性证据。
+ARM_CODE = "ARM"
+INVIVO_CODES = (ARM_CODE,)
+# 心搏频带：40~180 bpm。搏动占比 = 该带内方差 / 总方差。
+PULSE_BAND_HZ = (0.67, 3.0)
+# 谱峰显著度（带内谱峰/全谱中位）的判定下限。自验：心搏 0.5% 振幅给
+# 250~354，纯噪声给 4.8~5.7 —— 两者差约 50 倍，取 30 留足余量。
+PULSE_PROM_MIN = 30.0
 # 一个扫描周期的帧数：(1 暗槽 + 5 波长) × 2 距离。
 FRAMES_PER_CYCLE = (1 + len(WLS)) * len(RHOS)
 # 实时表的配色阈值：扣暗后低于此值标红（srs.py 的 MIN_COUNTS 是 2000），
@@ -63,14 +78,20 @@ MIN_NET_COUNTS = 2000
 #   暗读数为负（−56,230），故为有符号转换器；2,883,734 已超过 22 位有符号
 #   上限 2,097,151，所以至少是 23 位有符号。
 #
-# 取**最保守**的那个可能满量程（23 位有符号 4,194,303）的 90% 作阈值。
-# 这样：比实测过的最亮情形（2,883,734）高 30%，不会误报；
-# 又在最低可能的满量程之前就告警。
+# 2026-10-13 更新：满量程**实测确认**了。手臂采集（标定采集_20261013_113257）
+# 里出现削顶，削顶值恰为 8,388,607 = 2²³−1 —— **24 位有符号**。
+# 原先按最保守的 23 位推断设成 3,750,000，只有真实满量程的 45%，会误报。
+# 现取实测满量程的 90%。
 #
-# ⚠️ 这是推断，不是厂家规格。应当向厂家确认 ADC 位数与满量程后改掉。
-# 注：A2 + 950nm + 3cm + 150档 是整个 12 块 × 5 波长 × 2 距离矩阵里
-#     最亮的一格，它既然不饱和，150 档对全部 12 块都安全。
-SAT_WARN = 3_750_000
+# 注：A2 + 950nm + 3cm + 150档 是整个 12 块 × 5 波长 × 2 距离矩阵里最亮的
+#     一格（峰值 2,883,734 = 满量程的 34%），所以 150 档对 12 块都安全。
+ADC_FULL_SCALE = 8_388_607          # 实测削顶值，24 位有符号
+SAT_WARN = int(ADC_FULL_SCALE * 0.9)
+# 启动时自动连这个口、并下发这个档位。acquire 和 online 共用这两个常量
+# （online 从这里 import），避免两处定义各改各的、悄悄跑偏。
+# 串口不存在时**不自动连别的口** —— 见 autostart。
+DEFAULT_PORT = "COM16"
+DEFAULT_GEAR = BRIGHTNESS_MAX       # 255 = 单字节上限
 # 暗时隙状态条：统计最近多少帧，以及暗自身 std 的报警线。
 # 实测白噪声地板 474(3cm)/588(4cm)，留 3 倍余量。
 DARK_STAT_FRAMES = 600
@@ -190,6 +211,61 @@ class Take:
                 out[r] = (float(a.mean()),
                           float(a.std(ddof=1)) if a.size > 1 else 0.0,
                           float(np.ptp(a)))
+        return out
+
+    def pulsatility(self, cycle_hz: float) -> dict:
+        """距离 -> (AC/DC 振幅比, 峰频Hz, 等效心率bpm, 谱峰显著度)。
+
+        判据用**显著度** = 带内谱峰 / 全谱中位，不用「带内功率占比」：
+        0.67~3 Hz 这个带本身就占频谱宽度的约 47%，白噪声天然落进去
+        44~48%，拿占比当判据等于把纯噪声判成心搏（2026-10-13 自验到）。
+        真心搏是一根窄谱线，显著度能到几十上百；白噪声只有个位数。
+
+        AC/DC 是把带外谱清零后反变换得到的峰峰值除以均值 —— 就是灌注
+        指数那个量，在体典型 1~3%，给人看比显著度直观。
+
+        ⚠️ `cycle_hz` 要用**实测**的扫描周期率。采样率不足（< 2×3Hz）时
+           返回空 —— 心搏会混叠到别的频率，报出来的数反而误导。
+        """
+        out: dict = {}
+        if not np.isfinite(cycle_hz) or cycle_hz < 2 * PULSE_BAND_HZ[1]:
+            return out
+        for rho in RHOS:
+            # 用该距离上最亮的那个波长，信噪最好
+            best, series = None, None
+            for w in WLS:
+                v = [f[3] for f in self.frames
+                     if f[0] == w and f[1] == rho and f[3] is not None]
+                if len(v) >= 32 and (best is None or np.mean(v) > best):
+                    best, series = float(np.mean(v)), np.asarray(v, float)
+            if series is None:
+                continue
+            x = series - np.polyval(np.polyfit(np.arange(series.size),
+                                               series, 1),
+                                    np.arange(series.size))   # 去线性漂移
+            f = np.fft.rfftfreq(x.size, d=1.0 / cycle_hz)
+            X = np.fft.rfft(x * np.hanning(x.size))
+            p = np.abs(X) ** 2
+            p[0] = 0.0
+            band = (f >= PULSE_BAND_HZ[0]) & (f <= PULSE_BAND_HZ[1])
+            med = float(np.median(p[1:])) if p.size > 2 else 0.0
+            if med <= 0 or not band.any():
+                continue
+            ib = int(np.argmax(p[band]))
+            pk = float(f[band][ib])
+            prom = float(p[band][ib] / med)
+            # AC/DC：只留峰附近 ±1 bin 反变换，取峰峰 / 直流。
+            # ⚠️ 这里用**不加窗**的变换。加窗后再按窗均值归一会把幅度放大
+            #    一倍（窗中心是 1.0，均值才 0.5）—— 实测 1.5% 正弦被报成
+            #    6.2%，正是这个原因。窗只用于上面算显著度（压旁瓣）。
+            Xu = np.fft.rfft(x)
+            keep = np.zeros_like(Xu)
+            k = int(np.arange(f.size)[band][ib])
+            keep[max(k - 1, 1):k + 2] = Xu[max(k - 1, 1):k + 2]
+            ac = np.fft.irfft(keep, n=x.size)
+            dc = float(np.mean(series))
+            out[rho] = (float(np.ptp(ac) / dc) if dc else float("nan"),
+                        pk, pk * 60.0, prom)
         return out
 
     def det_series(self) -> dict:
@@ -344,6 +420,13 @@ class SimWorker(QtCore.QThread):
             if blk not in cache:
                 if blk == DARK_CODE:
                     cache[blk] = np.full((len(WLS), len(RHOS)), 150.0)
+                elif blk == ARM_CODE:
+                    # 前臂量级：按头部组织 μeff≈2.1 的体模(D2/B4 之间)取，
+                    # 比 D4 亮、比 C2 暗。**是量级，不是实测** ——
+                    # 真机采到之前没有在体数据可依。搏动在下面逐帧叠加。
+                    cache[blk] = np.array(
+                        [[3.0e5, 1.1e4], [6.0e5, 2.6e4], [5.4e5, 2.4e4],
+                         [8.5e5, 3.8e4], [1.4e6, 6.6e4]])[:len(WLS)]
                 elif blk == AIR_CODE:
                     # 空测：没有体模，读数只剩板内串扰 —— 与波长弱相关、
                     # 与距离强相关。这里的量级是 2026-10-12 D4 数据拟
@@ -359,6 +442,11 @@ class SimWorker(QtCore.QThread):
                                                   phantom.REFRACTIVE_INDEX,
                                                   scale=SIM_SCALE)
             base = cache[blk]
+            if blk == ARM_CODE:
+                # 心搏：约 72 bpm，搏动幅度取总光强的 1.5%（在体典型 1~3%）。
+                # 排练时能看到判定里的「搏动占比」亮起来，知道该期待什么。
+                self._pulse = getattr(self, "_pulse", 0.0) + 2 * np.pi * 1.2 / 10.0
+                base = base * (1.0 + 0.015 * np.sin(self._pulse))
             # 暗时隙：每周期最前，两个探测器各一帧。带慢漂移，量级取 SIM_DARK
             # （实测 3cm 约 −4.4 万、4cm 约 +0.9 万；两个探测器符号相反）。
             self._dark_phase = getattr(self, "_dark_phase", 0.0) + 0.05
@@ -584,7 +672,19 @@ class MainWindow(QtWidgets.QWidget):
             "即可知道体模读数里有多大比例不是穿过体模的。\n"
             "不会进入标定。")
         b_air.clicked.connect(lambda: self.start_capture(AIR_CODE))
-        bl.addWidget(b_air, 5, 0, 1, 4)
+        bl.addWidget(b_air, 5, 0, 1, 2)
+        # 在体采集。判定走另一条分支（见 ARM_CODE 的注释）。
+        b_arm = QtWidgets.QPushButton("手臂（在体）")
+        b_arm.setMinimumHeight(40)
+        b_arm.setStyleSheet("font-weight:bold;color:#1a7f5a")
+        b_arm.setToolTip(
+            "贴在前臂上采集。体模的验收判据对它不适用：\n"
+            "心搏会让白噪声度必然偏低，那是真信号不是故障。\n"
+            "这里改看「有没有心搏」——看得见心搏，才说明探头\n"
+            "确实耦合到了活体组织，而不是在读板内串扰。\n"
+            "探头顺着手臂长轴放，不要横着绕。不进标定。")
+        b_arm.clicked.connect(lambda: self.start_capture(ARM_CODE))
+        bl.addWidget(b_arm, 5, 2, 1, 2)
         self.lbl_darkstat = QtWidgets.QLabel("暗时隙：等待数据…")
         self.lbl_darkstat.setStyleSheet(
             "padding:6px;border:1px solid #cfe0f5;border-radius:4px;"
@@ -641,6 +741,7 @@ class MainWindow(QtWidgets.QWidget):
 
     # -- 串口 --------------------------------------------------------------
     def refresh_ports(self) -> None:
+        """枚举串口，并把 DEFAULT_PORT 预选上（若在）。"""
         self.cmb_port.clear()
         try:
             from serial.tools import list_ports
@@ -650,6 +751,29 @@ class MainWindow(QtWidgets.QWidget):
             pass
         if self.cmb_port.count() == 0:
             self.cmb_port.addItem("未发现串口", None)
+            return
+        i = self.cmb_port.findData(DEFAULT_PORT)
+        if i >= 0:
+            self.cmb_port.setCurrentIndex(i)
+
+    def autostart(self) -> None:
+        """启动时自动连 DEFAULT_PORT 并下发 DEFAULT_GEAR。
+
+        ⚠️ 只在该串口**确实存在**时才动。找不到就只提示，不去连别的口 ——
+           自动连到另一台设备上还给它下发满档光强，比"没自动连"糟得多。
+        """
+        if self.simulate or self.worker is not None:
+            return
+        port = getattr(self, "auto_port", DEFAULT_PORT)
+        if self.cmb_port.findData(port) < 0:
+            self.lbl_link.setText(f"未发现 {port}，请手动选口")
+            return
+        self.cmb_port.setCurrentIndex(self.cmb_port.findData(port))
+        self.toggle_conn()
+        if self.worker is None:                 # 开口失败，on_failed 已提示
+            return
+        self.spn_bright.setValue(getattr(self, "auto_gear", DEFAULT_GEAR))
+        self._bright_timer.start()              # 走既有防抖通道下发
 
     def toggle_conn(self) -> None:
         if self.worker is not None:
@@ -732,6 +856,15 @@ class MainWindow(QtWidgets.QWidget):
             self.worker.stop(); self.worker = None
         self.btn_conn.setText("连接"); self.lbl_link.setText("未连接")
         self._abort_capture()
+
+    def _cycle_hz(self) -> float:
+        """实测扫描周期率（周期/秒）。判搏动必须用实测值 —— 按假设的帧率
+        算会把心搏放到错误的频率上。拿不到返回 nan，上层据此跳过搏动判定。"""
+        t = time.perf_counter() - getattr(self, "_t0", time.perf_counter())
+        n = getattr(self, "_frames_seen", 0)
+        if t <= 0 or n <= 0:
+            return float("nan")
+        return n / t / FRAMES_PER_CYCLE
 
     def _tick_rate(self) -> None:
         if self.worker is None:
@@ -937,7 +1070,30 @@ class MainWindow(QtWidgets.QWidget):
         rsd, sem, n, wr = tk.worst_noise()
         drift = wr < DRIFT_LIMIT
         need = 0
-        if not tk.complete():
+        if tk.block in INVIVO_CODES:
+            # 在体：不套体模判据（心搏必然压低白噪声度、抬高标准误）。
+            # 改判两件事：4cm 够不够亮、看不看得见心搏。
+            cyc = self._cycle_hz()
+            pul = tk.pulsatility(cyc)
+            worst4 = min((m for (w, r), m in tk.mean.items() if r == max(RHOS)),
+                         default=float("nan"))
+            # 取显著度最高的那一路报（通常是 3cm，信噪最好）
+            best = max(pul.values(), key=lambda v: v[3], default=None)
+            acdc, bpm, prom = ((best[0], best[2], best[3]) if best
+                               else (float("nan"),) * 3)
+            if not tk.complete():
+                verdict, color = f"不完整（{len(tk.mean)}/10 组合）", "#c33"
+            elif np.isfinite(worst4) and worst4 < MIN_NET_COUNTS:
+                verdict, color = f"4cm 最弱 {worst4:,.0f} ＜ {MIN_NET_COUNTS}", "#c33"
+            elif not pul:
+                verdict, color = "无法判搏动（周期率不足或帧太少）", "#b8860b"
+            elif prom < PULSE_PROM_MIN:
+                verdict, color = f"✗ 看不到心搏（显著度 {prom:.0f}）", "#c33"
+            else:
+                verdict, color = (f"✓ 在体（AC/DC {acdc:.2%}，{bpm:.0f} bpm）",
+                                  "#1a8")
+            self._arm_note = (worst4, acdc, bpm, prom, cyc)
+        elif not tk.complete():
             verdict, color = f"不完整（{len(tk.mean)}/10 组合，不进标定）", "#c33"
         elif drift:
             verdict, color = "不合格 → 有漂移/振荡，加帧数无用", "#c33"
@@ -961,7 +1117,21 @@ class MainWindow(QtWidgets.QWidget):
         # 判定用横幅，不用 QMessageBox。暗块本来就大概率不合格，
         # 每块弹一次模态框会把流程打断得没法做；而且模态框会阻塞事件循环，
         # 采集线程还在往里灌帧，无人点确定时整个界面就停在那儿。
-        if drift:
+        if tk.block in INVIVO_CODES:
+            w4, acdc, bpm, prom, cyc = getattr(
+                self, "_arm_note", (float("nan"),) * 5)
+            if verdict.startswith("✓"):
+                self._banner(
+                    f"✓ {tk.block}：看到心搏（AC/DC {acdc:.2%}，{bpm:.0f} bpm，"
+                    f"谱峰显著度 {prom:.0f}）"
+                    f" —— 探头确实耦合在活体组织上。4cm 最弱 {w4:,.0f} 计数，"
+                    f"周期率 {cyc:.1f} Hz。此次不进标定。", ok=True)
+            else:
+                self._banner(
+                    f"{verdict}（{tk.block}）—— 在体采集不套体模判据。"
+                    f"看不到心搏通常是贴得太松、位置不对，"
+                    f"或者读到的根本不是穿过组织的光。", ok=False)
+        elif drift:
             self._banner(
                 f"✗ {tk.block}：白噪声度 {wr:.2f} ＜ {DRIFT_LIMIT} —— "
                 "采集期间存在慢漂移/振荡，相邻帧高度相关，"
@@ -1232,16 +1402,26 @@ def main(argv=None) -> int:
     ap.add_argument("--no-print", dest="print_frames", action="store_false",
                     default=PRINT_FRAMES_DEFAULT,
                     help="启动时不勾选「终端打印」（默认勾选）")
+    ap.add_argument("--port", default=DEFAULT_PORT,
+                    help=f"启动时自动连的串口，默认 {DEFAULT_PORT}")
+    ap.add_argument("--gear", type=int, default=DEFAULT_GEAR,
+                    help=f"启动时下发的光源档位，默认 {DEFAULT_GEAR}")
+    ap.add_argument("--no-autostart", action="store_true",
+                    help="不自动连口、不自动下发档位")
     args = ap.parse_args(argv)
 
     app = QtWidgets.QApplication(sys.argv[:1])
     win = MainWindow(simulate=args.simulate)
+    win.auto_port, win.auto_gear = args.port, args.gear
     win.chk_print.setChecked(args.print_frames)
     if args.print_frames:
         print("  序号   |  波长  | 距离 |          ADC | 校验 |"
               " 帧头 长 型 波 距   ADC(4B)  通       保留(14B)        校验")
         print("-" * 118, flush=True)
     win.show()
+    # 放在 show() 之后：开口失败要弹提示框，没有父窗口会弹不出来。
+    if not args.no_autostart:
+        QtCore.QTimer.singleShot(0, win.autostart)
     return app.exec_()
 
 

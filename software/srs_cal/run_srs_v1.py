@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """v1 标定：跑通整条 SRS 并给出验证方法。
 
-反演波长跟随 `hardware.WAVELENGTHS_ACTIVE_NM`（当前 670/770/810/850）。
+反演波长跟随 `hardware.WAVELENGTHS_ACTIVE_NM`（当前 670/770；810、850 已停用）。
 
     python -m srs_cal.run_srs_v1                    # 用已采的真实数据
     python -m srs_cal.run_srs_v1 --fig              # 另出验证图到 docs/验证图/
@@ -46,7 +46,7 @@ DOCS_FIG = _HERE.parent.parent / "docs" / "验证图"
 
 # ---------------------------------------------------------------------------
 def load_measured(data_dir: Path = DATA_DIR,
-                  quiet: bool = False) -> tuple[dict, dict, dict]:
+                  quiet: bool = False) -> tuple[dict, dict, dict, dict]:
     """把「逐帧」表读成 {块: {(λ,ρ): [逐帧值]}}，暗采单独返回。
 
     读逐帧而不是汇总，是为了能算批均值标准误 —— 相邻帧相关时
@@ -167,10 +167,17 @@ def load_measured(data_dir: Path = DATA_DIR,
                 era.setdefault(b, set()).add("legacy")
     if skipped_blk and not quiet:
         print(f"  ℹ️ 已排除非体模块名（不进标定）：{sorted(skipped_blk)}")
+    # 每块采了几次（去重后）。标定文件要如实写明有没有重贴合 —— 写死成
+    # 「每块 1 次」在 12 块×3 次之后就是假话，而 online.py 会原样显示它。
+    takes: dict[str, list] = {}
+    for b, t, ts in seen:
+        takes.setdefault(b, []).append((t, ts))
+    for b in takes:
+        takes[b].sort(key=lambda x: str(x[1]))
     # ⚠️ 同一块可能两个时代都有（旧固件采过、换固件后又采了）。
     #    **绝不能合并** —— 旧的 810 是坏的，合进来会把它拖回去。
     #    这里只返回原始的分时代结构，由调用方挑。
-    return by_era, dark, era
+    return by_era, dark, era, takes
 
 
 def batch_se(x, n_batch: int = 10) -> float:
@@ -229,6 +236,10 @@ def main(argv=None) -> int:
     ap.add_argument("--legacy", action="store_true",
                     help="把旧固件（无暗时隙）的数据也算进来。仅供对照："
                          "两个时代的暗电平处理不同，810 尤其不可比。")
+    ap.add_argument("--at-mueff", type=float, metavar="CM-1", default=None,
+                    help="G 取 μeff 趋势在该 μeff 处的值，而非块平均。"
+                         "人体实体层 μeff≈1.84~2.65（见 MC 头模型），用 2.2。"
+                         "⚠️ 经验外推，机理未知")
     ap.add_argument("--exclude", metavar="CODES", default="",
                     help="逗号分隔的块码，排除在标定之外（例：--exclude D4）。"
                          "用于做受控对比 —— 只改一个变量再跑一遍。"
@@ -251,7 +262,7 @@ def main(argv=None) -> int:
     except Exception:                                            # noqa: BLE001
         pass
 
-    by_era, dark, era = load_measured(Path(a.data))
+    by_era, dark, era, takes = load_measured(Path(a.data))
     # 两个时代不能混算，**同一块也不行** —— 旧固件只能整场扣一次暗，
     # 810 偏 2~7 倍；与新数据合并会把它拖回去。
     if by_era["slot"] and not a.legacy:
@@ -304,6 +315,31 @@ def main(argv=None) -> int:
                     for i in range(nb)])
     G = per.mean(axis=0)
     disp = per.std(axis=0, ddof=1)
+    # --at-mueff：G 不取块平均，而是逐波长对 μeff 作线性拟合后在给定 μeff 处取值。
+    #
+    # 为什么需要：G 本应是纯仪器增益、与介质无关，实测却随 μeff 系统漂移
+    # （2026-10-13，12 块×3 次：斜率 −0.256 ± 0.048，r=−0.86，5.3σ），
+    # **连谱形残差也随 μeff 漂**（r = −0.957/+0.952/+0.931，p<1e-4）。
+    # 而只有谱形影响读数、平坦量不影响（实测验证）。所以对跨度 μeff
+    # 0.86~3.00 的 12 块取平均，得到的是 μeff≈1.9 处的谱形，用在人体
+    # （1.84~2.65）上会偏：真值 70% 读成 71.16，50→90 的斜率 0.974。
+    # 在 μeff=2.2 取值则是 70.02 / 0.991。
+    #
+    # ⚠️ 这是**经验修正**，机理未知（见 hardware.py 与 docs）。它假设体模上
+    #    观察到的 μeff 依赖同样适用于人体 —— 这一点没有证据。
+    mueff_blk = np.sqrt(3 * mua_c[sel] * (mua_c[sel] + musp_c[sel]))[:, 1]
+    if a.at_mueff is not None:
+        if nb < 4:
+            print("\n  ⚠️ --at-mueff 需要至少 4 块才能拟合，已忽略")
+        else:
+            fit = np.array([np.polyfit(mueff_blk, per[:, j], 1)
+                            for j in range(WL.size)])
+            G = fit[:, 0] * a.at_mueff + fit[:, 1]
+            print(f"\n  ℹ️ --at-mueff {a.at_mueff:.2f}：G 由 μeff 趋势取值，"
+                  f"非块平均")
+            for j, w in enumerate(WL):
+                print(f"     {w:.0f}  斜率 {fit[j,0]:+.4f}/cm⁻¹  "
+                      f"→ G = {G[j]:+.4f}（块平均为 {per[:,j].mean():+.4f}）")
     print("\n① G(λ)")
     print("   λ      G(λ)      块间离散   平均不确定度   离散/不确定度")
     for j, w in enumerate(WL):
@@ -445,12 +481,13 @@ def main(argv=None) -> int:
         make_figure(codes, xs, ys, k, b, r2, per, disp, (s_flat, s_spec))
     if a.emit_cal:
         emit_cal(Path(a.emit_cal), G, dark, codes, disp, s_flat, s_spec, tcost,
-                 dropped=drop)
+                 dropped=drop, at_mueff=a.at_mueff,
+                 ntk=min((len(takes.get(c, [1])) for c in codes), default=1))
     return 0
 
 
 def emit_cal(path: Path, G, dark: dict, codes, disp, s_flat, s_spec,
-             tcost, dropped=()) -> None:
+             tcost, dropped=(), at_mueff=None, ntk=1) -> None:
     """写标定文件供 online.py 加载。
 
     刻意把**局限性一起写进文件**（`caveats`），而不是只写数值：
@@ -475,7 +512,7 @@ def emit_cal(path: Path, G, dark: dict, codes, disp, s_flat, s_spec,
         "k": 1.0,
         "b": 0.0,
         "source_blocks": list(codes),
-        "n_takes_per_block": 1,
+        "n_takes_per_block": ntk,
         "dispersion_per_wl": [float(x) for x in disp],
         "sigma_flat": float(s_flat),
         "sigma_spectral": float(s_spec),
@@ -487,21 +524,36 @@ def emit_cal(path: Path, G, dark: dict, codes, disp, s_flat, s_spec,
         #    810 恢复、块数变了之后文件里就是假话 —— 而在线程序会把它
         #    原样显示给使用者。
         "caveats": [
-            f"仅 {len(codes)} 块（{', '.join(codes)}）、每块 1 次（**无重贴合**）"
-            " —— 不是出厂标定",
+            f"仅 {len(codes)} 块（{', '.join(codes)}）、每块 "
+            + (f"{ntk} 次重贴合" if ntk > 1 else "1 次（**无重贴合**）")
+            + " —— 不是出厂标定",
             f"反演波长 {'/'.join(f'{w:.0f}' for w in WL)} nm",
             f"G 块间离散 {disp.mean():.4f}（各波长 "
             + "、".join(f"{w:.0f}:{d:.4f}" for w, d in zip(WL, disp)) + "）",
+            # 哪一项代价更大要**看数**，不能写死：平坦 σ 大时是平坦更贵，
+            # 小时是波长相关更贵，两种情形都实际出现过。
             f"其中平坦 {s_flat:.4f}、波长相关 {s_spec:.4f}；"
-            f"波长相关那项代价更大（TOI {tcost[1][1]:.1f} vs 平坦 "
-            f"{tcost[0][1]:.1f} %O₂）",
-            f"预期 TOI 重复性约 ±{tcost[-1][1]:.1f} %O₂"
-            f"（由 {len(codes)} 块估计，样本极少，本身很粗）",
+            + (f"波长相关那项代价更大（TOI {tcost[1][1]:.1f} vs 平坦 "
+               f"{tcost[0][1]:.1f} %O₂）" if tcost[1][1] > tcost[0][1] else
+               f"平坦那项代价更大（TOI {tcost[0][1]:.1f} vs 波长相关 "
+               f"{tcost[1][1]:.1f} %O₂）"),
+            # 这个数是**块间**差异折成的 TOI，即「换一种光学性质的介质、
+            # 不重标定」的偏差，不是同一对象上重贴探头的重复性。两者差很多：
+            # 2026-10-13 实测块间 ±5.2，而重贴合只有 ±2.0 %O₂。
+            f"块间差异折成 TOI ±{tcost[-1][1]:.1f} %O₂ —— 这是「换一种光学"
+            f"性质的介质而不重标定」的偏差，不是同一对象上重贴探头的重复性",
+            f"其中平坦那部分原则上可被 k/b 吸收，扣掉后剩 "
+            f"±{tcost[1][1]:.1f} %O₂（波长相关项，k/b 吸收不掉）",
             "k/b 未标定（=1/0）：TOI 的绝对值未经人体或血液体模对标，"
             "只能看趋势和相对变化，不能当绝对血氧读数",
             "体模上的贴合变异未必等于皮肤上的，该外推无证据支持",
         ] + ([f"人为排除了块 {', '.join(dropped)} —— 这不是自然结果，"
-              f"用它之前必须知道排除的理由"] if dropped else []),
+              f"用它之前必须知道排除的理由"] if dropped else [])
+          + ([f"G 不是块平均，而是 μeff 趋势在 μeff={at_mueff:.2f} cm⁻¹ 处的取值"
+              f"（人体实体层约 1.84~2.65）。因为 G 实测随 μeff 系统漂移、"
+              f"连谱形也漂，对跨度 0.86~3.00 的块取平均会偏向低 μeff 一侧。"
+              f"⚠️ 这是经验外推，机理未知，且假设体模上的 μeff 依赖同样适用于"
+              f"人体 —— 该假设无证据支持"] if at_mueff is not None else []),
     }
     path.write_text(json.dumps(doc, ensure_ascii=False, indent=2),
                     encoding="utf-8")

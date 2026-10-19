@@ -84,8 +84,16 @@ def run(mat_path: Path, step: int = 5) -> int:
 
     raw = sio.loadmat(mat_path, squeeze_me=True, struct_as_record=False)
     deep = raw["Exp1_LMA1_MuaMusp"].Deep  # (T, 14, 2)  mua, musp
-    mua_all = deep[:, :, 0]
-    musp_all = deep[:, :, 1]
+    # ⚠️ 2026-10-13 修正：数据集的 μa/μs′ 单位是 **mm⁻¹**（TD-NIRS 惯例），
+    #    而 srs.py / forward.py 全套按 **cm⁻¹** 工作（RHO_CM、MUSP_REF_800=10.83）。
+    #    原先直接喂进去差 10 倍，后果不是小偏差而是整条结论变样：
+    #        未换算：读数跨 −30.7 ~ 130.1（物理上不可能），回归斜率 1.988
+    #        换算后：读数跨  24.7 ~  96.6，            回归斜率 0.912
+    #    判据（单位自证）：实测 μs′≈1.0 → 1.0 mm⁻¹ = 10 cm⁻¹，正是 Intralipid
+    #    血液体模的典型值；当成 cm⁻¹ 则是 1 cm⁻¹，比任何生物组织都低一个量级。
+    MM_TO_CM = 10.0
+    mua_all = deep[:, :, 0] * MM_TO_CM
+    musp_all = deep[:, :, 1] * MM_TO_CM
     valid = np.isfinite(mua_all).all(axis=1) & np.isfinite(musp_all).all(axis=1)
     mua_all = mua_all[valid]
     musp_all = musp_all[valid]

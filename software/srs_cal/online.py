@@ -40,15 +40,28 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 _HERE = Path(__file__).resolve().parent
 CAL_DIR = _HERE / "标定参数"      # 标定 json 都放这里，由 run_srs_v1 --emit-cal 产出
+# 不带 --cal 时加载哪一个。**刻意写成具名常量，不是「取目录里最新的」**：
+# 那样会把一次顺手的 --emit-cal 产物静默变成在用标定（2026-10-12 已因
+# 默认落点踩过两次）。换版本就改这一行，在 git 里看得见。
+# 2026-10-16：v3 → v5。**标定不跨光学套件转移**，探头换了就必须换标定：
+#   旧探头的 v3 配新探头，真值 70 的介质读 37.2（误差 −32.8 %O₂），
+#   比完全不标定（48.2）还差 11 个点。ΔG 达 −0.218/−0.222（贴合噪声的 7.3 倍）。
+# v5 = 探头优化版数据 + 停用 850（见 hardware.py），TOI 离散 ±1.59 %O₂。
+# ⚠️ v5 仅 6 块 × 1 次，是**临时版**；补满 12 块 × 3 次后重出并改这一行。
+DEFAULT_CAL = "标定_v5_探头优化_双波长.json"
 sys.path.insert(0, str(_HERE.parent))
 
 from srs_cal import hardware as hw                       # noqa: E402
 from srs_cal.acquire import (BAUDRATES, BRIGHTNESS_SETTLE_MS,    # noqa: E402
+                             DEFAULT_GEAR, DEFAULT_PORT,
                              FRAMES_PER_CYCLE, SerialWorker, SimWorker)
 from srs_cal.protocol import (BRIGHTNESS_DEFAULT, BRIGHTNESS_MAX,  # noqa: E402
                               BRIGHTNESS_MIN, build_brightness)
 
-WL = hw.WAVELENGTHS_ACTIVE_NM                 # 670 / 770 / 850
+# DEFAULT_PORT / DEFAULT_GEAR 定义在 acquire.py，这里只 import（见上方 import 行）。
+# 两个程序共用一份，避免各改各的、悄悄跑偏。命令行 --port / --gear 可临时覆盖。
+
+WL = hw.WAVELENGTHS_ACTIVE_NM                 # 当前 670 / 770（810、850 已停用）
 RHO = hw.RHO_CM
 # 与 liveplot.py 同一套配色。键要覆盖**全部**器件波长，不能只列当前
 # 在用的几路 —— WAVELENGTHS_ACTIVE_NM 变过（810 停用又恢复），
@@ -285,6 +298,7 @@ class OnlineWindow(QtWidgets.QWidget):
 
     # -- 串口 --------------------------------------------------------------
     def _refresh_ports(self) -> None:
+        """枚举串口，并把 DEFAULT_PORT 预选上（若在）。"""
         self.cmb_port.clear()
         try:
             from serial.tools import list_ports
@@ -294,6 +308,31 @@ class OnlineWindow(QtWidgets.QWidget):
             pass
         if self.cmb_port.count() == 0:
             self.cmb_port.addItem("未发现串口", None)
+            return
+        i = self.cmb_port.findData(DEFAULT_PORT)
+        if i >= 0:
+            self.cmb_port.setCurrentIndex(i)
+
+    def _autostart(self) -> None:
+        """启动时自动连 DEFAULT_PORT 并下发 DEFAULT_GEAR。
+
+        ⚠️ 只在该串口**确实存在**时才动。找不到就什么都不做、只提示 ——
+           不去连别的口：自动连到另一台设备上并给它下发最大光强，
+           是个比"没自动连"糟糕得多的结果。
+        """
+        if self.simulate or self.worker is not None:
+            return
+        port = getattr(self, "auto_port", DEFAULT_PORT)
+        if self.cmb_port.findData(port) < 0:
+            self.lbl_link.setText(f"未发现 {port}，请手动选口")
+            return
+        i = self.cmb_port.findData(port)
+        self.cmb_port.setCurrentIndex(i)
+        self._toggle_conn()
+        if self.worker is None:                 # 开口失败，_on_failed 已提示
+            return
+        self.spn_bright.setValue(getattr(self, "auto_gear", DEFAULT_GEAR))
+        self._bright_timer.start()
 
     def _send_brightness(self) -> None:
         """下发档位。在线没有「一次采集」的概念，随时可改。
@@ -484,11 +523,29 @@ class OnlineWindow(QtWidgets.QWidget):
 # ---------------------------------------------------------------------------
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="在线 SRS —— 实时 TOI")
-    ap.add_argument("--cal", help="标定文件（run_srs_v1.py --emit-cal 产出）")
+    ap.add_argument("--cal", default=DEFAULT_CAL,
+                    help=f"标定文件（run_srs_v1.py --emit-cal 产出）。"
+                         f"默认 {DEFAULT_CAL}；传 none 则不加载（G=0）")
     ap.add_argument("--simulate", action="store_true", help="无硬件排练")
+    ap.add_argument("--port", default=DEFAULT_PORT,
+                    help=f"启动时自动连的串口，默认 {DEFAULT_PORT}")
+    ap.add_argument("--gear", type=int, default=DEFAULT_GEAR,
+                    help=f"启动时下发的光源档位，默认 {DEFAULT_GEAR}")
+    ap.add_argument("--no-autostart", action="store_true",
+                    help="不自动连口、不自动下发档位")
     a = ap.parse_args(argv)
 
     cal = Calibration()
+    if a.cal and a.cal.lower() == "none":
+        a.cal = None
+    if a.cal and not (CAL_DIR / a.cal).exists() and not Path(a.cal).exists() \
+            and a.cal == DEFAULT_CAL:
+        # 默认文件不在 —— 不要静默改用别的版本，说清楚再退回 G=0。
+        have = sorted(p.name for p in CAL_DIR.glob("*.json"))
+        print(f"⚠ 默认标定 {DEFAULT_CAL} 不存在于 {CAL_DIR}")
+        print(f"  现有：{have if have else '（空）'}")
+        print(f"  用 --cal <文件名> 指定，或改 online.py 的 DEFAULT_CAL")
+        a.cal = None
     if a.cal:
         p = Path(a.cal)
         if not p.is_absolute() and not p.exists():
@@ -509,7 +566,12 @@ def main(argv=None) -> int:
 
     app = QtWidgets.QApplication(sys.argv if argv is None else [])
     win = OnlineWindow(cal, simulate=a.simulate)
+    win.auto_port, win.auto_gear = a.port, a.gear
     win.show()
+    # 自动连口 + 下发档位放在 show() 之后：失败时的提示框要有父窗口，
+    # 否则弹不出来（或弹到屏幕外）。延一拍让事件循环先跑起来。
+    if not a.no_autostart:
+        QtCore.QTimer.singleShot(0, win._autostart)
     return app.exec_()
 
 

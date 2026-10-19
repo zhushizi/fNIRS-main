@@ -91,7 +91,12 @@ EXPECTED_CHANNEL = 0x01          # byte10。厂家参考实现不读这一字节
 #    不必等固件改 —— 可以先用软件切档位验证暗电平方案。
 FRAME_TYPE_CMD = 0x01
 CMD_START, CMD_STOP = 0x01, 0x00
-BRIGHTNESS_MIN, BRIGHTNESS_MAX = 0x00, 0x96
+# 档位占指令帧的**一个字节**（build_brightness 的 b[5]），所以物理上限就是
+# 0xFF = 255。要再高必须改协议（换两字节或换字段），这是厂家的事。
+# ⚠️ 2026-10-13 曾要求设到 300、256 —— 都越界：300 会抛 ValueError，
+#    256 按模 256 变成 0（最暗），两种都不是想要的结果。
+BRIGHTNESS_BYTE_MAX = 0xFF
+BRIGHTNESS_MIN, BRIGHTNESS_MAX = 0x00, BRIGHTNESS_BYTE_MAX
 BRIGHTNESS_DEFAULT = 0x0F        # 上电默认，= 上限的 10%
 
 # ⚠️ **命名口径与厂家不同，对接时按字节位置说，别按名字说：**
@@ -216,7 +221,11 @@ def format_frame(raw: bytes) -> str:
 
 
 def build_brightness(gear: int) -> bytes:
-    """光源档位指令。gear = 0x00 ~ 0x0F，**上电默认 0x0F（最亮）**。
+    """光源档位指令。gear = 0x00 ~ 0xFF（0~255），上电默认 0x0F（15）。
+
+    ⚠️ 档位是**一个字节**，传 >255 会被 bytearray 拒绝。上限经历过
+       0x0F → 0x96(150) → 0xFF(255) 三次上调，都是厂家确认后改的；
+       再往上需要改协议，不是改这个常数。
 
     这是目前唯一确认有效的指令。生成的帧与厂家 2026-10-10 给的样例一致：
         build_brightness(0x00) == 55 AA 1A 01 01 00 01 00 … 00 1D
