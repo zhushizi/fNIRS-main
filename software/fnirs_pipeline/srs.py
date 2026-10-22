@@ -79,6 +79,42 @@ B_BOUNDS = (0.4, 1.6)
 SLOPE_RESIDUAL_MAX = 0.05       # 三点拟合残差上限（理论值 ≈0.018 OD）
 MIN_COUNTS = 2000               # 最远探测器的有效计数下限
 
+# ---------------------------------------------------------------------------
+# 物理判据（2026-10-22 新增）—— 不需要任何外部参考，只靠生理学与物理上限
+# ---------------------------------------------------------------------------
+# 两探测器 + 两波长时空间残差与光谱残差**都恒为零**（见 compute_toi 的 flags），
+# 设备出了异常不会报警。这组判据是当前唯一还能抓到异常的东西。
+#
+# tHb 窗口取 20~120 µM：本仓库自己的 MBLL 基线假设 80 µM
+# （online_android/rso2.py: DEFAULT_BASELINE_HBT_uM），成人组织常见 40~80 µM，
+# 两侧各留约 2 倍余量。**刻意取宽** —— 它要抓的是「2.66 µM」「TOI 106.8%」
+# 这种量级的失败（2026-10-13/14 在体实测出现过），不是精细判别。
+THB_MIN_uM, THB_MAX_uM = 20.0, 120.0
+
+# μa 谱拟合残差上限，cm⁻¹。⚠️ 仅在 dof > 0（≥3 波长）时生效。
+#
+# 定值依据（正演 + 实测噪声，2026-10-22）。**误报率与灵敏度要一起看** ——
+# 初版只按误报率取了 0.015，漏掉灵敏度那一半，自检当场抓到。
+#
+#   残差本底（正确系统，仅模型近似误差）      0.00024 ~ 0.00035
+#   叠加实测通道噪声 3.6% 后的 99 分位        0.0096 ~ 0.0105
+#   （3.6% 取自 2026-10-22 在体归档，差分法实测）
+#
+#     阈值    误报率        单路失配检出下限
+#     0.010   1.1 ~ 1.8%   ~20%
+#     0.012   0.24~0.29%   ~25 ~ 35%     ← 取此
+#     0.015   0.01~0.03%   ~25 ~ 43%
+#     0.020   0.00%        ~35 ~ 58%（太钝）
+#
+# 取 0.012：按 0.66 周期/秒、10 周期一个窗口算，误报约每 1.5 小时一次，
+# 而它只是**质量标志**不是报警，这个代价换灵敏度划算。
+#
+# ⚠️ 检出下限是个**区间**，因为灵敏度取决于失配发生在哪一路：
+#    同样 +30% 失配，落在 850 上只产生 0.0104 残差，落在最敏感的那一路
+#    产生 0.0188。拟合能部分吸收与张成空间较对齐的那一路的偏差。
+#    所以「未超阈」不等于「没有失配」，只能说「没有大到这个程度」。
+SPECTRAL_RESIDUAL_MAX = 0.012
+
 
 # ---------------------------------------------------------------------------
 @dataclass
@@ -112,11 +148,49 @@ class SrsResult:
     slope: np.ndarray                       # 各波长的 dA/dρ
     residual: np.ndarray                    # 各波长的三点拟合残差 RMS (OD)
     b_fitted: float = np.nan                # 自解得到的 μs′ 谱指数
-    flags: list[str] = field(default_factory=list)   # 质量标记
+    # flags：**本次测量的异常**。随测随报。
+    # config_notes：与本次测量无关的**常驻配置状态**（如「只有 2 波长」）。
+    #   ⚠️ 2026-10-22 分出来。此前两者混在 flags 里，后果有二：
+    #     ① `valid` 恒为 False —— 常驻项永远在，条件 `not self.flags` 永不成立
+    #     ② 下游把它当异常逐次呈现，每次都显示 ✗，真异常被淹没
+    #        （真机回放当场抓到：30 次反演全部显示 fail）
+    #   常驻项应由界面固定呈现一次，不进逐次异常行。
+    flags: list[str] = field(default_factory=list)
+    config_notes: list[str] = field(default_factory=list)
+
+    # --- 2026-10-22 补回。此前这三项算出来就被丢掉 ------------------------
+    # c_hbo/c_hbr：绝对浓度（mol/L）。`mua_to_toi` 一直在算，调用处用 `_` 丢弃。
+    #   它们是 TOI 的来源，且 tHb = c_hbo + c_hbr 构成一条**不需要任何外部
+    #   参考**的物理判据：组织 tHb 应在 20~120 µM。
+    # spectral_residual：μa 谱的拟合残差（cm⁻¹）。
+    #   ⚠️ 只有 `spectral_dof > 0` 时才有自检意义。当前两波长 dof=0，
+    #      残差恒为零；恢复到 ≥3 波长后自动生效。
+    #   ⚠️ 自解散射分支下恒为 NaN —— 那条路的 mua 是由拟合浓度**重建**的
+    #      （见 fit_scattering_and_toi 末尾的 `_unpack`），再去拟合它残差
+    #      必然为零，不构成自检。真正的残差在 least_squares 的斜率域里。
+    c_hbo: float = np.nan
+    c_hbr: float = np.nan
+    spectral_residual: np.ndarray | None = None
+    spectral_dof: int = 0
 
     @property
     def valid(self) -> bool:
         return bool(np.isfinite(self.toi)) and not self.flags
+
+    @property
+    def thb_uM(self) -> float:
+        """总血红蛋白，µM。NaN 表示未解出。"""
+        if not (np.isfinite(self.c_hbo) and np.isfinite(self.c_hbr)):
+            return float("nan")
+        return (self.c_hbo + self.c_hbr) * 1e6
+
+    @property
+    def spectral_resid_rms(self) -> float:
+        """μa 谱残差 RMS（cm⁻¹）。dof=0 时恒为 0，**不代表拟合好**。"""
+        if self.spectral_residual is None:
+            return float("nan")
+        r = np.asarray(self.spectral_residual, float)
+        return float(np.sqrt(np.mean(r ** 2))) if r.size else float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +261,63 @@ def mua_from_mueff(mueff: np.ndarray, musp: np.ndarray) -> np.ndarray:
     return np.where(mueff > 0, mueff ** 2 / (3.0 * musp), np.nan)
 
 
+@dataclass(frozen=True)
+class HbFit:
+    """μa 谱 → 血红蛋白浓度的完整分解。
+
+    2026-10-22 新增。此前 `mua_to_toi` 只把 TOI 和浓度返回出去，
+    **拟合残差被 `*_` 丢弃** —— 而那正是光谱自检。
+    """
+
+    toi: float                  # 100·HbO/(HbO+HbR)，%
+    c_hbo: float                # mol/L
+    c_hbr: float                # mol/L
+    residual: np.ndarray        # 各波长的 μa 拟合残差，cm⁻¹
+    dof: int                    # 自由度 = 波长数 − 2
+
+    @property
+    def thb(self) -> float:
+        """总血红蛋白，µM。组织典型 40~80 µM —— 越界即为物理判据失败。"""
+        return (self.c_hbo + self.c_hbr) * 1e6
+
+    @property
+    def resid_rms(self) -> float:
+        r = np.asarray(self.residual, float)
+        return float(np.sqrt(np.mean(r ** 2))) if r.size else float("nan")
+
+    @property
+    def resid_rel(self) -> float:
+        """残差相对 μa 量级。dof=0 时恒为 0，无自检意义。"""
+        r = np.asarray(self.residual, float)
+        return float("nan") if r.size == 0 else self.resid_rms
+
+
+def mua_to_hb(mua: np.ndarray, wavelengths: np.ndarray,
+              table: str = "wray") -> HbFit:
+    """由各波长 μa 最小二乘解出 HbO/HbR，并**保留残差**。
+
+    ⚠️ **dof = 波长数 − 2。dof = 0 时残差恒为零，不是「拟合完美」。**
+       当前在用两波长（670/770），矩阵是 2×2 可逆方阵，任何输入
+       （包括纯噪声）都会被映射成一对浓度，残差为零 —— 这正是
+       `docs/双解码器架构.md` R1 说的「零自检」。恢复到 ≥3 波长后，
+       本残差自动变成真正的光谱自检，无需改代码。
+    """
+    mua = np.asarray(mua, dtype=float)
+    wl = list(map(float, np.atleast_1d(wavelengths)))
+    dof = max(len(wl) - 2, 0)
+    if mua.size == 0 or np.any(~np.isfinite(mua)):
+        return HbFit(np.nan, np.nan, np.nan, np.full(len(wl), np.nan), dof)
+    E = hemoglobin_extinctions(wl, table)                 # 1/(M·cm)
+    A = E * LN10
+    c, *_ = np.linalg.lstsq(A, mua, rcond=None)
+    # ⚠️ 不用 lstsq 返回的 residuals：它在**欠定或恰定**时是空数组，
+    #    而我们恰恰工作在恰定（2 波长）状态。显式算，口径才一致。
+    resid = mua - A @ c
+    total = c[0] + c[1]
+    toi = 100.0 * c[0] / total if total != 0 else np.nan
+    return HbFit(float(toi), float(c[0]), float(c[1]), resid, dof)
+
+
 def mua_to_toi(mua: np.ndarray, wavelengths: np.ndarray,
                table: str = "wray") -> tuple[float, np.ndarray]:
     """由各波长 μa 解出 (c_HbO, c_HbR)，返回 (TOI%, 浓度)。
@@ -194,14 +325,15 @@ def mua_to_toi(mua: np.ndarray, wavelengths: np.ndarray,
     ⚠️ ε 表的选择直接进结果，且**没有退路**：
        MBLL 送检时两侧用同一张表可抵消，SRS 出绝对值，表错了就是错了。
        实测 wray 与 Prahl 在 700nm 的 HbO 差 44.6%，导致 TOI 差 4~6 %O₂。
+
+    本函数是 `mua_to_hb` 的薄包装，**签名刻意保持不变** ——
+    既有调用方（run_srs_v1、tools/ 下多个脚本）用的是 2 元组解包或 `[0]`。
+    要残差请直接用 `mua_to_hb`。
     """
-    mua = np.asarray(mua, dtype=float)
-    if np.any(~np.isfinite(mua)):
+    f = mua_to_hb(mua, wavelengths, table)
+    if not np.isfinite(f.c_hbo):
         return np.nan, np.full(2, np.nan)
-    E = hemoglobin_extinctions(list(map(float, wavelengths)), table)   # 1/(M·cm)
-    c, *_ = np.linalg.lstsq(E * LN10, mua, rcond=None)
-    total = c[0] + c[1]
-    return (100.0 * c[0] / total if total != 0 else np.nan), c[:2]
+    return f.toi, np.array([f.c_hbo, f.c_hbr], dtype=float)
 
 
 def fit_scattering_and_toi(slope: np.ndarray, rho: np.ndarray,
@@ -294,6 +426,7 @@ def compute_toi(intensities: np.ndarray, geom: SrsGeometry,
     wl = geom.wavelengths_nm
     rho = geom.rho_cm
     flags: list[str] = []
+    notes: list[str] = []
 
     A = to_attenuation(intensities, geom.dark_level)
     slope, resid = fit_slopes(A, rho)
@@ -308,9 +441,18 @@ def compute_toi(intensities: np.ndarray, geom: SrsGeometry,
     if np.nanmin(I[:, -1]) < MIN_COUNTS:
         flags.append("最远探测器计数不足")
     # 2 个探测器时残差恒为零，空间自检不可用 —— 必须显式标出来，
-    # 否则 residual=0 会被误读成「拟合极好」。改由光谱域自检承担，见下。
+    # 否则 residual=0 会被误读成「拟合极好」。
+    # ⚠️ 2026-10-22 修正措辞：原文是「请依赖光谱残差」，但当前只有两个波长，
+    #    光谱残差同样恒为零（实测 1.1e-17，即机器精度）。两条自检**都没有**，
+    #    这句话原样留着会把人引到一条不存在的退路上。
+    #    真正的退路是下面的物理判据（tHb / TOI 越界 / 浓度非负）。
     if rho.size < 3:
-        flags.append("仅 2 个长距：无空间残差自检，请依赖光谱残差")
+        if wl.size < 3:
+            notes.append(f"仅 {rho.size} 长距 + {wl.size} 波长："
+                         "空间与光谱自检**均不可用**，只能依赖物理判据")
+        else:
+            notes.append(f"仅 {rho.size} 个长距：无空间残差自检，"
+                         "请依赖光谱残差")
     elif np.nanmax(resid) > SLOPE_RESIDUAL_MAX:
         flags.append(f"斜率拟合残差 {np.nanmax(resid):.4f} 超限（理论 ≈0.018）")
 
@@ -324,15 +466,36 @@ def compute_toi(intensities: np.ndarray, geom: SrsGeometry,
         if np.isfinite(b_fit) and min(abs(b_fit - B_BOUNDS[0]),
                                       abs(b_fit - B_BOUNDS[1])) < 1e-3:
             flags.append(f"自解谱指数 b={b_fit:.3f} 顶到边界，模型可能不匹配")
+        # 浓度仍要解出来（物理判据要用），但 **残差置 NaN**：
+        # 这条路的 mua 是由拟合浓度重建的，再拟合必然零残差，不是自检。
+        hb = mua_to_hb(mua, wl, table)
+        hb = HbFit(hb.toi, hb.c_hbo, hb.c_hbr,
+                   np.full(wl.size, np.nan), 0)
     else:
         b_fit = MUSP_EXPONENT
         musp = musp_power_law(wl, MUSP_REF_800, b_fit)
         mua = mua_from_mueff(mueff, musp)
-        toi_raw, _ = mua_to_toi(mua, wl, table)
+        hb = mua_to_hb(mua, wl, table)      # 这条路的残差**是**真正的光谱自检
+        toi_raw = hb.toi
+
+    # 物理判据：不需要任何外部参考，只靠生理学。组织 tHb 应在 20~120 µM。
+    # ⚠️ 这是当前「零自检」状态下**唯一**还能抓到异常的东西，别省。
+    thb = hb.thb
+    if np.isfinite(thb) and not (THB_MIN_uM <= thb <= THB_MAX_uM):
+        flags.append(f"tHb {thb:.1f} µM 越界（生理 {THB_MIN_uM:.0f}~{THB_MAX_uM:.0f}）")
+    if np.isfinite(hb.c_hbo) and (hb.c_hbo < 0 or hb.c_hbr < 0):
+        flags.append("解出的 HbO/HbR 有负值，模型与数据不符")
+    if np.isfinite(toi_raw) and not (0.0 <= toi_raw <= 100.0):
+        flags.append(f"TOI_raw {toi_raw:.1f}% 越界（物理上限 0~100）")
+    if hb.dof > 0 and hb.resid_rms > SPECTRAL_RESIDUAL_MAX:
+        flags.append(f"光谱残差 {hb.resid_rms:.4f} 超限（限 {SPECTRAL_RESIDUAL_MAX}）")
 
     toi = geom.k * toi_raw + geom.b if np.isfinite(toi_raw) else np.nan
     return SrsResult(toi=toi, toi_raw=toi_raw, mua=mua, mueff=mueff,
-                     slope=slope, residual=resid, b_fitted=b_fit, flags=flags)
+                     slope=slope, residual=resid, b_fitted=b_fit,
+                     flags=flags, config_notes=notes,
+                     c_hbo=hb.c_hbo, c_hbr=hb.c_hbr,
+                     spectral_residual=hb.residual, spectral_dof=hb.dof)
 
 
 def compute_toi_series(intensities: np.ndarray, geom: SrsGeometry,

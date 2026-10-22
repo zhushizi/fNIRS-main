@@ -31,6 +31,7 @@ sys.path.insert(0, str(_HERE.parent))
 
 from srs_cal import hardware as hw           # noqa: E402
 from srs_cal import phantom                  # noqa: E402
+from srs_cal.robust import aggregate         # noqa: E402
 from srs_cal.protocol import (                # noqa: E402
     BRIGHTNESS_MAX, BRIGHTNESS_MIN, DISTANCE_BY_CODE, EXPECTED_CHANNEL,
     BRIGHTNESS_DEFAULT, WAVELENGTH_BY_CODE, Frame, FrameStream,
@@ -176,6 +177,8 @@ class Take:
     #    实际是设备上电默认档位 0x0F（最亮）。那几份数据按 15 解读。
     brightness: int | None = None
     mean: dict = field(default_factory=dict)
+    # 稳健聚合剔除的样本数，键同 mean。供质量层使用，别丢。
+    rejected: dict = field(default_factory=dict)
     std: dict = field(default_factory=dict)
     count: dict = field(default_factory=dict)
     # 暗时隙读数（距离 -> 本次采集的全部暗值）。信号已在采集时逐周期扣过暗，
@@ -370,9 +373,19 @@ class SerialWorker(QtCore.QThread):
                 self._lock.unlock()
                 for pay in out:
                     ser.write(pay)
-                data = ser.read(4096)
-                if data:
-                    fr = self.stream.feed(data)
+                # ⚠️ 2026-10-22：不要用 `ser.read(4096)` —— 它阻塞到**超时**
+                #    才返回，帧的 t_host 因而晚于真实到达时刻，凭空制造抖动。
+                #    真机实测（verify_timing，COM16 115200，2026-10-22）：
+                #        read(4096) + timeout=0.2 → 每批 2 帧，净抖动 31%
+                #        先等 1 字节再打戳        → 每批 1 帧，净抖动  7%
+                #    设备以 2.3 ms 突发送完一帧，再静默约 125 ms，所以
+                #    "等第一个字节"几乎就是帧的到达时刻。
+                #    归档会把 t_host 永久记下来，事后补不回来，故在此修正。
+                head = ser.read(1)
+                if head:
+                    t_arrive = time.perf_counter()
+                    rest = ser.read(ser.in_waiting) if ser.in_waiting else b""
+                    fr = self.stream.feed(head + rest, t_host=t_arrive)
                     if fr:
                         self.framesReady.emit(fr)
         except Exception as e:                                  # noqa: BLE001
@@ -1016,11 +1029,17 @@ class MainWindow(QtWidgets.QWidget):
                   brightness=(self.gear_in_effect() if BRIGHTNESS_ADJUSTABLE
                               else None))
         tk.dark = {r: list(v) for r, v in self.dark_buffer.items()}
+        # ⚠️ 2026-10-22：由算术均值改为**稳健聚合**（MAD 剔除离群后取均值）。
+        #    实测在体归档每通道有 2~6% 的周期是尖峰、幅度约 25 倍；
+        #    一个尖峰就能把该次采集的均值抬高数倍。选型依据见 robust.py。
+        #    std 同样基于保留样本，与 mean 口径一致（否则 rel_std/sem 会虚高）。
+        tk.rejected = {}
         for k, vals in self.buffer.items():
-            a = np.asarray(vals, dtype=float)
-            tk.mean[k] = float(a.mean())
-            tk.std[k] = float(a.std(ddof=1) if a.size > 1 else 0.0)
-            tk.count[k] = int(a.size)
+            ag = aggregate(vals)
+            tk.mean[k] = ag.value
+            tk.std[k] = ag.std
+            tk.count[k] = ag.n_used
+            tk.rejected[k] = ag.n_rejected
         tk.frames = list(self.order_buffer)
         # ⚠️ 不完整的采集**照样留下**。缺组合恰恰最需要原始帧来查原因
         #    （哪颗 LED 没亮？帧率够不够？），扔掉它就等于扔掉证据。

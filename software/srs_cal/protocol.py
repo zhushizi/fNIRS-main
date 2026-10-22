@@ -31,7 +31,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 
 HEADER = b"\x55\xAA"
 FRAME_LEN = 26
@@ -60,6 +61,20 @@ DISTANCE_BY_CODE: dict[int, float] = {0x01: 3.0, 0x02: 4.0}
 CODE_BY_DISTANCE = {v: k for k, v in DISTANCE_BY_CODE.items()}
 
 EXPECTED_CHANNEL = 0x01          # byte10。厂家参考实现不读这一字节，见下
+
+# ---------------------------------------------------------------------------
+# 扫描周期（2026-10-22 新增，为 t_host / cycle_id 服务）
+# ---------------------------------------------------------------------------
+# 一周期 = (1 暗 + 5 波长) × 2 距离。**由本文件的协议表自身推导**，
+# 因为周期结构是固件定的，协议层才是它的权威出处。
+#
+# ⚠️ acquire.py:66 另有一个同名常量，由它自己的 WLS/RHOS 算出。两者**应当相等**；
+#    若不等，说明采集侧期望的波长集与设备实际发送的不一致 —— 那本身就是个信号。
+#    本模块不 import acquire（层次颠倒），故刻意不合并。
+FRAMES_PER_CYCLE = (1 + len(WAVELENGTH_BY_CODE)) * len(DISTANCE_BY_CODE)
+
+# 周期起点标志：暗时隙 + 最近的那个距离（实测帧序 (0,3cm) → (0,4cm) → (670,3cm) …）
+CYCLE_START_DISTANCE_CM = min(DISTANCE_BY_CODE.values())
 
 # ---------------------------------------------------------------------------
 # 指令帧（帧标识 0x01）—— 由厂家 jhw-adc.py 的 _build_cmd() 确认
@@ -118,6 +133,31 @@ class Frame:
     channel: int
     raw: bytes
 
+    # --- 2026-10-22 新增。两者都由 **上位机** 补，设备不发这些 ---------------
+    #
+    # t_host：收到这一帧时的 `time.perf_counter()`。
+    #   ⚠️ 设备侧 26 字节里**没有任何时间字段**（见文件头的帧格式表），
+    #      而 FrameStream 是全链路唯一知道"字节何时到达"的地方 ——
+    #      帧一旦交给上层，时间信息就永久丢失，事后无法补。
+    #      没有它就没有采样率：2026-10-13~14 的 6 组在体采集，靠 take 时间戳
+    #      倒推出 0.67 / 1.02 / 12.50 / 25.00 周期每秒，**跨度 37 倍**，
+    #      任何按 Hz 指定的滤波都无从谈起（MBLL 因此完全做不了）。
+    #   精度：串口按块读，同一批解出的帧共用一个时刻，批内误差在微秒级，
+    #      对 ~12 周期/秒的扫描率足够。要更准需厂家在 byte11:25 的
+    #      14 字节保留区里打设备侧时间戳。
+    #
+    # cycle_id：本帧属于第几个扫描周期，从 0 开始。
+    #   用途一：让"逐周期扣暗"可验证。现在 online.py 用的是**最近一次**暗值
+    #      （`self.cycle_dark[距离]`），不是**同周期**暗值 —— 不丢帧时两者
+    #      等价，一旦丢帧（n_dropped 不为零是实际发生过的），信号帧会被
+    #      上一周期的暗值扣掉，而且没有任何提示。
+    #   用途二：五个波长是周期内**依次**点亮的，670 与 770 差几十毫秒。
+    #      算慢变化无所谓，算心搏带时该进计算。
+    #
+    # 两者都有默认值，所有既有调用无需改动。
+    t_host: float = 0.0
+    cycle_id: int = -1
+
     @property
     def key(self) -> tuple[float, float]:
         return (self.wavelength_nm, self.distance_cm)
@@ -154,21 +194,47 @@ class FrameStream:
     `feed()` 返回本次喂入后新解出的帧。丢弃的字节计入 `n_dropped`，
     校验失败计入 `n_bad_checksum` —— 这两个计数就是链路质量指标，
     标定时若不为零应当停下来查线，不要带病采数。
+
+    2026-10-22 起还负责给每帧补 `t_host` 和 `cycle_id`（见 `Frame` 的说明）。
+    周期计数**不假定每周期 12 帧**，而是实测计数后与 `FRAMES_PER_CYCLE`
+    比对，不符的计入 `n_short_cycles`。这样固件改了帧结构也不会静默出错。
     """
 
     MAX_BUFFER = 64 * 1024
 
-    def __init__(self) -> None:
+    def __init__(self, clock=time.perf_counter) -> None:
         self._buf = bytearray()
         self.n_frames = 0
         self.n_dropped = 0
         self.n_bad_checksum = 0
+        # --- 周期跟踪 -------------------------------------------------------
+        self._clock = clock          # 可注入，便于自检里用确定性时钟
+        self.cycle_id = -1           # 尚未见到第一个周期起点
+        self.n_cycles = 0            # 已见到的周期起点数
+        self.n_short_cycles = 0      # 帧数 ≠ FRAMES_PER_CYCLE 的周期数
+        self._in_cycle = 0           # 当前周期已收帧数
 
     def reset(self) -> None:
         self._buf.clear()
         self.n_frames = self.n_dropped = self.n_bad_checksum = 0
+        self.cycle_id = -1
+        self.n_cycles = self.n_short_cycles = self._in_cycle = 0
 
-    def feed(self, data: bytes) -> list[Frame]:
+    def _stamp(self, fr: Frame, t_host: float) -> Frame:
+        """补 t_host / cycle_id。周期起点 = 暗时隙 + 最近距离。"""
+        if fr.is_dark and fr.distance_cm == CYCLE_START_DISTANCE_CM:
+            # 上一周期收尾：帧数对不上就记一笔（丢帧 / 固件帧结构变了）
+            if self.cycle_id >= 0 and self._in_cycle != FRAMES_PER_CYCLE:
+                self.n_short_cycles += 1
+            self.cycle_id += 1
+            self.n_cycles += 1
+            self._in_cycle = 0
+        self._in_cycle += 1
+        return replace(fr, t_host=t_host, cycle_id=self.cycle_id)
+
+    def feed(self, data: bytes, t_host: float | None = None) -> list[Frame]:
+        """`t_host` 留空则取 `self._clock()`；显式传入用于回放已归档的数据。"""
+        t = self._clock() if t_host is None else float(t_host)
         self._buf.extend(data)
         if len(self._buf) > self.MAX_BUFFER:        # 异常流，别无限涨
             self.n_dropped += len(self._buf) - self.MAX_BUFFER
@@ -199,7 +265,7 @@ class FrameStream:
                 continue
             del self._buf[:FRAME_LEN]
             self.n_frames += 1
-            out.append(fr)
+            out.append(self._stamp(fr, t))
         return out
 
 

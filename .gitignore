@@ -83,3 +83,6 @@ __pycache__/
 
 # Decoder runtime logs (online_android.logging_utils)
 software/online_android/logs/
+# SRS 原始归档（二进制，约 18 MB/小时，不进版本库）
+software/srs_cal/原始归档/
+*.srsraw
