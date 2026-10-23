@@ -539,3 +539,143 @@ def scalp_confidence(long_toi: np.ndarray, short_signal: np.ndarray,
         if np.std(a) > 0 and np.std(b) > 0:
             out[i] = float(np.corrcoef(a, b)[0, 1])
     return out
+
+
+# ---------------------------------------------------------------------------
+# 派生相对量（2026-10-23 新增）
+# ---------------------------------------------------------------------------
+# 为什么从 SRS 的绝对浓度减基线，而不是跑 MBLL：
+#
+#   MBLL 要 **300 秒**才出第一个点（高通 0.01 Hz 的起步门槛），而且依赖
+#   `scipy.signal` 的零相位滤波 —— 移植到安卓端很麻烦。
+#   SRS 的 `compute_toi` **本来就逐点算出 c_hbo / c_hbr / tHb**，减一条
+#   基线就是全部需要的相对量：延迟只有 SRS 自身的 N/2 个周期，而且
+#   **纯算术，没有滤波、没有 scipy**。
+#
+#   这也是竞品 BRS-100 的做法（说明书 p17/p31：输出 CHb/CHbO2/CtHb 绝对浓度
+#   + 基线 + 与基线的差值比率 + AUC，整机不含 MBLL）。
+#
+# 代价（实测，体模静置 141147）：
+#   ΔHbO 噪声底 1.486 µM，是 MBLL 带通路径（0.124 µM）的 12 倍。
+#   但真实生理信号远大于此 —— 阻断实验实测 ΔtHb 67 µM、ΔHbO 63 µM，
+#   信噪比 42~70 倍，绰绰有余。各量的噪声底与阻断信噪比：
+#
+#       量      噪声底        阻断信号    信噪比
+#       ΔtHb    0.955 µM     67.1 µM      70×
+#       ΔTHI    2.05  %      96.6 %       47×
+#       ΔHbO    1.486 µM     62.8 µM      42×
+#       ΔHbR    0.741 µM      5.2 µM       7×
+#       ΔTOI    1.868 %O₂     —           见下
+#
+#   ⚠️ ΔTOI 的噪声底 1.868 %O₂ 不算小。文献报道动脉阻断的去饱和速率是
+#      6~16 %O₂/分钟（前臂 15mm 探头 −6.4、25mm −10.0、大鱼际 −12.5），
+#      3 分钟可降 20~30 点 —— 那时信噪比 10~16 倍。但**小幅去饱和会被淹没**。
+#
+# ⚠️ 基线不抗漂移。SRS 浓度 63% 的噪声在 <0.01 Hz，而 SRS **不能高通**
+#    （会毁掉绝对值）。所以界面必须提供「重设基线」，由操作者按需校准 ——
+#    竞品也是这么做的（说明书 p32「点击后，系统重新校准基线值」）。
+
+
+@dataclass(frozen=True)
+class Baseline:
+    """一次基线标定。**不可变** —— 重设就新建一个，不就地改。
+
+    这样任何一个 `Derived` 都能追溯到它是相对哪一条基线算的。
+    """
+
+    t: float                 # 设定时刻（调用方的时钟）
+    n: int                   # 参与平均的点数
+    hbo: float               # µM
+    hbr: float               # µM
+    thb: float               # µM
+    toi: float               # %
+
+    @property
+    def ok(self) -> bool:
+        """tHb 为 0 时 THI 无定义 —— 那条基线不能用。"""
+        return (self.n > 0 and np.isfinite(self.thb) and self.thb > 0
+                and np.isfinite(self.hbo) and np.isfinite(self.toi))
+
+
+def make_baseline(results, t: float = 0.0) -> Baseline | None:
+    """由一串 `SrsResult` 求基线。非有限值自动跳过；一个都不剩则返回 None。
+
+    ⚠️ 用算术均值而非中位数：调用方喂进来的应当是**已经过稳健聚合**的点
+       （`robust.aggregate` 在更上游剔过尖峰了），这里再做一次中位数
+       只会白白损失效率。若调用方没做剔除，责任在调用方。
+    """
+    hbo, hbr, thb, toi = [], [], [], []
+    for r in results:
+        if not (np.isfinite(r.toi) and np.isfinite(r.thb_uM)):
+            continue
+        hbo.append(r.c_hbo * 1e6); hbr.append(r.c_hbr * 1e6)
+        thb.append(r.thb_uM); toi.append(r.toi)
+    if not thb:
+        return None
+    return Baseline(t=float(t), n=len(thb),
+                    hbo=float(np.mean(hbo)), hbr=float(np.mean(hbr)),
+                    thb=float(np.mean(thb)), toi=float(np.mean(toi)))
+
+
+@dataclass(frozen=True)
+class Derived:
+    """相对基线的派生量。全部是减法/除法，没有滤波。"""
+
+    d_hbo: float             # µM
+    d_hbr: float             # µM
+    d_thb: float             # µM
+    thi: float               # 血红蛋白浓度指数，% 基线（基线处 = 100）
+    d_thi: float             # THI − 100，%
+    d_toi: float             # %O₂
+
+
+def derive(res: "SrsResult", bl: Baseline | None) -> Derived | None:
+    """`SrsResult` + 基线 → 相对量。基线缺失或本次无效时返回 None。
+
+    返回 None 而不是 NaN：调用方必须显式处理「还没设基线」这个状态，
+    而不是把 NaN 画到曲线上。
+    """
+    if bl is None or not bl.ok:
+        return None
+    if not (np.isfinite(res.toi) and np.isfinite(res.thb_uM)):
+        return None
+    thb = res.thb_uM
+    thi = 100.0 * thb / bl.thb
+    return Derived(d_hbo=res.c_hbo * 1e6 - bl.hbo,
+                   d_hbr=res.c_hbr * 1e6 - bl.hbr,
+                   d_thb=thb - bl.thb,
+                   thi=thi, d_thi=thi - 100.0,
+                   d_toi=res.toi - bl.toi)
+
+
+class AucAccumulator:
+    """去饱和曲线下面积：∫ max(基线TOI − TOI, 0) dt，单位 %O₂·s。
+
+    只累加**低于**基线的部分 —— 这是「去饱和负荷」的常用定义，
+    高于基线的时间不该把它抵消掉。
+
+    ⚠️ 用实际时间差累加，不假设固定采样间隔（丢帧时仍正确）。
+       两次之间间隔过大时跳过，避免把一段空洞算成持续去饱和。
+    """
+
+    MAX_GAP_S = 10.0
+
+    def __init__(self) -> None:
+        self.value = 0.0         # %O₂·s
+        self.seconds = 0.0       # 低于基线的累计时长
+        self._t_prev: float | None = None
+
+    def push(self, t: float, d_toi: float) -> float:
+        """喂一个时刻的 ΔTOI，返回当前累计值。"""
+        if self._t_prev is not None:
+            dt = t - self._t_prev
+            if 0.0 < dt <= self.MAX_GAP_S and np.isfinite(d_toi) and d_toi < 0:
+                self.value += -d_toi * dt
+                self.seconds += dt
+        self._t_prev = float(t)
+        return self.value
+
+    def reset(self) -> None:
+        self.value = 0.0
+        self.seconds = 0.0
+        self._t_prev = None

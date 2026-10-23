@@ -1230,6 +1230,78 @@ def t16_mbll_live() -> None:
     win.close()
 
 
+def t17_derived_quantities() -> None:
+    """17 派生相对量：基线、ΔHb/THI/AUC、以及「没设基线」这个状态。"""
+    print("\n[17] 派生相对量（SRS 绝对浓度 − 基线）")
+    from fnirs_pipeline.srs import (AucAccumulator, Baseline, SrsResult,
+                                    derive, make_baseline)
+
+    def mk(hbo_uM, hbr_uM, toi):
+        return SrsResult(toi=toi, toi_raw=toi, mua=np.zeros(2),
+                         mueff=np.zeros(2), slope=np.zeros(2),
+                         residual=np.zeros(2),
+                         c_hbo=hbo_uM * 1e-6, c_hbr=hbr_uM * 1e-6)
+
+    base = [mk(60.0, 10.0, 85.0), mk(62.0, 10.0, 85.0), mk(61.0, 10.0, 85.0)]
+    bl = make_baseline(base, t=5.0)
+    _check("17 基线取算术均值", bl is not None and abs(bl.hbo - 61.0) < 1e-9
+           and abs(bl.thb - 71.0) < 1e-9, f"HbO {bl.hbo:.2f} tHb {bl.thb:.2f}")
+    _check("17 基线记下点数与时刻", bl.n == 3 and bl.t == 5.0)
+
+    # --- 非有限值被跳过 ----------------------------------------------------
+    bl2 = make_baseline(base + [mk(np.nan, 10.0, 85.0),
+                                mk(60.0, 10.0, np.nan)], t=0.0)
+    _check("17 非有限的点被跳过，不污染基线",
+           bl2 is not None and bl2.n == 3 and abs(bl2.hbo - 61.0) < 1e-9)
+    _check("17 一个有效点都没有时返回 None",
+           make_baseline([mk(np.nan, np.nan, np.nan)]) is None)
+
+    # --- 派生 --------------------------------------------------------------
+    d = derive(mk(120.0, 20.0, 80.0), bl)
+    _check("17 ΔHbO/ΔHbR/ΔtHb 是减法",
+           abs(d.d_hbo - 59.0) < 1e-9 and abs(d.d_hbr - 10.0) < 1e-9
+           and abs(d.d_thb - 69.0) < 1e-9,
+           f"{d.d_hbo:.1f} / {d.d_hbr:.1f} / {d.d_thb:.1f} µM")
+    _check("17 THI = 100×tHb/基线tHb",
+           abs(d.thi - 100.0 * 140.0 / 71.0) < 1e-9
+           and abs(d.d_thi - (d.thi - 100.0)) < 1e-12,
+           f"THI {d.thi:.2f}%")
+    _check("17 基线处 THI 恰为 100、其余全为 0",
+           (lambda z: abs(z.thi - 100) < 1e-9 and abs(z.d_hbo) < 1e-9
+            and abs(z.d_thb) < 1e-9 and abs(z.d_toi) < 1e-9)
+           (derive(mk(61.0, 10.0, 85.0), bl)))
+    _check("17 ΔTOI 是减法", abs(d.d_toi - (-5.0)) < 1e-9, f"{d.d_toi:.1f}")
+
+    # --- 「还没设基线」必须显式返回 None，不能画 NaN ------------------------
+    _check("17 没有基线时返回 None（而不是 NaN）",
+           derive(mk(60.0, 10.0, 85.0), None) is None)
+    _check("17 tHb=0 的基线被拒（THI 无定义）",
+           not Baseline(0, 1, 0.0, 0.0, 0.0, 0.0).ok
+           and derive(mk(60.0, 10.0, 85.0),
+                      Baseline(0, 1, 0.0, 0.0, 0.0, 85.0)) is None)
+    _check("17 本次反演无效时返回 None",
+           derive(mk(np.nan, 10.0, 85.0), bl) is None
+           and derive(mk(60.0, 10.0, np.nan), bl) is None)
+
+    # --- AUC ---------------------------------------------------------------
+    a = AucAccumulator()
+    for i in range(11):
+        a.push(float(i), -2.0)              # 持续低于基线 2 个点，共 10 秒
+    _check("17 AUC = |ΔTOI| × 时长", abs(a.value - 20.0) < 1e-9,
+           f"{a.value:.1f} %O₂·s，低于基线 {a.seconds:.0f} s")
+    a2 = AucAccumulator()
+    for i in range(11):
+        a2.push(float(i), +3.0)             # 全部高于基线
+    _check("17 高于基线不累加（去饱和负荷不被抵消）", a2.value == 0.0)
+    a3 = AucAccumulator()
+    a3.push(0.0, -2.0); a3.push(100.0, -2.0)   # 中间 100 秒空洞
+    _check("17 间隔超过上限时跳过，不把空洞算成持续去饱和",
+           a3.value == 0.0, f"gap 100s > {AucAccumulator.MAX_GAP_S}s")
+    a3.reset()
+    _check("17 reset 清零", a3.value == 0.0 and a3.seconds == 0.0
+           and a3._t_prev is None)
+
+
 def main() -> int:
     print("=" * 72)
     print("srs_cal 自检 —— 新硬件 (670/770/810/850 nm, ρ=3.0/4.0 cm)")
@@ -1241,7 +1313,8 @@ def main() -> int:
                t9_frame_timing, t10_raw_archive,
                t11_robust_aggregate, t12_hb_and_physics,
                t13_quality_layer, t14_dark_subtraction,
-               t15_mbll_decoder, t16_mbll_live):
+               t15_mbll_decoder, t16_mbll_live,
+               t17_derived_quantities):
         fn()
     n_ok = sum(1 for _, ok in _RESULTS if ok)
     print("\n" + "=" * 72)

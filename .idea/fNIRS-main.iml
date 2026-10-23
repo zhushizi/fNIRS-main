@@ -1,7 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module type="PYTHON_MODULE" version="4">
   <component name="NewModuleRootManager">
-    <content url="file://$MODULE_DIR$" />
+    <content url="file://$MODULE_DIR$">
+      <!-- 与 pyrightconfig.json 的 extraPaths 保持一致。代码运行时用
+           sys.path.insert 加这两个目录（srs_cal/selftest.py:36-37），
+           这里让 PyCharm 的静态分析也能找到。 -->
+      <sourceFolder url="file://$MODULE_DIR$/software" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/software/tools" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/software/.venv-mne" />
+      <excludeFolder url="file://$MODULE_DIR$/software/result_table" />
+    </content>
     <orderEntry type="jdk" jdkName="D:\Anaconda" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>

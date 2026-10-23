@@ -76,6 +76,8 @@ from srs_cal.acquire import (BAUDRATES, BRIGHTNESS_SETTLE_MS,    # noqa: E402
                              FRAMES_PER_CYCLE, SerialWorker, SimWorker)
 from srs_cal.archive import RawArchive                   # noqa: E402
 from srs_cal.robust import aggregate                     # noqa: E402
+from fnirs_pipeline.srs import (AucAccumulator,          # noqa: E402
+                                derive, make_baseline)
 from srs_cal.darksub import DarkSubtractor               # noqa: E402
 from srs_cal.quality import QualityMonitor, summarize    # noqa: E402
 from srs_cal.protocol import (BRIGHTNESS_DEFAULT, BRIGHTNESS_MAX,  # noqa: E402
@@ -129,6 +131,11 @@ REFRESH_HZ = 10
 #
 #    滑动窗口：加大 N **不降低出点率**，代价只是滞后（约 N/2 个周期）。
 DEFAULT_AVG = 20
+# 「校准基线」按下后攒多少个点求均值。20 个点 ≈ 30 秒。
+# 取这个数的理由：基线的离散直接加到此后**每一个**相对量上，所以它的
+# 噪声应当明显小于单点噪声。20 个点把 ΔHbO 的基线不确定度压到
+# 1.486/√20 ≈ 0.33 µM，相对阻断信号（63 µM）可忽略。
+BASELINE_N = 20
 SPAN_S = 60
 
 
@@ -239,6 +246,7 @@ class OnlineWindow(QtWidgets.QWidget):
             active_wl=tuple(float(w) for w in WL))
         self.last_qflags: list = []
         self._mbll_err = ""
+        self._derived_err = ""
         # 显式传 WL —— 跟着 WAVELENGTHS_ACTIVE_NM 走，别依赖 geometry() 的默认。
         # ⚠️ **不传 dark_level**：暗电平已经在 _on_frames 里用每个周期的
         #    暗时隙逐帧扣过了。再把标定文件里的静态暗传进来会扣两次。
@@ -270,6 +278,17 @@ class OnlineWindow(QtWidgets.QWidget):
         self._last_frames = 0
         self._fps = 0.0
         self._t0 = time.perf_counter()
+        # L3A 的派生相对量：ΔHbO/ΔHbR/ΔtHb/THI/AUC。
+        # 由 SRS 的绝对浓度**减基线**得到 —— 纯算术，延迟只有 SRS 自身的，
+        # 不像 MBLL 要等 300 s。详见 fnirs_pipeline/srs.py 的「派生相对量」。
+        self.baseline = None                 # srs.Baseline | None
+        self._bl_pending: list = []          # 正在为新基线攒的点
+        self._bl_need = 0                    # 还要攒几个
+        self._auc = AucAccumulator()
+        self.d_hist: dict = {k: deque(maxlen=MAXPTS)
+                             for k in ("d_hbo", "d_hbr", "d_thb", "d_toi")}
+        self.td_hist: deque = deque(maxlen=MAXPTS)
+        self.last_derived = None
         self.t_hist: deque = deque(maxlen=MAXPTS)
         self.toi_hist: deque = deque(maxlen=MAXPTS)
         self.mua_hist: dict = {w: deque(maxlen=MAXPTS) for w in WL}
@@ -330,6 +349,18 @@ class OnlineWindow(QtWidgets.QWidget):
         self._bright_timer.timeout.connect(self._send_brightness)
         self.spn_bright.valueChanged.connect(self._bright_timer.start)
         self.lbl_avg = QtWidgets.QLabel()
+        # 相对量的参考点。**必须能随时重设** —— SRS 不能高通，基线会随
+        # 仪器慢漂走偏（实测 63% 的浓度噪声在 <0.01 Hz）。竞品同样提供
+        # 这个按钮（BRS-100 说明书 p32「点击后，系统重新校准基线值」）。
+        self.btn_bl = QtWidgets.QPushButton("校准基线")
+        self.btn_bl.setToolTip("\n".join((
+            f"取之后 {BASELINE_N} 个点（约 {BASELINE_N/0.657:.0f} 秒）的均值作为参考点。",
+            "ΔHbO / ΔHbR / ΔtHb / THI / AUC 全部相对它计算。",
+            "",
+            "⚠️ 基线不抗漂移：SRS 为了保住绝对值不能高通，",
+            "   所以长时间监护后应重新校准。",
+            "⚠️ 重设会把 AUC 一并清零。")))
+        self.btn_bl.clicked.connect(self._start_baseline)
         self.btn_reset = QtWidgets.QPushButton("清屏")
         self.btn_reset.clicked.connect(self._reset)
         for w in (QtWidgets.QLabel("串口"), self.cmb_port,
@@ -337,7 +368,7 @@ class OnlineWindow(QtWidgets.QWidget):
                   self.btn_refresh, self.btn_conn,
                   QtWidgets.QLabel("  光源"), self.spn_bright,
                   QtWidgets.QLabel("  平均"), self.spn_avg, self.lbl_avg,
-                  self.btn_reset):
+                  self.btn_bl, self.btn_reset):
             bar.addWidget(w)
         bar.addStretch(1)
         # 原始归档：**默认开启**。连续监护设备出了异常必须能回看，
@@ -446,6 +477,29 @@ class OnlineWindow(QtWidgets.QWidget):
         self.txt_hb = pg.TextItem(anchor=(0.5, 0.5), color="#8a5a00")
         self.p_hb.addItem(self.txt_hb)
         self._hb_started = False
+
+        # —— L3A 的派生相对量。与上面的 TOI 共用 x 轴（同一条链、同一时刻），
+        #    这点和 MBLL 那格不同 —— 那格是另一条链、另一个时间尺度。
+        self.p_rel = glw.addPlot(
+            row=3, col=0, title="ΔHbO / ΔHbR / ΔtHb　（SRS 绝对浓度 − 基线）")
+        self.p_rel.showGrid(x=True, y=True, alpha=0.3)
+        self.p_rel.setLabel("left", "Δc (µM)")
+        self.p_rel.setLabel("bottom", "时间 (s)")
+        self.p_rel.addLegend(offset=(-10, 8), labelTextSize="8pt")
+        self.c_rel = {
+            "d_hbo": self.p_rel.plot(pen=pg.mkPen("#d62728", width=1.8),
+                                     name="ΔHbO"),
+            "d_hbr": self.p_rel.plot(pen=pg.mkPen("#2a78d6", width=1.8),
+                                     name="ΔHbR"),
+            "d_thb": self.p_rel.plot(pen=pg.mkPen("#1a7f5a", width=1.4),
+                                     name="ΔtHb"),
+        }
+        for c in self.c_rel.values():
+            c.setClipToView(True)
+        self.p_rel.setXLink(self.p_toi)
+        self.txt_rel = pg.TextItem(anchor=(0.5, 0.5), color="#8a5a00")
+        self.p_rel.addItem(self.txt_rel)
+
         root.addWidget(glw, 1)
 
         self.lbl_mbll = QtWidgets.QLabel()
@@ -644,6 +698,17 @@ class OnlineWindow(QtWidgets.QWidget):
             self.c_hbo.setData([], [])   # 否则新旧两段会被当成一条连续记录
             self.c_hbr.setData([], [])
             self._hb_started = False     # 倒计时重新开始
+        # 清屏连基线一起清 —— 旧基线对应的是已经被清掉的那段数据
+        self.baseline = None
+        self._bl_pending = []
+        self._bl_need = 0
+        self._auc.reset()
+        self.last_derived = None
+        self.td_hist.clear()
+        for d in self.d_hist.values():
+            d.clear()
+        for c in self.c_rel.values():
+            c.setData([], [])
         self._no_dark = 0
         self._fresh.clear()
         self._since = 0
@@ -777,6 +842,49 @@ class OnlineWindow(QtWidgets.QWidget):
             self.toi_hist.append(res.toi)
             for j, w in enumerate(WL):
                 self.mua_hist[w].append(res.mua[j])
+        self._update_derived(res, t)
+
+    # -- 派生相对量 ---------------------------------------------------------
+    def _start_baseline(self) -> None:
+        """按下「校准基线」：丢掉旧基线，开始攒新的。
+
+        ⚠️ 立刻把旧基线置 None —— 攒的这 30 秒里不该继续用旧参考点出数，
+           否则界面上会出现一段「看着正常但参考点已作废」的曲线。
+        """
+        self.baseline = None
+        self._bl_pending = []
+        self._bl_need = BASELINE_N
+        self._auc.reset()
+        self.last_derived = None
+        self.td_hist.clear()
+        for d in self.d_hist.values():
+            d.clear()
+        for c in self.c_rel.values():
+            c.setData([], [])
+
+    def _update_derived(self, res, t: float) -> None:
+        """每次反演后调用。整个包在 try 里 —— 这一格坏掉不能影响 TOI。"""
+        try:
+            if self._bl_need > 0:
+                if np.isfinite(res.toi) and np.isfinite(res.thb_uM):
+                    self._bl_pending.append(res)
+                    self._bl_need -= 1
+                if self._bl_need == 0:
+                    self.baseline = make_baseline(self._bl_pending, t=t)
+                    self._bl_pending = []
+                return
+            d = derive(res, self.baseline)
+            if d is None:
+                return
+            self.last_derived = d
+            self._auc.push(t, d.d_toi)
+            self.td_hist.append(t)
+            for k in self.d_hist:
+                self.d_hist[k].append(getattr(d, k))
+        except Exception as e:                               # noqa: BLE001
+            self.baseline = None
+            self._bl_need = 0
+            self._derived_err = str(e)
 
     # -- 刷新 --------------------------------------------------------------
     def _refresh(self) -> None:
@@ -795,6 +903,11 @@ class OnlineWindow(QtWidgets.QWidget):
         sub = f"{self.last_n} 周期平均"
         if not self.cal.kb_set:
             sub += "　｜ k/b 未标定 → 看趋势，不是绝对值"
+        d = self.last_derived
+        if d is not None:
+            sub += (f"\nΔHbO {d.d_hbo:+.2f}　ΔHbR {d.d_hbr:+.2f}　"
+                    f"ΔtHb {d.d_thb:+.2f} µM　THI {d.thi:.1f}%"
+                    f"　ΔTOI {d.d_toi:+.2f}　AUC {self._auc.value:.0f} %O₂·s")
         if self._starved:
             sub += "　｜ ⚠ 长期收不到 " + "、".join(self._starved)
         # ⚠️ 用 summarize 而不是直接拼 res.flags：
@@ -824,6 +937,35 @@ class OnlineWindow(QtWidgets.QWidget):
                                           len(self.mua_hist[w])))
             self.p_toi.setXRange(max(0.0, ts[-1] - SPAN_S),
                                  max(SPAN_S, ts[-1]), padding=0)
+
+        self._refresh_derived()
+
+    def _refresh_derived(self) -> None:
+        """刷新派生量那一格。三种状态：没基线 / 攒基线中 / 出数。"""
+        if self._bl_need > 0:
+            self.txt_rel.setVisible(True)
+            self.txt_rel.setPos(0.5, 0.0)
+            self.txt_rel.setHtml(
+                "<div style='text-align:center;font-size:11pt'>"
+                f"<b>正在校准基线　还需 {self._bl_need} 点"
+                f"（约 {self._bl_need/max(self._fps/FRAMES_PER_CYCLE,1e-6):.0f} s）</b>"
+                "</div>")
+            return
+        if self.baseline is None:
+            self.txt_rel.setVisible(True)
+            self.txt_rel.setPos(0.5, 0.0)
+            self.txt_rel.setHtml(
+                "<div style='text-align:center;font-size:11pt'>"
+                "<b>尚未校准基线</b><br>"
+                "<span style='font-size:9pt;color:#8b8a84'>"
+                "相对量需要一个参考点 —— 点上方「校准基线」</span></div>")
+            return
+        self.txt_rel.setVisible(False)
+        if self.td_hist:
+            ts = np.fromiter(self.td_hist, float, len(self.td_hist))
+            for k, c in self.c_rel.items():
+                c.setData(ts, np.fromiter(self.d_hist[k], float,
+                                          len(self.d_hist[k])))
 
     def _refresh_mbll(self) -> None:
         """刷新 MBLL 那一格。**整个函数包在 try 里** —— 这一格坏掉
