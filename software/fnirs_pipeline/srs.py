@@ -58,7 +58,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -562,7 +563,7 @@ def scalp_confidence(long_toi: np.ndarray, short_signal: np.ndarray,
 #
 #       量      噪声底        阻断信号    信噪比
 #       ΔtHb    0.955 µM     67.1 µM      70×
-#       ΔTHI    2.05  %      96.6 %       47×
+#       ΔTHI    0.0205       0.966        47×   （比值口径；原表按 % 记为 2.05 / 96.6）
 #       ΔHbO    1.486 µM     62.8 µM      42×
 #       ΔHbR    0.741 µM      5.2 µM       7×
 #       ΔTOI    1.868 %O₂     —           见下
@@ -589,6 +590,10 @@ class Baseline:
     hbr: float               # µM
     thb: float               # µM
     toi: float               # %
+    # --- 2026-10-26 新增，均带默认值，既有调用不受影响 ---------------------
+    source: str = "captured"     # auto=自动 / captured=按钮抓取 / manual=TOI 手填过
+    low_signal: bool = False     # 攒的点里有「最远探测器计数不足」
+    unstable: bool = False       # 自动基线等稳定超时后照设的
 
     @property
     def ok(self) -> bool:
@@ -624,9 +629,15 @@ class Derived:
     d_hbo: float             # µM
     d_hbr: float             # µM
     d_thb: float             # µM
-    thi: float               # 血红蛋白浓度指数，% 基线（基线处 = 100）
-    d_thi: float             # THI − 100，%
+    # THI：当前 tHb ÷ 基线 tHb，**基线处 = 1.00**。
+    # 2026-10-26 由「% 基线（基线=100）」改成比值，对齐 MOC400 的读数口径 ——
+    # 其界面实测 THI 2.83 / ΔTHI 1.83，差恰为 1.00，可见基线归一到 1
+    # （与 NIRO 的 nTHI 同一约定）。
+    thi: float
+    d_thi: float             # THI − 1.00
     d_toi: float             # %O₂
+    # ΔTOI 占基线的百分比。与 AUC 的相对警戒线、BRS-100 的「差值比率」同一口径。
+    d_toi_rel: float = float("nan")
 
 
 def derive(res: "SrsResult", bl: Baseline | None) -> Derived | None:
@@ -640,19 +651,39 @@ def derive(res: "SrsResult", bl: Baseline | None) -> Derived | None:
     if not (np.isfinite(res.toi) and np.isfinite(res.thb_uM)):
         return None
     thb = res.thb_uM
-    thi = 100.0 * thb / bl.thb
+    thi = thb / bl.thb                      # 基线处 = 1.00
+    d_toi = res.toi - bl.toi
     return Derived(d_hbo=res.c_hbo * 1e6 - bl.hbo,
                    d_hbr=res.c_hbr * 1e6 - bl.hbr,
                    d_thb=thb - bl.thb,
-                   thi=thi, d_thi=thi - 100.0,
-                   d_toi=res.toi - bl.toi)
+                   thi=thi, d_thi=thi - 1.0,
+                   d_toi=d_toi,
+                   d_toi_rel=100.0 * d_toi / bl.toi if bl.toi > 0 else float("nan"))
+
+
+# ---------------------------------------------------------------------------
+# AUC 与基线状态机（2026-10-26 改造）
+# ---------------------------------------------------------------------------
+# AUC 警戒线 = 参考 TOI × (1 − AUC_REL_DROP)。
+#
+# 为什么不是「低于基线即累计」（2026-10-23 的旧实现）：那等于警戒线贴着基线，
+#   噪声的负半边全被收进去、正半边不抵消，基线一偏还会线性累积。
+#   实测体模（真实去饱和恒为 0）跑 10 分钟：141147 凭空攒 662 %·s、164708 攒 1013。
+#   文献口径的警戒线**永远严格低于基线**（绝对 50%，或相对基线下 10/20/30/50%），
+#   那段间隔本身就是死区（Slater 2009 PubMed 19101265；PMC8437017）。
+#
+# 为什么是相对 20% 而不是减 20 个点：文献相对口径里有「低于基线 50%」，
+#   只能是相对值；BRS-100 说明书 p31 把这个量叫「差值**比率**」。
+#   20% 远大于 ΔTOI 噪声（σ 0.07~2.42），所以不会凭空累积。
+AUC_REL_DROP = 0.20
 
 
 class AucAccumulator:
-    """去饱和曲线下面积：∫ max(基线TOI − TOI, 0) dt，单位 %O₂·s。
+    """去饱和负荷：∫ max(警戒线 − TOI, 0) dt。内部单位 %O₂·s，另给 %·min。
 
-    只累加**低于**基线的部分 —— 这是「去饱和负荷」的常用定义，
-    高于基线的时间不该把它抵消掉。
+    **自带参考点** `ref_toi`，与 BL 基线解耦（MOC400 的设计）：
+    BL 随时可重抓、可手填，AUC 是整台手术的累计账，不该跟着被清掉。
+    参考点只在 `reset(ref_toi)` 时设定；`ref_toi` 为 None 时不累计。
 
     ⚠️ 用实际时间差累加，不假设固定采样间隔（丢帧时仍正确）。
        两次之间间隔过大时跳过，避免把一段空洞算成持续去饱和。
@@ -660,22 +691,338 @@ class AucAccumulator:
 
     MAX_GAP_S = 10.0
 
-    def __init__(self) -> None:
+    def __init__(self, rel_drop: float = AUC_REL_DROP) -> None:
+        self.rel_drop = float(rel_drop)
+        self.ref_toi: float | None = None
         self.value = 0.0         # %O₂·s
-        self.seconds = 0.0       # 低于基线的累计时长
+        self.seconds = 0.0       # 低于警戒线的累计时长
         self._t_prev: float | None = None
 
-    def push(self, t: float, d_toi: float) -> float:
-        """喂一个时刻的 ΔTOI，返回当前累计值。"""
-        if self._t_prev is not None:
+    @property
+    def threshold(self) -> float | None:
+        """警戒线，%。没有参考点时为 None。"""
+        if self.ref_toi is None:
+            return None
+        return self.ref_toi * (1.0 - self.rel_drop)
+
+    @property
+    def value_min(self) -> float:
+        """%·min —— 相对口径文献的截断值（如 >150 min%）用这个单位。"""
+        return self.value / 60.0
+
+    def push(self, t: float, toi: float) -> float:
+        """喂一个时刻的**绝对** TOI，返回当前累计值（%·s）。"""
+        thr = self.threshold
+        if self._t_prev is not None and thr is not None:
             dt = t - self._t_prev
-            if 0.0 < dt <= self.MAX_GAP_S and np.isfinite(d_toi) and d_toi < 0:
-                self.value += -d_toi * dt
+            if 0.0 < dt <= self.MAX_GAP_S and np.isfinite(toi) and toi < thr:
+                self.value += (thr - toi) * dt
                 self.seconds += dt
         self._t_prev = float(t)
         return self.value
 
-    def reset(self) -> None:
+    def reset(self, ref_toi: float | None = None) -> None:
+        """清零，并把参考点设为 `ref_toi`（None = 暂无参考点，不累计）。"""
+        self.ref_toi = None if ref_toi is None else float(ref_toi)
         self.value = 0.0
         self.seconds = 0.0
         self._t_prev = None
+
+
+# 攒基线时**挡掉**的 flag：物理上不可能的值。按 compute_toi 产出的措辞匹配
+# （见上方 compute_toi 里的 flags.append）。措辞改了，t18 会报。
+_BASELINE_BLOCKING = ("TOI_raw", "负值", "μeff 非正")
+_LOW_SIGNAL_KEY = "计数不足"
+
+
+def baseline_reject_reason(res: "SrsResult") -> str:
+    """该点能否进基线：能 → 返回空串；不能 → 返回原因（给状态行显示）。
+
+    ⚠️ 两类 flag **刻意不挡**：
+       - tHb 越界：体模上恒触发（111030 实测 tHb 12.31 µM，低于 20 下限，
+         237/237 点报警），挡了体模就永远设不上基线。
+       - 最远探测器计数不足：前额透颅骨后 670/4cm 可能一直低于 MIN_COUNTS
+         （**未测**），挡了在头上可能永远设不上。改为收下、把基线标 low_signal。
+    """
+    if not (np.isfinite(res.toi) and np.isfinite(res.thb_uM)):
+        return "反演无效"
+    for f in res.flags:
+        if any(k in f for k in _BASELINE_BLOCKING):
+            return f
+    return ""
+
+
+# 「贴稳了」的判据。**只做指示灯，不拦基线**（见 BaselineManager 的说明）。
+# 依据（实测，8 份归档，与 online 同一条链路，N=20）：
+#
+#   记录      类型          770/3cm 60s 变化 p50   p90    第一个可判值
+#   111030   A2 体模静止        0.1%            0.2%     0.2%
+#   141147   体模低光           0.2%            0.4%     0.0%
+#   164708   体模低光           0.3%            0.8%     1.4%
+#   131237   在体刚贴上        10.0%           11.1%     6.2%
+#   150943   手臂勒紧           8.1%           13.5%     1.1%
+#
+# 静止体模 p90 ≤ 0.8%，刚贴上 ≥ 6.2% → 阈值 2% 两边各约 3 倍余量。
+# 只看**光强最高的一路**：「四路取最大」与「四路共模」都会混入低光 670/4cm
+# 自身的噪声（低光体模上 p90 撑到 3~20%），和「没贴稳」分不开。
+#
+# **光强稳 ≠ TOI 稳**（2026-10-26 用真实归档截图时发现）：TOI 由两波长的
+# **比值**决定，单一路光强平着，TOI 照样可以大变。103952 里 TOI 从 80 掉到
+# 52 又爬回 75，光强判据在 t=129 s 就放行，基线设在爬升途中（65），此后整段
+# ΔTOI 带 +10 的偏移。所以再加一条：过去 60 s TOI 线性总变化 < 5 个点。
+#
+#   记录      类型          TOI 60s 变化 p50   p90     关键时刻
+#   111030   A2 体模静止       0.08       0.20
+#   141147   体模低光          1.99       4.20
+#   164708   体模低光          2.79       9.19   ← 纯噪声也会超 5，等得久些 / 走超时
+#   150943   手臂勒紧          1.48       2.42
+#   131237   在体刚贴上        1.54       1.81   （光强判据已挡）
+#   103952   在体              5.45      24.78   t=129: 10.4  t=157: 19.9（爬升中）
+#
+# ⚠️ 全是手臂和体模，**前额未测**。
+SETTLE_WIN_S = 60.0
+SETTLE_MAX_REL = 0.02
+SETTLE_MAX_TOI_PTS = 5.0
+SETTLE_MIN_PTS = 10
+# 2026-10-26 第二轮删掉 SETTLE_TIMEOUT_S：判据不再拦基线，没有「等到超时」这回事。
+
+# 一次基线攒多少个点。20 个点 ≈ 30 秒（扫描率 0.657 周期/秒）。
+# 基线的离散会加到此后**每一个**相对量上，所以它要明显小于单点噪声：
+# 20 点把 ΔHbO 的基线不确定度压到 1.486/√20 ≈ 0.33 µM。
+BASELINE_N = 20
+
+
+class SettleGate:
+    """两条都满足才算「稳」：
+
+    ① 光强最高那一路，过去 `win_s` 秒 ln(I) 线性拟合的总变化 < `max_rel`（探头贴稳了）
+    ② 过去 `win_s` 秒 TOI 线性拟合的总变化 < `max_toi_pts` 个点（生理状态平稳）
+
+    `metric` 为 ①（0.02 = 2%），`metric_toi` 为 ②（点）。窗口没攒满时为 NaN。
+    `push` 不给 `toi` 时只用 ①（单测与旧调用）。
+    """
+
+    def __init__(self, win_s: float = SETTLE_WIN_S,
+                 max_rel: float = SETTLE_MAX_REL,
+                 min_pts: int = SETTLE_MIN_PTS,
+                 max_toi_pts: float = SETTLE_MAX_TOI_PTS) -> None:
+        self.win_s = float(win_s)
+        self.max_rel = float(max_rel)
+        self.min_pts = int(min_pts)
+        self.max_toi_pts = float(max_toi_pts)
+        self.reset()
+
+    def reset(self) -> None:
+        self._t: deque = deque()
+        self._I: deque = deque()
+        self._y: deque = deque()
+        self._t_first: float | None = None
+        self._use_toi = False
+        self.metric = float("nan")
+        self.metric_toi = float("nan")
+
+    def push(self, t: float, intensities, toi: float | None = None) -> float:
+        I = np.asarray(intensities, dtype=float).ravel()
+        if I.size == 0 or not np.all(np.isfinite(I)) or np.any(I <= 0):
+            return self.metric          # 取不了对数的点不进窗，也不改判据
+        if toi is not None:
+            self._use_toi = True
+        if self._t_first is None:
+            self._t_first = float(t)
+        self._t.append(float(t))
+        self._I.append(I)
+        self._y.append(float("nan") if toi is None else float(toi))
+        while self._t and self._t[0] <= t - self.win_s:
+            self._t.popleft()
+            self._I.popleft()
+            self._y.popleft()
+        self.metric = self.metric_toi = float("nan")
+        if t - self._t_first < self.win_s or len(self._t) < self.min_pts:
+            return self.metric
+        T = np.fromiter(self._t, float, len(self._t))
+        M = np.vstack(self._I)
+        j = int(np.argmax(M.mean(axis=0)))
+        k = np.polyfit(T, np.log(M[:, j]), 1)[0]
+        self.metric = float(abs(np.expm1(k * self.win_s)))
+        Y = np.fromiter(self._y, float, len(self._y))
+        ok = np.isfinite(Y)
+        if ok.sum() >= self.min_pts:
+            self.metric_toi = float(abs(np.polyfit(T[ok], Y[ok], 1)[0]
+                                        * self.win_s))
+        return self.metric
+
+    @property
+    def ready(self) -> bool:
+        return bool(np.isfinite(self.metric))
+
+    @property
+    def stable(self) -> bool:
+        if not (self.ready and self.metric < self.max_rel):
+            return False
+        if not self._use_toi:
+            return True
+        # 给过 TOI 却算不出（有效 TOI 点太少）→ 信号本身不行，不算稳
+        return bool(np.isfinite(self.metric_toi)
+                    and self.metric_toi < self.max_toi_pts)
+
+
+@dataclass(frozen=True)
+class BaselineState:
+    """给界面显示用的快照。界面只读它，不做判断。"""
+
+    phase: str               # collecting / set
+    n_have: int              # 本轮已攒的点
+    n_need: int
+    n_skipped: int           # 本轮因 flag 跳过的点
+    last_skip: str           # 最近一次跳过的原因
+    gate_metric: float       # 光强判据当前值（0.02 = 2%）
+    gate_metric_toi: float   # TOI 判据当前值（60 s 内变化几个点）
+    collecting_mode: str     # 正在攒的这一轮的来源：auto / captured
+    suggest_recapture: bool  # 基线标了未稳定，而现在信号稳了 → 建议重抓
+    gate_ready: bool         # 判据窗攒满了没（没满就还判不了）
+    gate_stable: bool        # **当前**信号稳不稳（实时，不是基线那一刻的）
+
+
+class BaselineManager:
+    """BL 基线与 AUC 的全部状态。界面只调方法、读 `state`，**不做任何判断** ——
+    这样安卓端拿到的是同一份行为，自检和归档回放也能直接测它。
+
+        reset()（连接 / 清屏）
+           ▼
+        采集中 n/N（只收 baseline_reject_reason 为空的点）
+           ▼
+        已设 ── 首次已设且 AUC 无参考点 → AUC 继承 BL 的 TOI
+           ├ capture()         BL 立即作废 → 重新采集（captured）
+           ├ set_manual_toi(x) 只改 BL 的 TOI，source=manual；AUC 不动
+           └ reset_auc()       AUC 清零，参考点 = 当前 BL 的 TOI；BL 不动
+
+    **AUC 在任何阶段都照常累计**（只认自己的参考点），重抓 BL 的那 30 秒不断档。
+
+    ⚠️ **稳定判据是指示灯，不是闸门**（2026-10-26 第二轮改）。它不拦着基线，
+       只在定基线那一刻被读一次，结果写进 `Baseline.unstable`。
+
+       第一轮设计成「等稳定才设」，实测代价远大于收益：最快也要 120 s，
+       8 份归档里 3 份全程设不上；而等待买到的精度差异 ≤0.5 点，
+       在 ΔTOI 噪声底（1.2~1.9）以下。竞品也不等 —— BRS-100 说明书 p34
+       「开始监测后，系统会自动计算基线」。详见 docs/online优化计划_第二轮.md。
+
+       基线标了 unstable、而判据后来通过了 → `state.suggest_recapture` 为真，
+       由界面提示操作者重抓。**不自动改基线** —— 监护仪的参考点自己移动是坏性质
+       （实测自动精化在 8 份里只触发 4 份，改动 ≤1.7 点，精度 2 好 1 坏 1 平）。
+
+    `t` 请传**数据时刻**（帧的 t_host），不要传反演那一刻的时钟 ——
+    前者才是光被测到的时刻，回放与自检也才能复现。
+
+    ⚠️ 只喂**满窗**的点：窗口没攒满时 `robust.aggregate` 因 MIN_N=4 不剔尖峰，
+       实测用部分窗的点算基线，103952 差 −23.48 点。由调用方保证（online 在
+       `n < need` 时不调本方法）。
+    """
+
+    COLLECTING, SET = "collecting", "set"
+
+    def __init__(self, n: int = BASELINE_N,
+                 gate: SettleGate | None = None,
+                 auc: AucAccumulator | None = None) -> None:
+        self.n = int(n)
+        self.gate = gate if gate is not None else SettleGate()
+        self.auc = auc if auc is not None else AucAccumulator()
+        self.reset()
+
+    # -- 操作 --------------------------------------------------------------
+    def reset(self) -> None:
+        """连接 / 清屏：基线、AUC、稳定判据全部从头来。"""
+        self.baseline: Baseline | None = None
+        self.last_derived: Derived | None = None
+        self._t_last: float | None = None
+        self.gate.reset()
+        self.auc.reset(None)
+        self._begin("auto")
+
+    def capture(self) -> None:
+        """「抓取当前」：立即重新攒一轮基线。
+
+        旧基线立即作废 —— 攒的这 30 秒里不该继续用旧参考点出数。
+        """
+        self.baseline = None
+        self._begin("captured")
+
+    def set_manual_toi(self, toi: float) -> bool:
+        """手填 TOI 基线。只改 TOI，浓度基线不动（浓度没法让人手填）。
+
+        还没有浓度基线时拒绝并返回 False —— ΔHbO/ΔHbR/ΔtHb/THI 需要它。
+        """
+        if self.baseline is None or not np.isfinite(toi) or not 0.0 < toi <= 100.0:
+            return False
+        self.baseline = replace(self.baseline, toi=float(toi), source="manual")
+        return True
+
+    def reset_auc(self) -> None:
+        """「AUC复位」：清零，参考点取当前 BL 的 TOI。BL 不动。"""
+        self.auc.reset(self.baseline.toi if self.baseline is not None else None)
+
+    # -- 数据 --------------------------------------------------------------
+    def push(self, t: float, res: "SrsResult", intensities) -> Derived | None:
+        """喂一次**满窗**反演结果。返回相对量；还没有基线时返回 None。"""
+        t = float(t)
+        self._t_last = t
+        self.gate.push(t, intensities, res.toi)
+
+        if self.phase == self.COLLECTING:
+            self._collect(t, res)
+
+        if np.isfinite(res.toi):
+            self.auc.push(t, res.toi)
+        d = derive(res, self.baseline) if self.phase == self.SET else None
+        self.last_derived = d
+        return d
+
+    @property
+    def state(self) -> BaselineState:
+        return BaselineState(
+            phase=self.phase, n_have=len(self._pending), n_need=self.n,
+            n_skipped=self._n_skipped, last_skip=self._last_skip,
+            gate_metric=self.gate.metric,
+            gate_metric_toi=self.gate.metric_toi,
+            collecting_mode=self._mode,
+            suggest_recapture=bool(self.baseline is not None
+                                   and self.baseline.unstable
+                                   and self.gate.stable),
+            gate_ready=self.gate.ready, gate_stable=self.gate.stable)
+
+    # -- 内部 --------------------------------------------------------------
+    def _begin(self, mode: str) -> None:
+        self.phase = self.COLLECTING
+        self._mode = mode
+        self._pending: list = []
+        self._low = False
+        self._n_skipped = 0
+        self._last_skip = ""
+
+    def _collect(self, t: float, res: "SrsResult") -> None:
+        why = baseline_reject_reason(res)
+        if why:
+            self._n_skipped += 1
+            self._last_skip = why
+            return
+        self._pending.append(res)
+        if any(_LOW_SIGNAL_KEY in f for f in res.flags):
+            self._low = True
+        if len(self._pending) < self.n:
+            return
+        bl = make_baseline(self._pending, t=t)
+        if bl is None or not bl.ok:          # 收进来的点都有限，正常不会发生
+            self._begin(self._mode)
+            return
+        # 判据在这一刻被读一次 —— 它是指示灯，不是闸门。
+        #
+        # ⚠️ 只有「判过且没通过」才标 unstable。**「还没判过」不标** ——
+        #    基线在 ~59 s 设上，而判据窗是 60 s，此时必然 ready=False。
+        #    若把没判过也算不稳，8 份归档会全部标红，就成了恒亮的告警灯
+        #    （和 tHb 判据在体模上 237/237 报警是同一个毛病）。
+        #    当前信号稳不稳由 `state.gate_*` 实时给，不冻在基线上。
+        self.baseline = replace(bl, source=self._mode, low_signal=self._low,
+                                unstable=self.gate.ready and not self.gate.stable)
+        self.phase = self.SET
+        self._pending = []
+        if self.auc.ref_toi is None:
+            self.auc.reset(self.baseline.toi)

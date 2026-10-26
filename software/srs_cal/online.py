@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""在线双解码器 —— 连上设备，一个界面里同时出 SRS 的 TOI 和 MBLL 的 ΔHb。
+"""在线解码器 —— 连上设备，实时出 SRS 的 TOI 与派生相对量。
 
     python -m srs_cal.online --cal 标定_v1.json      # 用标定文件
     python -m srs_cal.online                          # 无标定，只看相对变化
@@ -9,29 +9,22 @@
 ----------------
     acquire.py      体模标定【采数据】——  离线，12 块各点一次
     run_srs_v1.py   体模标定【算 G】  ——  离线，产出 标定参数/*.json
-    online.py       这个           ——  在线，实时反演 TOI + MBLL 相对量
+    online.py       这个           ——  在线，实时反演 TOI 与派生相对量
 
-界面上三格
-----------
-    TOI             SRS 绝对量，逐周期出点，看最近 SPAN_S 秒
-    各波长 μa       SRS 的反演中间量，与 TOI 共用 x 轴
-    ΔHbO / ΔHbR     MBLL 相对量，看**整段**记录（见下）
+界面（2026-10-26 改版，见 docs/online优化计划.md）
+------------------------------------------------
+    主页    TOI（+ 基线虚线、AUC 警戒线）/ ΔHbO·ΔHbR·ΔtHb / ΔTHI·ΔTOI / AUC
+    调试    各波长 μa（反演中间量）
+    时间窗可选 1 分钟 / 10 分钟 / 1 小时 / 全程；可打事件标记。
 
-两条链怎么并存
---------------
-    共用的只有**扣暗后的光强**（`_push_net` 是唯一入口，在那里分流）。
-    再往下各走各的：SRS 禁止高通（会毁掉绝对值），MBLL 必须高通
-    （否则仪器漂移淹没相对变化）。配置、时间轴、缓冲都各自独立。
+TOI 逐帧独立反演，不依赖任何基线 —— 贴上就出数。
+相对量（Δ 系列、THI、AUC）需要基线：开机后自动等信号稳定再设，
+也可「抓取当前」或手填 TOI。基线与 AUC 的全部判断在
+`fnirs_pipeline.srs.BaselineManager`，这里只调方法、读状态。
 
-    MBLL 那一格开头几分钟是空的 —— 高通 0.01 Hz 需要 ≥300 s 记录才起步，
-    状态行会一直显示还差多少秒。这是物理约束，不是没在跑。
-
-    MBLL 出任何异常都会被就地摘掉并在状态行标红，**绝不影响 TOI**。
-    界面上的 ΔHb 与 `python -m mbll_decoder.run` 跑同一份归档逐点相同
-    （自检 t16 验这一条）。
-
-SRS 的在线反演【逐帧独立】，不依赖任何时间基线 —— 这正是它能出绝对值
-而 MBLL 只能出相对量的原因。所以这里没有「基线采集」步骤，贴上就出数。
+MBLL 已不在这里跑（2026-10-26）：带通 0.01~0.05 Hz 看不见持续数分钟的变化
+（合成 4 分钟 −10 µM 的阻断，平台期解出 +0.09），且要等 300 s 才出数。
+模块与命令行 `python -m mbll_decoder.run <归档>` 保留，归档里的原始帧随时可离线重算。
 
 ⚠️ 当前标定的状态
     810 nm 停用（4cm 读数有 54~87% 不是穿过体模的光，见 hardware.py）。
@@ -76,30 +69,13 @@ from srs_cal.acquire import (BAUDRATES, BRIGHTNESS_SETTLE_MS,    # noqa: E402
                              FRAMES_PER_CYCLE, SerialWorker, SimWorker)
 from srs_cal.archive import RawArchive                   # noqa: E402
 from srs_cal.robust import aggregate                     # noqa: E402
-from fnirs_pipeline.srs import (AucAccumulator,          # noqa: E402
-                                derive, make_baseline)
+from fnirs_pipeline.srs import (AUC_REL_DROP, BASELINE_N,  # noqa: E402
+                                SETTLE_MAX_REL, SETTLE_MAX_TOI_PTS,
+                                SETTLE_WIN_S, BaselineManager)
 from srs_cal.darksub import DarkSubtractor               # noqa: E402
 from srs_cal.quality import QualityMonitor, summarize    # noqa: E402
 from srs_cal.protocol import (BRIGHTNESS_DEFAULT, BRIGHTNESS_MAX,  # noqa: E402
                               BRIGHTNESS_MIN, build_brightness)
-
-# L3B（MBLL）。**导入失败不能影响 SRS** —— 这一格是附加显示，
-# 绝对血氧那一路不依赖它。import 本身也包起来，缺包时降级而不是启动不了。
-try:
-    from mbll_decoder import hardware as mbll_hw            # noqa: E402
-    from mbll_decoder.live import LiveMbll                  # noqa: E402
-except Exception as _e:                                     # noqa: BLE001
-    LiveMbll = mbll_hw = None
-    _MBLL_ERR = str(_e)
-else:
-    _MBLL_ERR = ""
-
-
-def mbll_band_text() -> str:
-    """带通参数取自 MBLL 自己的配置，不在这里写死 —— 那边改了这里不会过期。"""
-    if mbll_hw is None:
-        return "—"
-    return f"{mbll_hw.BP_LOW_HZ} ~ {mbll_hw.BP_HIGH_HZ} Hz"
 
 # DEFAULT_PORT / DEFAULT_GEAR 定义在 acquire.py，这里只 import（见上方 import 行）。
 # 两个程序共用一份，避免各改各的、悄悄跑偏。命令行 --port / --gear 可临时覆盖。
@@ -131,12 +107,20 @@ REFRESH_HZ = 10
 #
 #    滑动窗口：加大 N **不降低出点率**，代价只是滞后（约 N/2 个周期）。
 DEFAULT_AVG = 20
-# 「校准基线」按下后攒多少个点求均值。20 个点 ≈ 30 秒。
-# 取这个数的理由：基线的离散直接加到此后**每一个**相对量上，所以它的
-# 噪声应当明显小于单点噪声。20 个点把 ΔHbO 的基线不确定度压到
-# 1.486/√20 ≈ 0.33 µM，相对阻断信号（63 µM）可忽略。
-BASELINE_N = 20
-SPAN_S = 60
+# 基线攒多少个点（BASELINE_N）及其理由已移到 fnirs_pipeline/srs.py，
+# 与 BaselineManager 放在一起 —— 安卓端拿到的是同一个数。
+#
+# 时间窗选项。2026-10-26 前固定 60 s：看得清逐点抖动，但基线漂移与 AUC
+# 是几十分钟到几小时的量，60 s 窗里根本看不出来。BRS-100 的窗口可设、
+# 可回看整段（说明书 p35）。历史本来就留着（MAXPTS 2 万点 ≈ 8.5 小时）。
+SPAN_CHOICES = (("1 分钟", 60.0), ("10 分钟", 600.0),
+                ("1 小时", 3600.0), ("全程", None))
+DEFAULT_SPAN_IDX = 1
+
+
+def _mmss(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 60:02d}:{s % 60:02d}"
 
 
 class Calibration:
@@ -245,7 +229,6 @@ class OnlineWindow(QtWidgets.QWidget):
             kb_calibrated=cal.kb_set,
             active_wl=tuple(float(w) for w in WL))
         self.last_qflags: list = []
-        self._mbll_err = ""
         self._derived_err = ""
         # 显式传 WL —— 跟着 WAVELENGTHS_ACTIVE_NM 走，别依赖 geometry() 的默认。
         # ⚠️ **不传 dark_level**：暗电平已经在 _on_frames 里用每个周期的
@@ -265,10 +248,6 @@ class OnlineWindow(QtWidgets.QWidget):
         # 代价是延迟 1 个扫描周期（约 1.5 s），相对 N×1.5 s 的窗口可忽略。
         # 详见 darksub.py 与 docs/双解码器架构.md §二·十。
         self._darksub = DarkSubtractor()
-        # L3B：MBLL 相对量。吃的是**同一个扣暗器的输出**（架构里「两条链
-        # 唯一的共同输入」），再往下各走各的预处理 —— SRS 禁止高通，
-        # MBLL 必须高通。它只读不写 SRS 的任何状态，出不出数都不影响 TOI。
-        self._mbll = LiveMbll() if LiveMbll is not None else None
         self.dark_win = {r: deque(maxlen=600) for r in RHO}
         self._no_dark = 0
         self._fresh: set = set()
@@ -277,20 +256,32 @@ class OnlineWindow(QtWidgets.QWidget):
         self._frames = 0
         self._last_frames = 0
         self._fps = 0.0
-        self._t0 = time.perf_counter()
-        # L3A 的派生相对量：ΔHbO/ΔHbR/ΔtHb/THI/AUC。
-        # 由 SRS 的绝对浓度**减基线**得到 —— 纯算术，延迟只有 SRS 自身的，
-        # 不像 MBLL 要等 300 s。详见 fnirs_pipeline/srs.py 的「派生相对量」。
-        self.baseline = None                 # srs.Baseline | None
-        self._bl_pending: list = []          # 正在为新基线攒的点
-        self._bl_need = 0                    # 还要攒几个
-        self._auc = AucAccumulator()
+        # 时间轴用**数据时刻**（帧的 t_host，与 perf_counter 同一个钟），
+        # 原点取第一帧。2026-10-26 前用的是「反演那一刻」的 perf_counter ——
+        # interp 扣暗下两者差约一个扫描周期（1.5 s），而且回放归档时后者
+        # 毫无意义（一瞬间喂完几百秒数据）。自动基线要 60 s 窗、AUC 要积分时间，
+        # 都必须用前者。
+        self._t_data: float | None = None    # 最近一帧的 t_host
+        self._t0_data: float | None = None   # 第一帧的 t_host，不随清屏重置
+        # 派生相对量：ΔHbO/ΔHbR/ΔtHb/THI/ΔTOI/AUC。SRS 绝对浓度减基线 ——
+        # 纯算术，延迟只有 SRS 自身的。基线与 AUC 的**全部判断**在
+        # BaselineManager 里（逻辑层），这里只调方法、读状态。
+        self.bl = BaselineManager()
         self.d_hist: dict = {k: deque(maxlen=MAXPTS)
-                             for k in ("d_hbo", "d_hbr", "d_thb", "d_toi")}
+                             for k in ("d_hbo", "d_hbr", "d_thb",
+                                       "d_thi", "d_toi")}
         self.td_hist: deque = deque(maxlen=MAXPTS)
+        # AUC 与基线解耦，自己一条时间轴：只要有参考点就记，重抓基线时不断档
+        self.ta_hist: deque = deque(maxlen=MAXPTS)
+        self.auc_hist: deque = deque(maxlen=MAXPTS)
         self.last_derived = None
+        # 事件标记：(数据时刻, 文字)。界面上画竖线，并写到归档旁的 .events.csv
+        self.events: list[tuple[float, str]] = []
+        self._event_lines: list = []
         self.t_hist: deque = deque(maxlen=MAXPTS)
         self.toi_hist: deque = deque(maxlen=MAXPTS)
+        # THI 绝对指数（k·tHb，µM）。不依赖基线，与 TOI 同一条时间轴。
+        self.thi_hist: deque = deque(maxlen=MAXPTS)
         self.mua_hist: dict = {w: deque(maxlen=MAXPTS) for w in WL}
         self.last_flags: list[str] = []
         self._build()
@@ -303,7 +294,7 @@ class OnlineWindow(QtWidgets.QWidget):
 
     # -- UI ----------------------------------------------------------------
     def _build(self) -> None:
-        self.setWindowTitle("在线双解码器 —— SRS 绝对 TOI ＋ MBLL 相对 ΔHb"
+        self.setWindowTitle("在线解码器 —— SRS TOI 与派生相对量"
                             + ("（模拟器）" if self.simulate else ""))
         self.resize(1120, 980)
         pg.setConfigOption("background", "w")
@@ -349,26 +340,15 @@ class OnlineWindow(QtWidgets.QWidget):
         self._bright_timer.timeout.connect(self._send_brightness)
         self.spn_bright.valueChanged.connect(self._bright_timer.start)
         self.lbl_avg = QtWidgets.QLabel()
-        # 相对量的参考点。**必须能随时重设** —— SRS 不能高通，基线会随
-        # 仪器慢漂走偏（实测 63% 的浓度噪声在 <0.01 Hz）。竞品同样提供
-        # 这个按钮（BRS-100 说明书 p32「点击后，系统重新校准基线值」）。
-        self.btn_bl = QtWidgets.QPushButton("校准基线")
-        self.btn_bl.setToolTip("\n".join((
-            f"取之后 {BASELINE_N} 个点（约 {BASELINE_N/0.657:.0f} 秒）的均值作为参考点。",
-            "ΔHbO / ΔHbR / ΔtHb / THI / AUC 全部相对它计算。",
-            "",
-            "⚠️ 基线不抗漂移：SRS 为了保住绝对值不能高通，",
-            "   所以长时间监护后应重新校准。",
-            "⚠️ 重设会把 AUC 一并清零。")))
-        self.btn_bl.clicked.connect(self._start_baseline)
         self.btn_reset = QtWidgets.QPushButton("清屏")
+        self.btn_reset.setToolTip("清掉曲线、基线与 AUC，自动基线重新开始等稳定。")
         self.btn_reset.clicked.connect(self._reset)
         for w in (QtWidgets.QLabel("串口"), self.cmb_port,
                   QtWidgets.QLabel("波特率"), self.cmb_baud,
                   self.btn_refresh, self.btn_conn,
                   QtWidgets.QLabel("  光源"), self.spn_bright,
                   QtWidgets.QLabel("  平均"), self.spn_avg, self.lbl_avg,
-                  self.btn_bl, self.btn_reset):
+                  self.btn_reset):
             bar.addWidget(w)
         bar.addStretch(1)
         # 原始归档：**默认开启**。连续监护设备出了异常必须能回看，
@@ -387,6 +367,7 @@ class OnlineWindow(QtWidgets.QWidget):
         self.lbl_link.setStyleSheet("color:#888")
         bar.addWidget(self.lbl_link)
         root.addLayout(bar)
+        root.addLayout(self._build_bar2())
         self.chk_rec.toggled.connect(self._toggle_record)
         self.btn_refresh.clicked.connect(self._refresh_ports)
         self.btn_conn.clicked.connect(self._toggle_conn)
@@ -428,6 +409,7 @@ class OnlineWindow(QtWidgets.QWidget):
         self.lbl_sub.setWordWrap(True)
         bv.addWidget(self.lbl_sub)
         mid.addWidget(box, 1)
+        mid.addWidget(self._build_cells(), 2)
 
         self.tbl = QtWidgets.QTableWidget(len(WL), 4)
         self.tbl.setHorizontalHeaderLabels(["I(3cm)", "I(4cm)", "斜率", "μa"])
@@ -440,51 +422,48 @@ class OnlineWindow(QtWidgets.QWidget):
         mid.addWidget(self.tbl, 1)
         root.addLayout(mid)
 
+        # —— 主页：临床量四格，共用 x 轴（同一条 SRS 链、同一时刻）。
+        #    调试页：μa（反演中间量）。2026-10-26 前 μa 与 MBLL 占了主页两行。
+        self.tabs = QtWidgets.QTabWidget()
         glw = pg.GraphicsLayoutWidget()
         self.p_toi = glw.addPlot(row=0, col=0, title="TOI")
         self.p_toi.showGrid(x=True, y=True, alpha=0.3)
         self.p_toi.setLabel("left", "TOI (%)")
-        self.c_toi = self.p_toi.plot(pen=pg.mkPen("#1a7f5a", width=2))
+        self.p_toi.addLegend(offset=(-10, 8), labelTextSize="8pt")
+        self.c_toi = self.p_toi.plot(pen=pg.mkPen("#1a7f5a", width=2),
+                                     name="TOI")
         self.c_toi.setClipToView(True)
-        self.p_mua = glw.addPlot(row=1, col=0, title="各波长 μa（反演中间量）")
-        self.p_mua.showGrid(x=True, y=True, alpha=0.3)
-        self.p_mua.setLabel("left", "μa (cm⁻¹)")
-        self.p_mua.setLabel("bottom", "时间 (s)")
-        self.p_mua.addLegend(offset=(-10, 8), labelTextSize="8pt")
-        self.c_mua = {w: self.p_mua.plot(pen=pg.mkPen(COLOR[w], width=1.6),
-                                         name=f"{w:.0f}") for w in WL}
-        for c in self.c_mua.values():
-            c.setClipToView(True)
-        self.p_mua.setXLink(self.p_toi)
+        # 基线与 AUC 警戒线画成**数据曲线**而不是 InfiniteLine：后者不参与
+        # 自动缩放，TOI 远高于警戒线时那条线会落在视野外，等于没画。
+        self.c_bl_line = self.p_toi.plot(
+            pen=pg.mkPen("#555555", width=1.4, style=QtCore.Qt.DashLine),
+            name="基线")
+        self.c_auc_line = self.p_toi.plot(
+            pen=pg.mkPen("#c0392b", width=1.4, style=QtCore.Qt.DotLine),
+            name=f"AUC 警戒线（参考×{1 - AUC_REL_DROP:.1f}）")
+        # 第一个窗口攒满前画进度，而不是留一张空图 ——
+        # 空图看起来是「坏了」，不是「在攒」。
+        self.txt_toi = pg.TextItem(anchor=(0.5, 0.5), color="#8a5a00")
+        self.p_toi.addItem(self.txt_toi)
 
-        # —— L3B：MBLL 相对量。**刻意不 setXLink**：
-        #    上面两格看的是最近 SPAN_S 秒的实时窗，这一格看的是整段记录
-        #    （高通 0.01 Hz 本来就要 ≥300 s 才起步）。强行共用 x 轴，
-        #    要么上面被拉得看不清，要么下面只剩一个点。
-        self.p_hb = glw.addPlot(
-            row=2, col=0, title="ΔHbO / ΔHbR　（MBLL —— 相对变化，整段记录）")
-        self.p_hb.showGrid(x=True, y=True, alpha=0.3)
-        self.p_hb.setLabel("left", "Δc (µM)")
-        self.p_hb.setLabel("bottom", "时间 (s)")
-        self.p_hb.addLegend(offset=(-10, 8), labelTextSize="8pt")
-        self.c_hbo = self.p_hb.plot(pen=pg.mkPen("#d62728", width=1.6),
-                                    name="ΔHbO")
-        self.c_hbr = self.p_hb.plot(pen=pg.mkPen("#2a78d6", width=1.6),
-                                    name="ΔHbR")
-        # 开头几分钟这一格必然是空的（高通 0.01 Hz 要 ≥300 s 才起步）。
-        # 把倒计时写在**图里**而不是只写在窗口最底下的状态行 ——
-        # 一张空图配一行灰字，看起来就是「坏了」，而不是「在攒」。
-        self.txt_hb = pg.TextItem(anchor=(0.5, 0.5), color="#8a5a00")
-        self.p_hb.addItem(self.txt_hb)
-        self._hb_started = False
+        # THI 绝对指数 = k·tHb，**不依赖基线**，开机就有；下面三格都要等基线。
+        #
+        # ⚠️ 2026-10-26 这一格加了、删了、又恢复。判据是竞品界面照片：
+        #    第一张只看到「THI 2.83 / ΔTHI 1.83」，差恰为 1.00，判为归一化 → 删。
+        #    第二张多出「BL 82 / rSO₂ 81」—— 病人是稳的，而 THI 2.83 若是
+        #    「当前 tHb ÷ 基线 tHb」就意味着总血红蛋白涨到近 3 倍，不可能。
+        #    故 THI 2.83 更可能是**绝对指数**，归一化那条恒等式是另一回事。
+        #    两种读法都留在界面上，免得猜错又返工（比值在读数行，指数在这一格）。
+        self.p_thi = glw.addPlot(
+            row=1, col=0, title="THI　（血红蛋白指数，不依赖基线）")
+        self.p_thi.showGrid(x=True, y=True, alpha=0.3)
+        self.p_thi.setLabel("left", "tHb (µM)")
+        self.c_thi = self.p_thi.plot(pen=pg.mkPen("#8e44ad", width=1.8))
 
-        # —— L3A 的派生相对量。与上面的 TOI 共用 x 轴（同一条链、同一时刻），
-        #    这点和 MBLL 那格不同 —— 那格是另一条链、另一个时间尺度。
         self.p_rel = glw.addPlot(
-            row=3, col=0, title="ΔHbO / ΔHbR / ΔtHb　（SRS 绝对浓度 − 基线）")
+            row=2, col=0, title="ΔHbO / ΔHbR / ΔtHb　（SRS 绝对浓度 − 基线）")
         self.p_rel.showGrid(x=True, y=True, alpha=0.3)
         self.p_rel.setLabel("left", "Δc (µM)")
-        self.p_rel.setLabel("bottom", "时间 (s)")
         self.p_rel.addLegend(offset=(-10, 8), labelTextSize="8pt")
         self.c_rel = {
             "d_hbo": self.p_rel.plot(pen=pg.mkPen("#d62728", width=1.8),
@@ -494,34 +473,180 @@ class OnlineWindow(QtWidgets.QWidget):
             "d_thb": self.p_rel.plot(pen=pg.mkPen("#1a7f5a", width=1.4),
                                      name="ΔtHb"),
         }
-        for c in self.c_rel.values():
-            c.setClipToView(True)
-        self.p_rel.setXLink(self.p_toi)
         self.txt_rel = pg.TextItem(anchor=(0.5, 0.5), color="#8a5a00")
         self.p_rel.addItem(self.txt_rel)
 
-        root.addWidget(glw, 1)
+        # ΔTHI 与 ΔTOI 同一格：都以 0 为中心、量级相近（%）。
+        # THI 本身（基线处 = 100）在读数行里给。
+        self.p_idx = glw.addPlot(row=3, col=0, title="ΔTHI / ΔTOI　（相对基线）")
+        self.p_idx.showGrid(x=True, y=True, alpha=0.3)
+        self.p_idx.setLabel("left", "%")
+        self.p_idx.addLegend(offset=(-10, 8), labelTextSize="8pt")
+        # ΔTHI 画成百分比（×100）才与 ΔTOI 的量级可比、共用一根 y 轴；
+        # 读数行按 MOC400 的比值口径给（THI 1.39 / ΔTHI +0.39）。
+        self.c_rel["d_thi"] = self.p_idx.plot(
+            pen=pg.mkPen("#8e44ad", width=1.6), name="ΔTHI (%，=比值×100)")
+        self.c_rel["d_toi"] = self.p_idx.plot(
+            pen=pg.mkPen("#1a7f5a", width=1.8), name="ΔTOI (%O₂)")
+        self.p_idx.addItem(pg.InfiniteLine(
+            pos=0.0, angle=0, pen=pg.mkPen("#999999", width=1)))
 
-        self.lbl_mbll = QtWidgets.QLabel()
-        self.lbl_mbll.setWordWrap(True)
-        self.lbl_mbll.setStyleSheet("color:#666")
-        self.lbl_mbll.setToolTip("\n".join((
-            "MBLL 给的是**相对变化**，不是绝对值 —— 绝对血氧由上面的 SRS 给。",
-            "两条链相互独立：各自的预处理、各自的配置、各自的时间轴，",
-            "只共用同一份扣暗后的光强（架构里「两条链唯一的共同输入」）。",
-            "",
-            f"带通 {mbll_band_text()}　距离 3.0cm　波长 670/770",
-            "⚠️ 高通 0.01 Hz 需要 ≥300 s 记录才起步，所以开头几分钟这一格是空的。",
-            "⚠️ 两波长时 ΔHbO 与 ΔHbR 被约束在一条直线上，强负相关是数学必然，",
-            "   不是生理证据。",
-            "",
-            "界面上的数与 `python -m mbll_decoder.run` 跑同一份归档**逐点相同**"
-            "（自检 t16 验这一条）。")))
-        root.addWidget(self.lbl_mbll)
+        self.p_auc = glw.addPlot(row=4, col=0, title="AUC　（去饱和负荷）")
+        self.p_auc.showGrid(x=True, y=True, alpha=0.3)
+        self.p_auc.setLabel("left", "%·min")
+        self.p_auc.setLabel("bottom", "时间 (s)")
+        self.c_auc = self.p_auc.plot(pen=pg.mkPen("#c0392b", width=1.8))
+        for c in (*self.c_rel.values(), self.c_auc, self.c_thi,
+                  self.c_bl_line, self.c_auc_line):
+            c.setClipToView(True)
+        for p in (self.p_thi, self.p_rel, self.p_idx, self.p_auc):
+            p.setXLink(self.p_toi)
+        # y 轴只按**可见**时间段自动缩放 —— 否则看「1 分钟」时，
+        # 一小时前的一次大波动会把 y 轴撑开，眼前的变化压成一条线。
+        for p in (self.p_toi, self.p_thi, self.p_rel, self.p_idx, self.p_auc):
+            p.setAutoVisible(y=True)
+        self.tabs.addTab(glw, "主页")
+
+        glw_dbg = pg.GraphicsLayoutWidget()
+        self.p_mua = glw_dbg.addPlot(row=0, col=0, title="各波长 μa（反演中间量）")
+        self.p_mua.showGrid(x=True, y=True, alpha=0.3)
+        self.p_mua.setLabel("left", "μa (cm⁻¹)")
+        self.p_mua.setLabel("bottom", "时间 (s)")
+        self.p_mua.addLegend(offset=(-10, 8), labelTextSize="8pt")
+        self.c_mua = {w: self.p_mua.plot(pen=pg.mkPen(COLOR[w], width=1.6),
+                                         name=f"{w:.0f}") for w in WL}
+        for c in self.c_mua.values():
+            c.setClipToView(True)
+        self.p_mua.setXLink(self.p_toi)
+        self.tabs.addTab(glw_dbg, "调试")
+
+        root.addWidget(self.tabs, 1)
 
         self._refresh_ports()
         self._sync_avg()
         self.spn_avg.valueChanged.connect(self._sync_avg)
+
+    # 每格：(键, 标题, 提示)。**标题必须自带限定词** ——
+    # 「THI」单独出现指不清是指数还是比值，用户为此找不到读数两次。
+    CELLS = (
+        ("thi_abs", "THI 指数 (µM)", "k·tHb，**不依赖基线**，开机就有。\n"
+                                    "k 来自 μs′ 假设，故只能叫指数、不是真浓度。"),
+        ("d_hbo", "ΔHbO (µM)", "相对基线的含氧血红蛋白变化。"),
+        ("d_hbr", "ΔHbR (µM)", "相对基线的脱氧血红蛋白变化。"),
+        ("d_thb", "ΔtHb (µM)", "ΔHbO + ΔHbR。"),
+        ("thi", "THI 比值", "当前 tHb ÷ 基线 tHb，**基线 = 1.00**。\n"
+                            "这是与 MOC400 的 THI 读数同一族的量。"),
+        ("d_thi", "ΔTHI", "THI − 1.00。"),
+        ("d_toi", "ΔTOI (%O₂)", "当前 TOI − 基线 TOI。括号里是占基线的百分比。"),
+        ("auc", "AUC (%·min)", "∫ max(警戒线 − TOI, 0) dt。\n"
+                               "括号里是低于警戒线的累计时长。"),
+    )
+
+    def _build_cells(self) -> QtWidgets.QWidget:
+        """带标签的读数格子。
+
+        2026-10-26：原先是一行七项的长文本，用户两次找不到 THI。
+        改成 MOC400 那样一格一个量、标题常驻 —— 扫一眼就能定位。
+        """
+        w = QtWidgets.QWidget()
+        g = QtWidgets.QGridLayout(w)
+        g.setSpacing(4)
+        g.setContentsMargins(0, 0, 0, 0)
+        mono = QtGui.QFont("Consolas"); mono.setPointSize(13); mono.setBold(True)
+        self.cells: dict = {}
+        for i, (key, title, tip) in enumerate(self.CELLS):
+            fr = QtWidgets.QFrame()
+            fr.setFrameShape(QtWidgets.QFrame.StyledPanel)
+            fr.setToolTip(tip)
+            v = QtWidgets.QVBoxLayout(fr)
+            v.setSpacing(0); v.setContentsMargins(6, 3, 6, 3)
+            cap = QtWidgets.QLabel(title)
+            cap.setStyleSheet("color:#888;font-size:8pt")
+            val = QtWidgets.QLabel("—")
+            val.setFont(mono)
+            val.setStyleSheet("color:#222")
+            v.addWidget(cap); v.addWidget(val)
+            g.addWidget(fr, i // 4, i % 4)
+            self.cells[key] = val
+        return w
+
+    def _build_bar2(self) -> QtWidgets.QHBoxLayout:
+        """第二行工具栏：基线 ｜ AUC ｜ 时间窗 ｜ 事件标记。
+
+        基线与 AUC 各有各的按钮 —— 2026-10-26 前一个「校准基线」同时清 AUC，
+        提示语里写着「重设会把 AUC 一并清零」，写出来了但没解决。
+        MOC400 的设置页同样是两行：BL 基线、AUC 基线（各自复位）。
+        """
+        bar = QtWidgets.QHBoxLayout()
+
+        # —— 基线 ——
+        self.btn_capture = QtWidgets.QPushButton("抓取当前")
+        self.btn_capture.setToolTip("\n".join((
+            f"立即取之后 {BASELINE_N} 个点（约 {BASELINE_N / 0.657:.0f} 秒）的均值"
+            "作为基线，不等稳定判据。",
+            "ΔHbO / ΔHbR / ΔtHb / THI / ΔTOI 全部相对它计算。",
+            "",
+            "开机后会自动设基线 —— 攒够点就设，**不等信号稳定**。",
+            f"稳定判据（{SETTLE_WIN_S:.0f} s 内最强一路光强变化 < {SETTLE_MAX_REL:.0%}"
+            f"、TOI 变化 < {SETTLE_MAX_TOI_PTS:.0f} 点）只在定基线那一刻读一次，",
+            "不通过就把基线标成「未稳定」，由你决定要不要重抓。",
+            "",
+            "⚠️ 基线不抗漂移：SRS 为了保住绝对值不能高通，长时间监护后应重抓。",
+            "   重抓**不影响 AUC**（AUC 有自己的参考点，用右边的「AUC复位」）。")))
+        self.btn_capture.clicked.connect(self._on_capture)
+        self.spn_bl_toi = QtWidgets.QDoubleSpinBox()
+        self.spn_bl_toi.setRange(1.0, 100.0)
+        self.spn_bl_toi.setDecimals(1)
+        self.spn_bl_toi.setSuffix(" %")
+        self.spn_bl_toi.setToolTip(
+            "手填 TOI 基线（如术前已知值）。只改 TOI 基线，\n"
+            "ΔHbO/ΔHbR/ΔtHb/THI 的浓度基线仍来自抓取 —— 浓度没法手填。\n"
+            "所以要先有一次抓取或自动基线，才能手填。")
+        self.btn_bl_apply = QtWidgets.QPushButton("应用")
+        self.btn_bl_apply.clicked.connect(self._on_manual_toi)
+        self.lbl_bl = QtWidgets.QLabel("基线：—")
+        self.lbl_bl.setMinimumWidth(330)
+
+        # —— AUC ——
+        self.btn_auc_reset = QtWidgets.QPushButton("AUC复位")
+        self.btn_auc_reset.setToolTip("\n".join((
+            "AUC 清零，参考点取**当前基线的 TOI**。基线不动。",
+            "",
+            f"AUC = ∫ max(警戒线 − TOI, 0) dt，警戒线 = 参考 × {1 - AUC_REL_DROP:.1f}"
+            f"（相对基线下 {AUC_REL_DROP:.0%}，不可改）。",
+            "警戒线必须低于基线：若贴着基线，噪声负半边会被持续收进来 ——",
+            "实测静止体模 10 分钟能凭空攒 662~1013 %·s。")))
+        self.btn_auc_reset.clicked.connect(self._on_auc_reset)
+        self.lbl_auc = QtWidgets.QLabel("警戒线：待基线")
+
+        # —— 时间窗 ——
+        self.cmb_span = QtWidgets.QComboBox()
+        for name, _ in SPAN_CHOICES:
+            self.cmb_span.addItem(name)
+        self.cmb_span.setCurrentIndex(DEFAULT_SPAN_IDX)
+        self.cmb_span.setToolTip("曲线显示的时间范围。数据本身一直保留（约 8.5 小时）。")
+
+        # —— 事件标记 ——
+        self.txt_event = QtWidgets.QLineEdit()
+        self.txt_event.setPlaceholderText("事件名（可空）")
+        self.txt_event.setMaximumWidth(150)
+        self.txt_event.returnPressed.connect(self._on_mark)
+        self.btn_mark = QtWidgets.QPushButton("标记")
+        self.btn_mark.setToolTip(
+            "在当前时刻打一条竖线（如袖带充气 / 放气）。\n"
+            "记录原始数据时同时写入归档旁的 <归档名>.events.csv，"
+            "时刻与归档里的 t_host 同一个钟，可对齐回放。")
+        self.btn_mark.clicked.connect(self._on_mark)
+
+        for w in (QtWidgets.QLabel("基线"), self.btn_capture,
+                  QtWidgets.QLabel("TOI"), self.spn_bl_toi, self.btn_bl_apply,
+                  self.lbl_bl, QtWidgets.QLabel("｜"),
+                  self.btn_auc_reset, self.lbl_auc, QtWidgets.QLabel("｜ 窗口"),
+                  self.cmb_span, QtWidgets.QLabel("｜ 事件"),
+                  self.txt_event, self.btn_mark):
+            bar.addWidget(w)
+        bar.addStretch(1)
+        return bar
 
     def _sync_avg(self) -> None:
         """显示平均窗口对应多少秒 —— 用**实测**帧率，不用假设值。
@@ -684,7 +809,17 @@ class OnlineWindow(QtWidgets.QWidget):
                 "color:#c33" if st.n_errors else "color:#2a7")
 
     def _reset(self) -> None:
+        # ⚠️ 连 last_res 一起丢掉 —— 否则清屏后曲线空了、大数字和格子却停在旧值，
+        #    进度条也因为「已有 last_res」而不出现，看起来像卡死。
+        for k in ("last_res", "last_I", "last_derived"):
+            self.__dict__.pop(k, None)
+        self.last_derived = None
+        self.lbl_toi.setText("—")
+        self.lbl_toi.setStyleSheet("color:#888")
+        for lab in self.cells.values():
+            lab.setText("—")
         self.t_hist.clear(); self.toi_hist.clear()
+        self.thi_hist.clear(); self.c_thi.setData([], [])
         for d in self.mua_hist.values():
             d.clear()
         for d in self.win.values():
@@ -693,22 +828,23 @@ class OnlineWindow(QtWidgets.QWidget):
             d.clear()
         self.cycle_dark.clear()
         self._darksub.reset()
-        if self._mbll is not None:
-            self._mbll.reset()      # 清屏要连 MBLL 的缓冲一起清，
-            self.c_hbo.setData([], [])   # 否则新旧两段会被当成一条连续记录
-            self.c_hbr.setData([], [])
-            self._hb_started = False     # 倒计时重新开始
-        # 清屏连基线一起清 —— 旧基线对应的是已经被清掉的那段数据
-        self.baseline = None
-        self._bl_pending = []
-        self._bl_need = 0
-        self._auc.reset()
+        # 清屏连基线、AUC 一起清 —— 旧基线对应的是已经被清掉的那段数据。
+        # 自动基线从「等待稳定」重新开始。
+        self.bl.reset()
         self.last_derived = None
         self.td_hist.clear()
         for d in self.d_hist.values():
             d.clear()
-        for c in self.c_rel.values():
+        self.ta_hist.clear(); self.auc_hist.clear()
+        for c in (*self.c_rel.values(), self.c_auc,
+                  self.c_bl_line, self.c_auc_line):
             c.setData([], [])
+        # 事件只清图上的线；已写进 .events.csv 的不动
+        for ln in self._event_lines:
+            for p, item in ln:
+                p.removeItem(item)
+        self._event_lines.clear()
+        self.events.clear()
         self._no_dark = 0
         self._fresh.clear()
         self._since = 0
@@ -722,24 +858,27 @@ class OnlineWindow(QtWidgets.QWidget):
         从 `_on_frames` 的循环里抽出来 —— 插值扣暗会在**一个暗时隙到达时
         成批**吐出上一周期的信号帧，原先内联在循环里的判定已不适用。
 
-        这里是「一个扣暗样本进入系统」的唯一入口，所以也在这里分流给
-        MBLL —— 两条链拿到的是**同一个值**，差异只可能来自算法。
+        `t` 是这个样本所属信号帧的 t_host —— 光被测到的时刻。
         """
-        # ⚠️ MBLL 永远不能打断 SRS 出数。出过一次异常就彻底摘掉这一格，
-        #    不反复抛；界面上会显示「已停用」，不会静默。
-        if self._mbll is not None:
-            try:
-                self._mbll.push(key[0], key[1], t, net)
-            except Exception as e:                           # noqa: BLE001
-                self._mbll = None
-                self._mbll_err = str(e)
+        self._t_data = float(t)
+        if self._t0_data is None:
+            self._t0_data = float(t)
         self.win[key].append(float(net))
         self._fresh.add(key)
         self._since += 1
         # 判定放在每压入一个样本之后：一批 feed 里可能含多个扫描周期，
         # 放在批末会让出点率被串口的读节奏绑架，而不是由设备扫描速率决定。
+        #
+        # ⚠️ 2026-10-26 第二轮试过「窗口没满也出点」，**实测否决**：
+        #    TOI 是光强的非线性函数（μa ∝ μeff²），单周期噪声不是散开而是**有偏**。
+        #    实测「n 个周期算的 TOI」减「同一时刻 20 周期算的」：
+        #      n=1  中位 0.2~7.2，p90 0.4~23.1
+        #      n=10 中位 0.0~2.7，p90 0.1~7.9
+        #    103952 开头几点读 42，真值 74。主读数上放一个错 32 点的数不可接受。
+        #    改为：窗口没满时在图里画进度，不出数。想更快就把工具栏的「平均」调小。
         if (len(self._fresh) == nk
                 and all(len(self.win[k]) >= need for k in self._keys)):
+                n = min(len(self.win[k]) for k in self._keys)
                 # ⚠️ 稳健聚合而非算术均值：实测每通道 2~6% 的周期是尖峰、
                 #    幅度约 25 倍。窗口 N=10 时约 10% 的窗口被污染，
                 #    一个尖峰会把该点的均值抬高约 2.5 倍。选型见 robust.py。
@@ -756,7 +895,7 @@ class OnlineWindow(QtWidgets.QWidget):
                 self._fresh.clear()
                 self._since = 0
                 self._starved = []
-                self._invert(I, need)
+                self._invert(I, n)
 
     def _on_frames(self, frames: list) -> None:
         """滑动窗口：每收齐一个新扫描周期出一个点，每点平均最近 N 个周期。
@@ -803,8 +942,6 @@ class OnlineWindow(QtWidgets.QWidget):
                     f.wavelength_nm, f.distance_cm, f.t_host, float(f.adc)):
                 self._push_net((wl, rho), net, t, need, nk)
             self._no_dark = self._darksub.n_dropped_nodark
-            continue
-            self._push_net(key, net, need, nk)
 
         if self._since > max(need * 20, 400):
             # 某一路长期不来（LED 没亮、协议变了）。不能默默停更 ——
@@ -824,7 +961,7 @@ class OnlineWindow(QtWidgets.QWidget):
         from fnirs_pipeline.srs import compute_toi
 
         res = compute_toi(I, self.geom)
-        t = time.perf_counter() - self._t0
+        t = self._now()
         self.last_I = I
         self.last_res = res
         self.last_n = n_cycles
@@ -842,57 +979,116 @@ class OnlineWindow(QtWidgets.QWidget):
             self.toi_hist.append(res.toi)
             for j, w in enumerate(WL):
                 self.mua_hist[w].append(res.mua[j])
-        self._update_derived(res, t)
+            self.thi_hist.append(res.thb_uM)
+        self._update_derived(res, I, t)
+
+    def _now(self) -> float:
+        """数据时刻，以第一帧为 0。还没收到帧时退回 0。"""
+        if self._t_data is None or self._t0_data is None:
+            return 0.0
+        return self._t_data - self._t0_data
 
     # -- 派生相对量 ---------------------------------------------------------
-    def _start_baseline(self) -> None:
-        """按下「校准基线」：丢掉旧基线，开始攒新的。
+    def _update_derived(self, res, I, t: float) -> None:
+        """每次反演后调用。判断全在 BaselineManager 里，这里只记历史。
 
-        ⚠️ 立刻把旧基线置 None —— 攒的这 30 秒里不该继续用旧参考点出数，
-           否则界面上会出现一段「看着正常但参考点已作废」的曲线。
+        整个包在 try 里 —— 这一格坏掉不能影响 TOI。
         """
-        self.baseline = None
-        self._bl_pending = []
-        self._bl_need = BASELINE_N
-        self._auc.reset()
-        self.last_derived = None
-        self.td_hist.clear()
-        for d in self.d_hist.values():
-            d.clear()
-        for c in self.c_rel.values():
-            c.setData([], [])
-
-    def _update_derived(self, res, t: float) -> None:
-        """每次反演后调用。整个包在 try 里 —— 这一格坏掉不能影响 TOI。"""
         try:
-            if self._bl_need > 0:
-                if np.isfinite(res.toi) and np.isfinite(res.thb_uM):
-                    self._bl_pending.append(res)
-                    self._bl_need -= 1
-                if self._bl_need == 0:
-                    self.baseline = make_baseline(self._bl_pending, t=t)
-                    self._bl_pending = []
-                return
-            d = derive(res, self.baseline)
-            if d is None:
-                return
+            d = self.bl.push(t, res, I)
             self.last_derived = d
-            self._auc.push(t, d.d_toi)
-            self.td_hist.append(t)
-            for k in self.d_hist:
-                self.d_hist[k].append(getattr(d, k))
+            if d is not None:
+                self.td_hist.append(t)
+                for k in self.d_hist:
+                    self.d_hist[k].append(getattr(d, k))
+            if self.bl.auc.ref_toi is not None:
+                self.ta_hist.append(t)
+                self.auc_hist.append(self.bl.auc.value_min)
         except Exception as e:                               # noqa: BLE001
-            self.baseline = None
-            self._bl_need = 0
-            self._derived_err = str(e)
+            self._derived_err = f"{type(e).__name__}: {e}"
+
+    def _break_derived_line(self) -> None:
+        """基线换了：在相对量曲线里插一个 NaN，断开前后两段。
+
+        历史**不清掉** —— 旧的那段是相对旧基线算的，本身没错，删了反而丢信息；
+        但两段不该连成一条线，否则重抓那一刻会画出一条假的跳变斜线。
+        """
+        if self.td_hist:
+            self.td_hist.append(self.td_hist[-1])
+            for d in self.d_hist.values():
+                d.append(float("nan"))
+
+    def _on_capture(self) -> None:
+        self.bl.capture()
+        self.last_derived = None
+        self._break_derived_line()
+
+    def _on_manual_toi(self) -> None:
+        if not self.bl.set_manual_toi(self.spn_bl_toi.value()):
+            QtWidgets.QMessageBox.information(
+                self, "手填基线",
+                "还没有浓度基线 —— 先等自动基线，或点「抓取当前」。\n"
+                "手填只改 TOI 基线；ΔHbO/ΔHbR/ΔtHb/THI 需要抓取得到的浓度基线。")
+            return
+        self._break_derived_line()
+
+    def _on_auc_reset(self) -> None:
+        self.bl.reset_auc()
+        # AUC 曲线断开：复位前后不是同一笔账
+        if self.ta_hist:
+            self.ta_hist.append(self.ta_hist[-1])
+            self.auc_hist.append(float("nan"))
+
+    def _on_mark(self) -> None:
+        """事件标记：画竖线，并写进归档旁的 .events.csv。"""
+        t = self._now()
+        label = self.txt_event.text().strip() or f"事件 {len(self.events) + 1}"
+        self.events.append((t, label))
+        self.txt_event.clear()
+        items = []
+        for p in (self.p_toi, self.p_thi, self.p_rel, self.p_idx, self.p_auc):
+            ln = pg.InfiniteLine(
+                pos=t, angle=90, pen=pg.mkPen("#e67e22", width=1.2),
+                label=label if p is self.p_toi else None,
+                labelOpts={"position": 0.92, "color": "#e67e22",
+                           "fill": (255, 255, 255, 200)})
+            p.addItem(ln)
+            items.append((p, ln))
+        self._event_lines.append(items)
+        self._write_event(t, label)
+
+    def _write_event(self, t: float, label: str) -> None:
+        """追加写一行。失败只提示 —— 标记丢了不能中断测量。
+
+        时刻写两份：`t_host`（与归档里每帧的 t_host 同一个钟，回放时对齐用）
+        和墙钟（给人看）。
+        """
+        path = self.archive.current_path if self.archive is not None else None
+        if path is None:
+            self.lbl_rec.setText(f"⚠ 事件「{label}」未写入文件（未在记录）")
+            return
+        try:
+            ev = path.with_name(path.stem + ".events.csv")
+            new = not ev.exists()
+            with ev.open("a", encoding="utf-8-sig", newline="") as fh:
+                if new:
+                    fh.write("wall_time,t_host,t_rel_s,label\n")
+                wall = time.strftime("%Y-%m-%d %H:%M:%S")
+                t_host = "" if self._t_data is None else f"{self._t_data:.6f}"
+                safe = label.replace('"', "“")          # CSV 字段里不留裸引号
+                fh.write(f'{wall},{t_host},{t:.3f},"{safe}"\n')
+        except Exception as e:                               # noqa: BLE001
+            self.lbl_rec.setText(f"⚠ 事件未写入：{e}")
 
     # -- 刷新 --------------------------------------------------------------
     def _refresh(self) -> None:
-        # MBLL 放在 SRS 的早退之前：开头几分钟 SRS 还没出第一个点，
-        # 而这一格正该显示「还差多少秒」—— 空着会让人以为程序没在跑。
-        self._refresh_mbll()
+        # 基线 / AUC 状态放在早退之前：开头 SRS 还没出点时，
+        # 这一行正该说清「在等什么」。
+        self._refresh_bars()
         if not hasattr(self, "last_res"):
+            self._refresh_wait()
             return
+        self.txt_toi.setVisible(False)
         res, I = self.last_res, self.last_I
         if np.isfinite(res.toi):
             self.lbl_toi.setText(f"{res.toi:.1f}")
@@ -900,14 +1096,17 @@ class OnlineWindow(QtWidgets.QWidget):
         else:
             self.lbl_toi.setText("—")
             self.lbl_toi.setStyleSheet("color:#c33")
+        # 各量填进带标签的格子（见 _build_cells），**不再拼成一长行** ——
+        # 原先七项挤一行，用户两次找不到 THI。这里只留状态与告警。
+        self._fill_cells()
         sub = f"{self.last_n} 周期平均"
         if not self.cal.kb_set:
             sub += "　｜ k/b 未标定 → 看趋势，不是绝对值"
-        d = self.last_derived
-        if d is not None:
-            sub += (f"\nΔHbO {d.d_hbo:+.2f}　ΔHbR {d.d_hbr:+.2f}　"
-                    f"ΔtHb {d.d_thb:+.2f} µM　THI {d.thi:.1f}%"
-                    f"　ΔTOI {d.d_toi:+.2f}　AUC {self._auc.value:.0f} %O₂·s")
+        if self.bl.baseline is None:
+            st = self.bl.state
+            sub += f"　｜ 相对量等基线（采集中 {st.n_have}/{st.n_need}）"
+        if self._derived_err:
+            sub += "　｜ ⚠ 派生量出错：" + self._derived_err
         if self._starved:
             sub += "　｜ ⚠ 长期收不到 " + "、".join(self._starved)
         # ⚠️ 用 summarize 而不是直接拼 res.flags：
@@ -935,82 +1134,138 @@ class OnlineWindow(QtWidgets.QWidget):
             for w, c in self.c_mua.items():
                 c.setData(ts, np.fromiter(self.mua_hist[w], float,
                                           len(self.mua_hist[w])))
-            self.p_toi.setXRange(max(0.0, ts[-1] - SPAN_S),
-                                 max(SPAN_S, ts[-1]), padding=0)
+            self.c_thi.setData(ts, np.fromiter(self.thi_hist, float,
+                                               len(self.thi_hist)),
+                               connect="finite")
+            # 基线与警戒线：横跨整段历史画平线（当前值）
+            x2 = [ts[0], ts[-1]]
+            b, thr = self.bl.baseline, self.bl.auc.threshold
+            self.c_bl_line.setData(x2 if b else [], [b.toi] * 2 if b else [])
+            self.c_auc_line.setData(x2 if thr is not None else [],
+                                    [thr] * 2 if thr is not None else [])
+            # 「最近 span 秒」。右端钉在最新一点，**不往后留空白** ——
+            # 记录比窗口短时（如选 1 小时但才测了 8 分钟），留空白会把曲线
+            # 挤到左边 14% 里看不清。不够 span 秒就显示全部。
+            span = SPAN_CHOICES[self.cmb_span.currentIndex()][1]
+            lo = ts[0] if span is None else max(ts[0], ts[-1] - span)
+            self.p_toi.setXRange(lo, max(ts[-1], lo + 1.0), padding=0.01)
 
         self._refresh_derived()
 
+    def _fill_cells(self) -> None:
+        """把各量填进格子。没有基线时相对量那几格显示「—」。"""
+        d, auc = self.last_derived, self.bl.auc
+        thi_abs = self.last_res.thb_uM
+        txt = {"thi_abs": f"{thi_abs:.1f}" if np.isfinite(thi_abs) else "—"}
+        if d is not None:
+            txt.update({
+                "d_hbo": f"{d.d_hbo:+.2f}", "d_hbr": f"{d.d_hbr:+.2f}",
+                "d_thb": f"{d.d_thb:+.2f}", "thi": f"{d.thi:.2f}",
+                "d_thi": f"{d.d_thi:+.2f}",
+                "d_toi": f"{d.d_toi:+.1f}（{d.d_toi_rel:+.1f}%）"})
+        if auc.ref_toi is not None:
+            txt["auc"] = f"{auc.value_min:.1f}（{_mmss(auc.seconds)}）"
+        for k, lab in self.cells.items():
+            lab.setText(txt.get(k, "—"))
+
+    def _refresh_wait(self) -> None:
+        """第一个窗口还没攒满 —— 在 TOI 图里画进度。
+
+        TOI 要攒满 N 个周期才出第一个点（N=20 时约 30 s）。**不出半成品**：
+        实测 n=1 的 TOI 与 n=20 差到 23 点（103952 读 42、真值 74），
+        非线性（μa ∝ μeff²）使单周期噪声有偏，不是散开。嫌慢就把「平均」调小。
+        """
+        n = min((len(d) for d in self.win.values()), default=0)
+        need = self._need
+        cps = self._fps / FRAMES_PER_CYCLE if self._fps > 0 else 0.0
+        eta = f"，还差 {(need - n) / cps:.0f} s" if cps > 0 else ""
+        self.p_toi.setXRange(0, max(need, 1), padding=0)
+        self.p_toi.setYRange(0, 100, padding=0)
+        self.txt_toi.setPos(need / 2.0, 50.0)
+        self.txt_toi.setHtml(
+            "<div style='text-align:center;font-size:11pt'>"
+            f"<b>攒第一个平均窗　{n} / {need} 周期{eta}</b><br>"
+            "<span style='font-size:9pt;color:#8b8a84'>"
+            "不出半成品：单周期的 TOI 可偏 20 点以上（μa ∝ μeff² 使噪声有偏）。"
+            "要更快就把上面的「平均」调小</span></div>")
+        self.txt_toi.setVisible(True)
+
+    def _refresh_bars(self) -> None:
+        """第二行工具栏的状态文字。只读 BaselineManager 的状态，不做判断。"""
+        st, b, auc = self.bl.state, self.bl.baseline, self.bl.auc
+        if st.phase == self.bl.COLLECTING:
+            how = "抓取" if st.collecting_mode == "captured" else "自动"
+            txt = f"采集中 {st.n_have}/{st.n_need}（{how}）"
+            if st.n_skipped:
+                txt += f"　已跳过 {st.n_skipped} 点：{st.last_skip[:16]}"
+            color = "#8a5a00"
+        else:
+            src = {"auto": "自动", "captured": "抓取", "manual": "手填"}.get(
+                b.source, b.source)
+            txt = f"已设 TOI {b.toi:.1f}（{src}，t={b.t:.0f}s）"
+            warn = (["⚠ 设定时信号在变"] if b.unstable else []) + \
+                   (["⚠ 低信号"] if b.low_signal else [])
+            if warn:
+                txt += "　" + " ".join(warn)
+            # 当时不稳、现在稳了 → 提示重抓。**不自动改基线**（见 BaselineManager）
+            if st.suggest_recapture:
+                txt += "　→ 信号已稳定，建议重抓"
+            color = "#c33" if warn else "#1a7f5a"
+        # 实时的信号稳定性 —— 判据是指示灯，这里就是那盏灯。
+        # 与基线上的标记分开：基线记的是「设定那一刻」，这里是「此刻」。
+        if st.phase == self.bl.SET or st.n_have:
+            if not st.gate_ready:
+                txt += f"　｜ 信号：攒满 {SETTLE_WIN_S:.0f}s 才能判"
+            elif st.gate_stable:
+                txt += "　｜ 信号：稳定"
+            else:
+                txt += (f"　｜ 信号：在变（{SETTLE_WIN_S:.0f}s 内光强 "
+                        f"{st.gate_metric:.1%}、TOI "
+                        + ("—" if not np.isfinite(st.gate_metric_toi)
+                           else f"{st.gate_metric_toi:.1f}") + " 点）")
+        self.lbl_bl.setText(txt)
+        self.lbl_bl.setStyleSheet(f"color:{color}")
+        # 手填要先有浓度基线
+        for w in (self.spn_bl_toi, self.btn_bl_apply):
+            w.setEnabled(b is not None)
+        if b is not None and b is not getattr(self, "_bl_shown", None) \
+                and not self.spn_bl_toi.hasFocus():
+            self.spn_bl_toi.setValue(b.toi)        # 基线换了 → 框里预填新值
+            self._bl_shown = b
+        thr = auc.threshold
+        self.lbl_auc.setText("警戒线：待基线" if thr is None else
+                             f"警戒线 {thr:.1f}%（参考 {auc.ref_toi:.1f}）")
+
     def _refresh_derived(self) -> None:
-        """刷新派生量那一格。三种状态：没基线 / 攒基线中 / 出数。"""
-        if self._bl_need > 0:
-            self.txt_rel.setVisible(True)
-            self.txt_rel.setPos(0.5, 0.0)
+        """刷新相对量与 AUC 曲线。没有基线时在图里说明在等什么。"""
+        b = self.bl.baseline
+        if b is None:
+            st = self.bl.state
+            head = f"正在采集基线　{st.n_have}/{st.n_need}"
+            tail = "保持探头不动"
+            (x0, x1), (y0, y1) = self.p_rel.viewRange()
+            self.txt_rel.setPos((x0 + x1) / 2, (y0 + y1) / 2)
             self.txt_rel.setHtml(
                 "<div style='text-align:center;font-size:11pt'>"
-                f"<b>正在校准基线　还需 {self._bl_need} 点"
-                f"（约 {self._bl_need/max(self._fps/FRAMES_PER_CYCLE,1e-6):.0f} s）</b>"
-                "</div>")
-            return
-        if self.baseline is None:
+                f"<b>{head}</b><br>"
+                f"<span style='font-size:9pt;color:#8b8a84'>{tail}</span></div>")
             self.txt_rel.setVisible(True)
-            self.txt_rel.setPos(0.5, 0.0)
-            self.txt_rel.setHtml(
-                "<div style='text-align:center;font-size:11pt'>"
-                "<b>尚未校准基线</b><br>"
-                "<span style='font-size:9pt;color:#8b8a84'>"
-                "相对量需要一个参考点 —— 点上方「校准基线」</span></div>")
-            return
-        self.txt_rel.setVisible(False)
+        else:
+            self.txt_rel.setVisible(False)
+        # 历史照画（重抓基线时旧段不删，中间用 NaN 断开）
         if self.td_hist:
             ts = np.fromiter(self.td_hist, float, len(self.td_hist))
             for k, c in self.c_rel.items():
-                c.setData(ts, np.fromiter(self.d_hist[k], float,
-                                          len(self.d_hist[k])))
-
-    def _refresh_mbll(self) -> None:
-        """刷新 MBLL 那一格。**整个函数包在 try 里** —— 这一格坏掉
-        不能把 TOI 的刷新一起拖死。出过一次异常就摘掉，并在界面上说明。
-        """
-        if self._mbll is None:
-            self.lbl_mbll.setText(
-                "MBLL　已停用：" + (self._mbll_err or _MBLL_ERR or "未知原因"))
-            self.lbl_mbll.setStyleSheet("color:#c33")
-            return
-        try:
-            need = self._mbll.need_s()
-            if need > 0:
-                # 还没到起步线：画进度，而不是留一张空图。
-                # x 轴固定成 0~MIN_RECORD_S，进度条就是「走到哪了」本身。
-                total = self._mbll.span_s + need
-                self.p_hb.setXRange(0, total, padding=0)
-                self.p_hb.setYRange(-1, 1, padding=0)
-                self.txt_hb.setPos(total / 2.0, 0.0)
-                self.txt_hb.setHtml(
-                    "<div style='text-align:center;font-size:11pt'>"
-                    f"<b>攒数据中　{self._mbll.span_s:.0f} / {total:.0f} s</b>"
-                    f"<br>还差 <b>{need:.0f}</b> 秒出第一条曲线<br>"
-                    "<span style='font-size:9pt;color:#8b8a84'>"
-                    "高通 0.01 Hz 的瞬态要 3 倍时间常数才衰减干净，"
-                    "不够就强滤出来的是滤波器瞬态，不是生理信号</span></div>")
-                self.txt_hb.setVisible(True)
-            else:
-                r = self._mbll.poll(time.perf_counter())
-                if r is not None and r.ok:
-                    if not self._hb_started:
-                        # 第一次出曲线：把占位文字撤掉，交还自动缩放
-                        self.txt_hb.setVisible(False)
-                        self.p_hb.enableAutoRange()
-                        self._hb_started = True
-                    # 换算到与 TOI 同一条时间轴（都是「连接以来的秒数」），
-                    # 两格的时间才对得上 —— 虽然 x 轴范围各看各的。
-                    off = self._mbll.t_offset - self._t0
-                    self.c_hbo.setData(r.t + off, r.d_hbo)
-                    self.c_hbr.setData(r.t + off, r.d_hbr)
-            self.lbl_mbll.setText("MBLL（相对量）　" + self._mbll.status())
-            self.lbl_mbll.setStyleSheet("color:#666")
-        except Exception as e:                               # noqa: BLE001
-            self._mbll = None
-            self._mbll_err = str(e)
+                y = np.fromiter(self.d_hist[k], float, len(self.d_hist[k]))
+                # ΔTHI 存的是比值（基线 = 1.00，MOC400 口径）。画图乘 100
+                # 换成百分比，才和同一格里的 ΔTOI 量级可比、共用一根 y 轴。
+                c.setData(ts, y * 100.0 if k == "d_thi" else y,
+                          connect="finite")
+        if self.ta_hist:
+            self.c_auc.setData(
+                np.fromiter(self.ta_hist, float, len(self.ta_hist)),
+                np.fromiter(self.auc_hist, float, len(self.auc_hist)),
+                connect="finite")
 
     def closeEvent(self, e) -> None:                             # noqa: N802
         if self.worker is not None:

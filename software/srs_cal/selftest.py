@@ -1043,10 +1043,8 @@ def t15_mbll_decoder() -> None:
 
 
 def t16_mbll_live() -> None:
-    """16 MBLL 实时接入：周期成组、与离线逐点相同、以及**不能拖垮 SRS**。"""
-    print("\n[16] MBLL 实时接入（L4 并排显示）")
-    import os
-
+    """16 MBLL 实时模块：周期成组、与离线逐点相同（online 已不挂载，见 t19）。"""
+    print("\n[16] MBLL 实时模块（离线可用；online 已不挂载）")
     from mbll_decoder import hardware as mh
     from mbll_decoder.decoder import decode
     from mbll_decoder.live import LiveMbll
@@ -1054,12 +1052,6 @@ def t16_mbll_live() -> None:
     FS = 0.657
     W0, W1 = (float(w) for w in mh.WAVELENGTHS_NM)
     RHO3 = mh.DISTANCE_CM
-
-    def npts(curve) -> int:
-        """曲线上有几个点。⚠️ 不能写 `len(arr or [])`：
-        非空 ndarray 参与 `or` 会抛「真值歧义」。"""
-        y = curve.getData()[1]
-        return 0 if y is None else len(y)
 
     def feed(live, n, t0=0.0, rho=RHO3, seed=0):
         """按「一个周期两个波长」的顺序喂，模拟扣暗器的吐数顺序。"""
@@ -1147,87 +1139,10 @@ def t16_mbll_live() -> None:
            len(lv6._t) == 0 and lv6.span_s == 0.0
            and lv6.stats.n_cycles == 0 and lv6.last is None)
 
-    # --- 真界面：两格同时出数，且 MBLL 坏掉不影响 SRS -----------------------
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PyQt5 import QtWidgets
-
-    from srs_cal.online import CAL_DIR, DEFAULT_CAL, Calibration, OnlineWindow
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    win = OnlineWindow(Calibration.load(CAL_DIR / DEFAULT_CAL))
-    win.chk_rec.setChecked(False)
-    _check("16 界面挂上了 MBLL 那一格",
-           win._mbll is not None and hasattr(win, "c_hbo")
-           and hasattr(win, "c_hbr"))
-    _check("16 MBLL 那一格不与 SRS 共用 x 轴",
-           win.p_hb.getViewBox().linkedView(0) is None,
-           "上面看实时窗，下面看整段，强行共用必有一边看不清")
-
-    # 造 150 个周期的帧喂进真正的 _on_frames。
-    # is_dark 是由 wavelength_nm == 0.0 推出来的属性，不是字段。
-    from srs_cal.protocol import Frame
-    fr = []
-    for cyc in range(150):
-        base = cyc * 1.5213
-        for rho in (3.0, 4.0):
-            fr.append(Frame(wavelength_nm=0.0, distance_cm=rho, adc=1000,
-                            channel=0, raw=b"", t_host=base, cycle_id=cyc))
-            for j, wlx in enumerate(hw.WAVELENGTHS_ACTIVE_NM):
-                fr.append(Frame(wavelength_nm=float(wlx), distance_cm=rho,
-                                adc=int(2e5 if rho == 3.0 else 6e4),
-                                channel=0, raw=b"",
-                                t_host=base + 0.1 * (j + 1), cycle_id=cyc))
-    win._on_frames(fr)
-    n_toi, n_cyc = len(win.toi_hist), win._mbll.stats.n_cycles
-    _check("16 同一批帧同时喂到两条链",
-           n_toi > 0 and n_cyc > 0, f"TOI {n_toi} 点，MBLL {n_cyc} 周期")
-
-    # --- 没到 300 s 时：图里要有倒计时，不能留一张空图 ----------------------
-    # 150 周期 × 1.5213 s ≈ 228 s，还没到起步线。
-    win._refresh()
-    _check("16 未到起步线时图里显示倒计时",
-           win._mbll.need_s() > 0 and win.txt_hb.isVisible()
-           and "还差" in win.txt_hb.toPlainText(),
-           win.txt_hb.toPlainText().replace("\n", " ")[:38])
-    _check("16 倒计时期间曲线为空", npts(win.c_hbo) == 0)
-
-    # --- 越过 300 s：倒计时撤掉，曲线填上 -----------------------------------
-    fr2 = []
-    for cyc in range(150, 230):
-        base = cyc * 1.5213
-        for rho in (3.0, 4.0):
-            fr2.append(Frame(wavelength_nm=0.0, distance_cm=rho, adc=1000,
-                             channel=0, raw=b"", t_host=base, cycle_id=cyc))
-            for j, wlx in enumerate(hw.WAVELENGTHS_ACTIVE_NM):
-                fr2.append(Frame(wavelength_nm=float(wlx), distance_cm=rho,
-                                 adc=int(2e5 if rho == 3.0 else 6e4),
-                                 channel=0, raw=b"",
-                                 t_host=base + 0.1 * (j + 1), cycle_id=cyc))
-    win._on_frames(fr2)
-    win._refresh()
-    _check("16 越过 300 s 后倒计时撤掉",
-           win._mbll.need_s() <= 0 and not win.txt_hb.isVisible(),
-           f"span={win._mbll.span_s:.0f}s")
-    _check("16 越过 300 s 后曲线填上",
-           npts(win.c_hbo) > 0 and npts(win.c_hbr) > 0,
-           f"{npts(win.c_hbo)} 点")
-    n_toi = len(win.toi_hist)
-
-    class _Boom:
-        def push(self, *a):
-            raise RuntimeError("故意炸")
-
-        def poll(self, *a, **k):
-            raise RuntimeError("故意炸")
-
-    win._mbll = _Boom()
-    win._on_frames(fr)
-    win._refresh()
-    _check("16 MBLL 抛异常后 SRS 仍在出点", len(win.toi_hist) > n_toi,
-           f"{n_toi} → {len(win.toi_hist)}")
-    _check("16 坏掉的 MBLL 被摘掉且界面明示",
-           win._mbll is None and "停用" in win.lbl_mbll.text(),
-           win.lbl_mbll.text()[:40])
-    win.close()
+    # 2026-10-26：online 已不挂载 MBLL（带通 0.01~0.05 Hz 看不见持续数分钟的
+    # 变化，见 docs/online优化计划.md 第九节）。原先「界面挂 MBLL / 倒计时 /
+    # 同一批帧喂两条链」这几项随之删除；LiveMbll 模块本身的检查保留在上面。
+    # 界面的检查移到 t19。
 
 
 def t17_derived_quantities() -> None:
@@ -1262,15 +1177,20 @@ def t17_derived_quantities() -> None:
            abs(d.d_hbo - 59.0) < 1e-9 and abs(d.d_hbr - 10.0) < 1e-9
            and abs(d.d_thb - 69.0) < 1e-9,
            f"{d.d_hbo:.1f} / {d.d_hbr:.1f} / {d.d_thb:.1f} µM")
-    _check("17 THI = 100×tHb/基线tHb",
-           abs(d.thi - 100.0 * 140.0 / 71.0) < 1e-9
-           and abs(d.d_thi - (d.thi - 100.0)) < 1e-12,
-           f"THI {d.thi:.2f}%")
-    _check("17 基线处 THI 恰为 100、其余全为 0",
-           (lambda z: abs(z.thi - 100) < 1e-9 and abs(z.d_hbo) < 1e-9
-            and abs(z.d_thb) < 1e-9 and abs(z.d_toi) < 1e-9)
+    # 2026-10-26：THI 改比值口径（基线 = 1.00），对齐 MOC400（其 THI 2.83 / ΔTHI 1.83）
+    _check("17 THI = tHb/基线tHb（基线 = 1.00，MOC400 口径）",
+           abs(d.thi - 140.0 / 71.0) < 1e-9
+           and abs(d.d_thi - (d.thi - 1.0)) < 1e-12,
+           f"THI {d.thi:.3f}　ΔTHI {d.d_thi:+.3f}")
+    _check("17 基线处 THI 恰为 1.00、其余全为 0",
+           (lambda z: abs(z.thi - 1.0) < 1e-12 and abs(z.d_thi) < 1e-12
+            and abs(z.d_hbo) < 1e-9 and abs(z.d_thb) < 1e-9
+            and abs(z.d_toi) < 1e-9)
            (derive(mk(61.0, 10.0, 85.0), bl)))
     _check("17 ΔTOI 是减法", abs(d.d_toi - (-5.0)) < 1e-9, f"{d.d_toi:.1f}")
+    _check("17 ΔTOI% = ΔTOI / 基线 TOI（BRS-100「差值比率」口径）",
+           abs(d.d_toi_rel - 100.0 * (-5.0) / 85.0) < 1e-9,
+           f"{d.d_toi_rel:.2f}%")
 
     # --- 「还没设基线」必须显式返回 None，不能画 NaN ------------------------
     _check("17 没有基线时返回 None（而不是 NaN）",
@@ -1284,22 +1204,427 @@ def t17_derived_quantities() -> None:
            and derive(mk(60.0, 10.0, np.nan), bl) is None)
 
     # --- AUC ---------------------------------------------------------------
+    # 2026-10-26 改语义：喂**绝对** TOI，警戒线 = 参考 × (1 − 0.20)。
+    # 旧语义（低于基线即累计）在体模上 10 分钟凭空攒 662~1013 %·s，见 t18。
     a = AucAccumulator()
+    a.reset(80.0)                           # 警戒线 64
     for i in range(11):
-        a.push(float(i), -2.0)              # 持续低于基线 2 个点，共 10 秒
-    _check("17 AUC = |ΔTOI| × 时长", abs(a.value - 20.0) < 1e-9,
-           f"{a.value:.1f} %O₂·s，低于基线 {a.seconds:.0f} s")
+        a.push(float(i), 60.0)              # 低于警戒线 4 个点，共 10 秒
+    _check("17 AUC = (警戒线 − TOI) × 时长", abs(a.value - 40.0) < 1e-9
+           and abs(a.seconds - 10.0) < 1e-9,
+           f"{a.value:.1f} %O₂·s，低于警戒线 {a.seconds:.0f} s")
     a2 = AucAccumulator()
+    a2.reset(80.0)
     for i in range(11):
-        a2.push(float(i), +3.0)             # 全部高于基线
-    _check("17 高于基线不累加（去饱和负荷不被抵消）", a2.value == 0.0)
+        a2.push(float(i), 70.0)             # 低于基线、但高于警戒线 64
+    _check("17 低于基线但高于警戒线不累加（警戒线本身就是死区）",
+           a2.value == 0.0)
     a3 = AucAccumulator()
-    a3.push(0.0, -2.0); a3.push(100.0, -2.0)   # 中间 100 秒空洞
+    a3.reset(80.0)
+    a3.push(0.0, 60.0); a3.push(100.0, 60.0)   # 中间 100 秒空洞
     _check("17 间隔超过上限时跳过，不把空洞算成持续去饱和",
            a3.value == 0.0, f"gap 100s > {AucAccumulator.MAX_GAP_S}s")
     a3.reset()
-    _check("17 reset 清零", a3.value == 0.0 and a3.seconds == 0.0
-           and a3._t_prev is None)
+    _check("17 reset 清零且清掉参考点", a3.value == 0.0 and a3.seconds == 0.0
+           and a3._t_prev is None and a3.ref_toi is None)
+
+
+def t18_baseline_manager() -> None:
+    """18 基线状态机：自动基线等稳定、抓取、手填 TOI、AUC 与 BL 解耦（2026-10-26）。"""
+    print("\n[18] 基线状态机 / 稳定判据 / AUC 解耦")
+    from fnirs_pipeline.srs import (AUC_REL_DROP, BASELINE_N, SETTLE_WIN_S,
+                                    AucAccumulator, BaselineManager,
+                                    SettleGate, SrsResult,
+                                    baseline_reject_reason, musp_power_law)
+
+    DT = 1.5213                             # 实测扫描周期
+
+    def mk(toi, hbo=60.0, hbr=10.0, flags=()):
+        return SrsResult(toi=toi, toi_raw=toi, mua=np.zeros(2),
+                         mueff=np.zeros(2), slope=np.zeros(2),
+                         residual=np.zeros(2), flags=list(flags),
+                         c_hbo=hbo * 1e-6, c_hbr=hbr * 1e-6)
+
+    def I_const(level=1.0):
+        # 四路：强的一路 1e6，弱的一路 2e3（模仿 770/3 与 670/4 的量级差）
+        return np.array([[3e5, 2e3], [1e6, 3e4]]) * level
+
+    # --- AUC：噪声不再凭空累积 ---------------------------------------------
+    rng = np.random.default_rng(0)
+    a = AucAccumulator()
+    a.reset(80.0)
+    for i in range(400):                    # 约 10 分钟，σ 取实测最差的 2.42
+        a.push(i * DT, 80.0 + rng.normal(0.0, 2.42))
+    _check("18 基线处只有噪声（σ 2.42）时 10 分钟 AUC 为 0",
+           a.value == 0.0, f"警戒线 {a.threshold:.1f}，旧语义下会攒约 1000 %·s")
+    _check("18 警戒线 = 参考 × (1 − AUC_REL_DROP)，value_min = value/60",
+           abs(a.threshold - 80.0 * (1 - AUC_REL_DROP)) < 1e-9
+           and AucAccumulator().threshold is None)
+
+    # --- 进基线的筛选：用 compute_toi 真产出的 flag，措辞改了这里会报 --------
+    wl2 = hw.WAVELENGTHS_ACTIVE_NM
+    geom = hw.geometry(wavelengths_nm=wl2)
+
+    def intensities_for(c_hbo, c_hbr):
+        """反推能产出给定浓度的光强（I3 固定，I4 由目标斜率定）。同 t12。"""
+        E = hemoglobin_extinctions([float(w) for w in wl2], hw.EXTINCTION_TABLE)
+        mua = LN10 * (E @ np.array([c_hbo, c_hbr]))
+        musp = musp_power_law(np.asarray(wl2, float), hw.MUSP_REF_800,
+                              hw.MUSP_EXPONENT)
+        mueff = np.sqrt(3.0 * mua * musp)
+        slope = (mueff + 2.0 / float(np.mean(hw.RHO_CM))) / LN10
+        I3 = np.full(len(wl2), 1e6)
+        return np.column_stack([I3, I3 / 10.0 ** slope])
+
+    I_ok = intensities_for(42e-6, 18e-6)
+    r_ok = compute_toi(I_ok, geom)
+    r_neg = compute_toi(intensities_for(60e-6, -8e-6), geom)
+    r_low_thb = compute_toi(intensities_for(3.5e-6, 1.5e-6), geom)
+    # 整体缩放到最远探测器只剩 MIN_COUNTS 的 75%：斜率不变 → TOI 不变，
+    # 只多一条「计数不足」
+    r_dim = compute_toi(I_ok * (0.75 * MIN_COUNTS / I_ok[:, -1].min()), geom)
+    _check("18 正常点可进基线", baseline_reject_reason(r_ok) == "")
+    _check("18 浓度为负 / TOI 越界的点被挡",
+           baseline_reject_reason(r_neg) != "", baseline_reject_reason(r_neg)[:30])
+    _check("18 tHb 越界**不挡**（体模上恒触发，挡了永远设不上基线）",
+           any("tHb" in f for f in r_low_thb.flags)
+           and baseline_reject_reason(r_low_thb) == "")
+    _check("18 计数不足**不挡**（前额可能一直如此），但会被识别",
+           any("计数不足" in f for f in r_dim.flags)
+           and baseline_reject_reason(r_dim) == ""
+           and abs(r_dim.toi - r_ok.toi) < 1e-6,
+           f"TOI {r_dim.toi:.2f} vs {r_ok.toi:.2f}")
+
+    # --- 稳定判据 ------------------------------------------------------------
+    g = SettleGate()
+    t = 0.0
+    while t < SETTLE_WIN_S - DT:
+        g.push(t, I_const()); t += DT
+    _check("18 不满 60 s 时判据未就绪（不放行）", not g.ready and not g.stable)
+    for _ in range(5):
+        g.push(t, I_const()); t += DT
+    _check("18 恒定光强满 60 s 后放行", g.stable, f"metric {g.metric:.4f}")
+    g2 = SettleGate()
+    for i in range(80):                     # 强的一路每分钟涨 10%
+        g2.push(i * DT, I_const(1.0 + 0.10 * i * DT / 60.0))
+    _check("18 每分钟变 10% 判为不稳", g2.ready and not g2.stable
+           and abs(g2.metric - 0.10) < 0.02, f"metric {g2.metric:.3f}")
+    g3 = SettleGate()
+    for i in range(80):                     # 弱的一路 ±20% 乱跳，强的一路不动
+        I = I_const(); I[0, 1] *= 1.0 + 0.2 * rng.standard_normal()
+        g3.push(i * DT, I)
+    _check("18 只看最强一路：弱通道自身噪声不阻止放行", g3.stable,
+           f"metric {g3.metric:.4f}")
+    # 光强平、TOI 在爬：103952 的实际情形（TOI 60 s 内爬 10~20 点，光强判据已放行）
+    g4, g5 = SettleGate(), SettleGate()
+    for i in range(80):
+        g4.push(i * DT, I_const(), 60.0 + 15.0 * i * DT / 60.0)
+        g5.push(i * DT, I_const(), 80.0 + 0.5 * np.sin(i))
+    _check("18 光强平但 TOI 每分钟爬 15 点 → 不稳（光强稳 ≠ TOI 稳）",
+           g4.metric < 0.02 and not g4.stable,
+           f"光强 {g4.metric:.3f}，TOI {g4.metric_toi:.1f} 点/60s")
+    _check("18 光强平且 TOI 只在 ±0.5 内抖 → 稳", g5.stable,
+           f"TOI {g5.metric_toi:.2f} 点/60s")
+
+    # --- 状态机：自动基线 ----------------------------------------------------
+    # 2026-10-26 第二轮：判据是指示灯不是闸门 —— 攒够 N 点就设，不等稳定。
+    m = BaselineManager()
+    t = 0.0
+    while m.phase != m.SET and t < 200:
+        m.push(t, mk(80.0), I_const()); t += DT
+    bl = m.baseline
+    _check("18 攒够 N 点立刻设基线，不等稳定判据（N 点 ≈ 30 s）",
+           bl is not None and bl.source == "auto" and bl.n == BASELINE_N
+           and abs(bl.toi - 80.0) < 1e-9 and t < SETTLE_WIN_S,
+           f"t={t:.0f}s < 判据窗 {SETTLE_WIN_S:.0f}s")
+    _check("18 判据窗还没攒满 → **不**标 unstable（没判过 ≠ 不稳，否则恒亮）",
+           not bl.unstable and not m.gate.ready and not m.state.gate_ready)
+    # 继续喂稳定信号：判据窗攒满并通过 → 实时状态转「稳定」，基线一动不动
+    bl_before = m.baseline
+    while not m.gate.stable and t < 300:
+        m.push(t, mk(80.0), I_const()); t += DT
+    _check("18 判据是实时指示灯：信号转稳后 state 跟着变，基线不动",
+           m.state.gate_ready and m.state.gate_stable
+           and m.baseline is bl_before and not m.state.suggest_recapture,
+           f"t={t:.0f}s")
+    _check("18 首次设基线时 AUC 继承其 TOI 为参考点",
+           m.auc.ref_toi is not None and abs(m.auc.ref_toi - 80.0) < 1e-9)
+
+    # --- 抓取：BL 立即作废，AUC 不断档 ---------------------------------------
+    for _ in range(5):                      # 先去饱和到 50（警戒线 64 以下）
+        m.push(t, mk(50.0), I_const()); t += DT
+    v0 = m.auc.value
+    m.capture()
+    _check("18 抓取：旧基线立即作废，进入采集（captured）",
+           m.baseline is None and m.phase == m.COLLECTING
+           and m.state.collecting_mode == "captured")
+    for _ in range(3):
+        m.push(t, mk(50.0), I_const()); t += DT
+    _check("18 重抓 BL 期间 AUC 照常累计（与 BL 解耦）",
+           m.auc.value > v0 and m.auc.value > 0, f"{v0:.0f} → {m.auc.value:.0f}")
+    while m.phase != m.SET:
+        m.push(t, mk(70.0), I_const()); t += DT
+    _check("18 抓取完成后 AUC 参考点不变（不随 BL 改）",
+           abs(m.auc.ref_toi - 80.0) < 1e-9 and m.baseline.source == "captured")
+
+    # --- 手填 TOI ------------------------------------------------------------
+    hbo_before = m.baseline.hbo
+    ok = m.set_manual_toi(65.0)
+    _check("18 手填只改 TOI，浓度基线不动，source=manual",
+           ok and abs(m.baseline.toi - 65.0) < 1e-9
+           and m.baseline.hbo == hbo_before and m.baseline.source == "manual")
+    _check("18 手填不动 AUC 参考点", abs(m.auc.ref_toi - 80.0) < 1e-9)
+    _check("18 手填非法值被拒", not m.set_manual_toi(float("nan"))
+           and not m.set_manual_toi(0.0) and not m.set_manual_toi(120.0))
+    m2 = BaselineManager()
+    _check("18 还没有浓度基线时手填被拒", not m2.set_manual_toi(70.0))
+
+    # --- AUC 复位：参考点取当前 BL，BL 不动 ----------------------------------
+    m.reset_auc()
+    _check("18 AUC复位：清零，参考点 = 当前 BL 的 TOI，BL 不动",
+           m.auc.value == 0.0 and abs(m.auc.ref_toi - 65.0) < 1e-9
+           and abs(m.baseline.toi - 65.0) < 1e-9)
+
+    # --- 带 flag 的点：挡 / 收但标低信号 -------------------------------------
+    m3 = BaselineManager()
+    m3.capture()
+    t = 0.0
+    for i in range(BASELINE_N + 5):
+        fl = ["TOI_raw 120.0% 越界（物理上限 0~100）"] if i < 5 else ["最远探测器计数不足"]
+        m3.push(t, mk(80.0, flags=fl), I_const()); t += DT
+    _check("18 物理越界的点被跳过并计数，低信号点收下并标 low_signal",
+           m3.phase == m3.SET and m3.baseline.low_signal
+           and m3.baseline.n == BASELINE_N and m3.state.n_skipped == 5,
+           f"跳过 {m3.state.n_skipped}（{m3.state.last_skip[:12]}…），"
+           f"基线 n={m3.baseline.n if m3.baseline else '—'}")
+
+    # --- 信号一直不稳：照样设上，不再阻塞 ------------------------------------
+    m4 = BaselineManager()
+    t = 0.0
+    while m4.phase != m4.SET and t < 300:
+        m4.push(t, mk(80.0), I_const(1.0 + 0.10 * t / 60.0)); t += DT
+    _check("18 信号一直不稳也照设上（不再阻塞），~30 s 就有基线",
+           m4.baseline is not None and t < 60.0, f"t={t:.0f}s")
+
+    # --- 判据已能判且判为不稳时重抓 → 这次才标 unstable ----------------------
+    while not m4.gate.ready:                # 先把判据窗喂满（仍在变）
+        m4.push(t, mk(80.0), I_const(1.0 + 0.10 * t / 60.0)); t += DT
+    m4.capture()
+    while m4.phase != m4.SET:
+        m4.push(t, mk(80.0), I_const(1.0 + 0.10 * t / 60.0)); t += DT
+    _check("18 判过且判为不稳时设的基线 → 标 unstable",
+           m4.baseline.unstable and m4.gate.ready and not m4.gate.stable,
+           f"t={t:.0f}s，光强判据 {m4.gate.metric:.3f}")
+    _check("18 仍然不稳时不建议重抓（重抓也白搭）",
+           not m4.state.suggest_recapture)
+    bl4 = m4.baseline
+    while not m4.gate.stable and t < 1000:  # 信号稳下来（光强不再变）
+        m4.push(t, mk(80.0), I_const(1.10)); t += DT
+    _check("18 不稳的基线 + 信号已稳 → 建议重抓，但基线仍不自动改",
+           m4.state.suggest_recapture and m4.baseline is bl4, f"t={t:.0f}s")
+
+    m.reset()
+    _check("18 reset：基线、AUC、参考点全部清掉",
+           m.baseline is None and m.phase == m.COLLECTING
+           and m.auc.value == 0.0 and m.auc.ref_toi is None)
+
+
+def t19_online_ui() -> None:
+    """19 online 界面（2026-10-26 改版）：真窗口、真 _on_frames，离屏运行。"""
+    print("\n[19] online 界面：自动基线 / 抓取 / 手填 / AUC 复位 / 事件 / 时间窗")
+    import os
+    import shutil
+    import tempfile
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+
+    from srs_cal.online import (CAL_DIR, DEFAULT_CAL, SPAN_CHOICES,
+                                Calibration, OnlineWindow)
+    from srs_cal.protocol import Frame
+
+    def npts(curve) -> int:
+        """曲线上有几个**有限**点。⚠️ 不能写 `len(arr or [])`：
+        非空 ndarray 参与 `or` 会抛「真值歧义」。"""
+        y = curve.getData()[1]
+        return 0 if y is None else int(np.isfinite(y).sum())
+
+    # 净光强取 150943（手臂）的实测中位数，v5 标定下 TOI 约 88，不触发物理越界
+    NET = {(670.0, 3.0): 113641, (670.0, 4.0): 18108,
+           (770.0, 3.0): 343269, (770.0, 4.0): 56690}
+    DARK, DT = 1000, 1.5213
+
+    def frames(c0, n, scale=1.0):
+        out = []
+        for cyc in range(c0, c0 + n):
+            base = cyc * DT
+            for rho in (3.0, 4.0):
+                out.append(Frame(wavelength_nm=0.0, distance_cm=rho, adc=DARK,
+                                 channel=0, raw=b"", t_host=base, cycle_id=cyc))
+                for j, wlx in enumerate(hw.WAVELENGTHS_ACTIVE_NM):
+                    out.append(Frame(
+                        wavelength_nm=float(wlx), distance_cm=rho,
+                        adc=int(NET[(float(wlx), rho)] * scale) + DARK,
+                        channel=0, raw=b"", t_host=base + 0.1 * (j + 1),
+                        cycle_id=cyc))
+        return out
+
+    tmp = Path(tempfile.mkdtemp(prefix="online_t19_"))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    win = OnlineWindow(Calibration.load(CAL_DIR / DEFAULT_CAL), archive_dir=tmp)
+    try:
+        _check("19 MBLL 已不挂载；主页 / 调试两页",
+               not hasattr(win, "_mbll") and win.tabs.count() == 2
+               and [win.tabs.tabText(i) for i in range(2)] == ["主页", "调试"])
+
+        # --- 第一个窗口攒满前：画进度，不出半成品 -----------------------------
+        win._start_record()                 # 事件要写到归档旁，先开归档
+        win._on_frames(frames(0, 3))
+        win._refresh()
+        _check("19 窗口没攒满时不出 TOI 点，图里画进度（不出半成品）",
+               len(win.toi_hist) == 0 and win.txt_toi.isVisible()
+               and "攒第一个平均窗" in win.txt_toi.toPlainText(),
+               win.txt_toi.toPlainText().replace("\n", " ")[:34])
+
+        # --- 自动基线：恒定信号 150 周期（≈228 s）---------------------------
+        win._on_frames(frames(3, 147))
+        win._refresh()
+        b = win.bl.baseline
+        _check("19 攒满后进度撤掉，曲线接管", not win.txt_toi.isVisible()
+               and len(win.toi_hist) > 0)
+        _check("19 THI 指数有曲线，且不依赖基线（与 TOI 同时出，早于相对量）",
+               npts(win.c_thi) > 0
+               and len(win.thi_hist) == len(win.toi_hist)
+               and win.t_hist[0] < b.t,
+               f"{npts(win.c_thi)} 点，首点 t={win.t_hist[0]:.0f}s，"
+               f"基线 t={b.t:.0f}s，tHb {win.thi_hist[-1]:.1f} µM")
+        _check("19 THI 指数与 THI 比值各占一格，标题自带限定词（不再挤一行）",
+               win.cells["thi_abs"].text() not in ("—", "")
+               and win.cells["thi"].text() not in ("—", "")
+               and [t for k, t, _ in win.CELLS if k == "thi_abs"] == ["THI 指数 (µM)"]
+               and [t for k, t, _ in win.CELLS if k == "thi"] == ["THI 比值"],
+               f"指数 {win.cells['thi_abs'].text()}　"
+               f"比值 {win.cells['thi'].text()}")
+        _check("19 TOI 出点，时间轴是数据时刻（从 0 起）",
+               len(win.toi_hist) > 0 and win.t_hist[0] >= 0.0
+               and win.t_hist[-1] > 150.0,
+               f"{len(win.toi_hist)} 点，t {win.t_hist[0]:.0f}~{win.t_hist[-1]:.0f}s，"
+               f"TOI {win.toi_hist[-1]:.1f}")
+        _check("19 攒够点就自动设基线，不等稳定判据",
+               b is not None and b.source == "auto"
+               and "已设" in win.lbl_bl.text() and b.t < 70.0,
+               f"t={b.t:.0f}s｜{win.lbl_bl.text()[:40]}")
+        _check("19 基线由 N 个 TOI 点组成，设定时刻 = 第 N 个点的时刻",
+               b.n == win._need and abs(b.t - win.t_hist[win._need - 1]) < 1e-6,
+               f"n={b.n}，t={b.t:.1f}s = 第 {win._need} 个 TOI 点")
+        _check("19 基线虚线与 AUC 警戒线画在 TOI 图上",
+               npts(win.c_bl_line) == 2 and npts(win.c_auc_line) == 2)
+        _check("19 ΔHbO/ΔHbR/ΔtHb/ΔTHI/ΔTOI/AUC 六条曲线都有点",
+               all(npts(c) > 0 for c in win.c_rel.values())
+               and npts(win.c_auc) > 0,
+               "、".join(f"{k}:{npts(c)}" for k, c in win.c_rel.items()))
+        _check("19 八个量各占一格，ΔTOI 同时给点数与 %",
+               all(win.cells[k].text() not in ("—", "")
+                   for k, _, _ in win.CELLS)
+               and "%）" in win.cells["d_toi"].text(),
+               "　".join(f"{t}={win.cells[k].text()}"
+                         for k, t, _ in win.CELLS)[:78])
+
+        # --- 手填 TOI -------------------------------------------------------
+        hbo0, ref0 = b.hbo, win.bl.auc.ref_toi
+        win.spn_bl_toi.setValue(70.0)
+        win.btn_bl_apply.click()
+        b2 = win.bl.baseline
+        _check("19 手填只改 TOI 基线，AUC 参考点不动",
+               b2.toi == 70.0 and b2.source == "manual" and b2.hbo == hbo0
+               and win.bl.auc.ref_toi == ref0)
+
+        # --- 抓取：立即作废 → 采集 → 设上；曲线在切换处断开 ----------------
+        n_before = len(win.td_hist)
+        win.btn_capture.click()
+        win._refresh()
+        _check("19 抓取：旧基线立即作废，状态行显示采集中",
+               win.bl.baseline is None and "采集中" in win.lbl_bl.text())
+        win._on_frames(frames(150, 30))
+        win._refresh()
+        d_toi = np.fromiter(win.d_hist["d_toi"], float)
+        _check("19 抓取完成（source=captured），新旧两段之间用 NaN 断开",
+               win.bl.baseline is not None
+               and win.bl.baseline.source == "captured"
+               and len(win.td_hist) > n_before
+               and np.isnan(d_toi[n_before]),
+               f"断点在第 {n_before} 点")
+
+        # --- AUC 复位 -------------------------------------------------------
+        win.btn_auc_reset.click()
+        _check("19 AUC复位：清零，参考点 = 当前基线 TOI",
+               win.bl.auc.value == 0.0
+               and win.bl.auc.ref_toi == win.bl.baseline.toi)
+
+        # --- 事件标记：竖线 + 写进归档旁的 .events.csv ----------------------
+        win.txt_event.setText("袖带充气")
+        win.btn_mark.click()
+        ev = sorted(tmp.glob("*.events.csv"))
+        body = ev[0].read_text(encoding="utf-8-sig") if ev else ""
+        _check("19 事件标记：五格都画竖线 + 写入 <归档名>.events.csv",
+               len(win.events) == 1 and len(win._event_lines[0]) == 5
+               and len(ev) == 1 and "袖带充气" in body
+               and body.startswith("wall_time,t_host,t_rel_s,label"),
+               ev[0].name if ev else "未写出")
+
+        # --- 时间窗 ----------------------------------------------------------
+        names = [n for n, _ in SPAN_CHOICES]
+        win.cmb_span.setCurrentIndex(names.index("全程"))
+        win._refresh()
+        x0, x1 = win.p_toi.viewRange()[0]
+        _check("19 时间窗「全程」覆盖整段数据",
+               x0 <= win.t_hist[0] + 1.0 and x1 >= win.t_hist[-1] - 1.0,
+               f"view {x0:.0f}~{x1:.0f}s，数据 {win.t_hist[0]:.0f}~{win.t_hist[-1]:.0f}s")
+        win.cmb_span.setCurrentIndex(names.index("1 分钟"))
+        win._refresh()
+        x0, x1 = win.p_toi.viewRange()[0]
+        _check("19 时间窗「1 分钟」只看最近 60 s，右端钉在最新点",
+               abs((x1 - x0) - 60.0) < 8.0 and abs(x1 - win.t_hist[-1]) < 8.0,
+               f"view {x0:.0f}~{x1:.0f}s（跨度 {x1-x0:.0f}）")
+        # 记录比窗口短时不留空白，否则曲线被挤到左边一小块
+        win.cmb_span.setCurrentIndex(names.index("1 小时"))
+        win._refresh()
+        x0, x1 = win.p_toi.viewRange()[0]
+        _check("19 记录比时间窗短时显示全部，不往后留空白",
+               x1 - win.t_hist[-1] < 30.0,
+               f"view 右端 {x1:.0f}s，数据末 {win.t_hist[-1]:.0f}s")
+
+        # --- 派生量这一格出错不能拖垮 TOI ----------------------------------
+        def _boom(*a, **k):
+            raise RuntimeError("故意炸")
+        win.bl.push = _boom
+        n_toi = len(win.toi_hist)
+        win._on_frames(frames(180, 10))
+        win._refresh()
+        _check("19 派生量出错时 TOI 照常出点，且界面明示",
+               len(win.toi_hist) > n_toi and "派生量出错" in win.lbl_sub.text(),
+               f"{n_toi} → {len(win.toi_hist)}")
+        del win.bl.push                      # 还原成类上的方法
+
+        # --- 清屏 -----------------------------------------------------------
+        win._reset()
+        _check("19 清屏：基线、AUC、事件线、THI 与相对量历史全清，重新开始采集",
+               win.bl.baseline is None and win.bl.phase == win.bl.COLLECTING
+               and not win.events and not win._event_lines
+               and len(win.td_hist) == 0 and len(win.auc_hist) == 0
+               and len(win.thi_hist) == 0)
+        win._refresh()
+        _check("19 清屏后读数也清掉、进度条回来（不能停在旧值装作还在测）",
+               win.lbl_toi.text() == "—"
+               and all(l.text() == "—" for l in win.cells.values())
+               and win.txt_toi.isVisible(),
+               f"大数 {win.lbl_toi.text()}　"
+               f"格子 {win.cells['thi_abs'].text()}　"
+               f"进度 {win.txt_toi.isVisible()}")
+    finally:
+        win._stop_record()
+        win.close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main() -> int:
@@ -1314,7 +1639,8 @@ def main() -> int:
                t11_robust_aggregate, t12_hb_and_physics,
                t13_quality_layer, t14_dark_subtraction,
                t15_mbll_decoder, t16_mbll_live,
-               t17_derived_quantities):
+               t17_derived_quantities, t18_baseline_manager,
+               t19_online_ui):
         fn()
     n_ok = sum(1 for _, ok in _RESULTS if ok)
     print("\n" + "=" * 72)
