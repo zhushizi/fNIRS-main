@@ -75,7 +75,8 @@ from fnirs_pipeline.srs import (AUC_REL_DROP, BASELINE_N,  # noqa: E402
 from srs_cal.darksub import DarkSubtractor               # noqa: E402
 from srs_cal.quality import QualityMonitor, summarize    # noqa: E402
 from srs_cal.protocol import (BRIGHTNESS_DEFAULT, BRIGHTNESS_MAX,  # noqa: E402
-                              BRIGHTNESS_MIN, build_brightness)
+                              BRIGHTNESS_MIN, CHANNEL_MAX, CHANNEL_MIN,
+                              build_brightness)
 
 # DEFAULT_PORT / DEFAULT_GEAR 定义在 acquire.py，这里只 import（见上方 import 行）。
 # 两个程序共用一份，避免各改各的、悄悄跑偏。命令行 --port / --gear 可临时覆盖。
@@ -252,6 +253,13 @@ class OnlineWindow(QtWidgets.QWidget):
         self._no_dark = 0
         self._fresh: set = set()
         self._since = 0
+        # 通道校验：**以回传为准**。下发了 byte6 不等于设备真的切了 ——
+        # 2026-10-28 实测：下发通道 2，292 帧回来 byte10 全是 01，
+        # 且十路读数与通道 1 相差都在 ±1% 内（就是两次采集的正常起伏）。
+        # 所以不能拿「我发过」当「它切了」，只认数据帧自己标的通道号。
+        self._n_chan_ok = 0
+        self._n_chan_bad = 0
+        self._chan_seen: set = set()
         self._starved: list[str] = []
         self._frames = 0
         self._last_frames = 0
@@ -339,6 +347,26 @@ class OnlineWindow(QtWidgets.QWidget):
         self._bright_timer.setInterval(BRIGHTNESS_SETTLE_MS)
         self._bright_timer.timeout.connect(self._send_brightness)
         self.spn_bright.valueChanged.connect(self._bright_timer.start)
+        # 采集通道。与档位共用同一条指令帧（byte5 档位、byte6 通道），
+        # 所以改通道也走 _send_brightness。
+        self.cmb_chan = QtWidgets.QComboBox()
+        for c in range(CHANNEL_MIN, CHANNEL_MAX + 1):
+            self.cmb_chan.addItem(f"通道 {c}", c)
+        self.cmb_chan.setToolTip("\n".join((
+            f"采集通道 {CHANNEL_MIN}~{CHANNEL_MAX}。改动立即下发"
+            "（指令帧 byte6，与光源档位同一帧）。",
+            "",
+            "⚠️ **byte6 是通道号这件事没有厂家文档**，是按字节位置推的。",
+            "⚠️ 到 2026-10-28 为止，全部 46,572 帧归档里数据帧的 byte10",
+            "   （回传的通道号）**恒为 0x01**，从没出现过别的值。",
+            "   也就是说「切换生效了没有」目前**无法从回传数据上证实**。",
+            "   换通道后若读数毫无变化，先怀疑这条，别先怀疑探头。",
+            "",
+            "⚠️ 换通道 = 换探头 = 换光学套件，**G(λ) 标定不跨套件转移**。",
+            "   每个通道都要各标一份，否则绝对值无意义。")))
+        self.cmb_chan.currentIndexChanged.connect(self._on_channel)
+        self.lbl_chan = QtWidgets.QLabel("")
+        self.lbl_chan.setStyleSheet("color:#8a5a00")
         self.lbl_avg = QtWidgets.QLabel()
         self.btn_reset = QtWidgets.QPushButton("清屏")
         self.btn_reset.setToolTip("清掉曲线、基线与 AUC，自动基线重新开始等稳定。")
@@ -347,6 +375,7 @@ class OnlineWindow(QtWidgets.QWidget):
                   QtWidgets.QLabel("波特率"), self.cmb_baud,
                   self.btn_refresh, self.btn_conn,
                   QtWidgets.QLabel("  光源"), self.spn_bright,
+                  QtWidgets.QLabel("  通道"), self.cmb_chan, self.lbl_chan,
                   QtWidgets.QLabel("  平均"), self.spn_avg, self.lbl_avg,
                   self.btn_reset):
             bar.addWidget(w)
@@ -700,30 +729,64 @@ class OnlineWindow(QtWidgets.QWidget):
         self.spn_bright.setValue(getattr(self, "auto_gear", DEFAULT_GEAR))
         self._bright_timer.start()
 
-    def _send_brightness(self) -> None:
-        """下发档位。在线没有「一次采集」的概念，随时可改。
+    def _on_channel(self) -> None:
+        """换通道 = 换探头。立即下发，并把界面状态全部作废。"""
+        self._bright_timer.stop()       # 不等防抖，换探头要立刻生效
+        self._send_brightness()
 
-        但 G(λ) 是在某个档位下标的 —— 换档位后 TOI 是否还成立取决于
-        五路 LED 是否等比例变化（未验证）。所以要在界面上留痕。
+    def channel(self) -> int:
+        return int(self.cmb_chan.currentData())
+
+    def _send_brightness(self) -> None:
+        """下发档位与通道（同一帧：byte5 档位、byte6 通道）。
+
+        在线没有「一次采集」的概念，随时可改。但 G(λ) 是在某个档位、某个探头
+        下标的 —— 换档位后 TOI 是否还成立取决于五路 LED 是否等比例变化
+        （未验证）；换通道则直接换了光学套件，**标定一定不再成立**。
+        所以两者都要清屏、都要轮转归档、都要在界面上留痕。
         """
         if self.worker is None:
             return
-        g = self.spn_bright.value()
+        g, ch = self.spn_bright.value(), self.channel()
         prev = getattr(self, "_gear_sent", None)
-        self.worker.send(build_brightness(g))
-        self._gear_sent = g
-        self._reset()               # 换了光源，之前的曲线不是同一条件，清掉
-        # 归档同理：换档位就开新文件，让每个归档文件的头里恰好**一个**档位。
-        # 否则文件头记的是开始归档那一刻的档位，中途改了就对不上 ——
-        # 而原始帧里**不含档位**（档位只在出站的指令帧里），事后无从还原。
+        prev_ch = getattr(self, "_chan_sent", None)
+        self.worker.send(build_brightness(g, ch))
+        self._gear_sent, self._chan_sent = g, ch
+        self._reset()               # 换了光源/探头，之前的曲线不是同一条件，清掉
+        # 归档同理：换档位或换通道就开新文件，让每个归档文件的头里恰好
+        # **一个**档位、**一个**通道。否则文件头记的是开始归档那一刻的值，
+        # 中途改了就对不上 —— 而原始帧里**不含档位**（档位只在出站的指令帧里），
+        # 通道虽有 byte10 但实测恒为 0x01，两者事后都无从还原。
         #
-        # ⚠️ 只在档位**真的变了**时轮转。`_send_brightness` 会被防抖定时器
+        # ⚠️ 只在**真的变了**时轮转。`_send_brightness` 会被防抖定时器
         #    重复触发（同一档位也会再发一次），不加这个守卫会产生文件碎片。
-        if self.archive is not None and prev != g:
+        if self.archive is not None and (prev != g or prev_ch != ch):
             self._stop_record()
             self._start_record()
-        # 质量层的会话基线也不能跨档位沿用 —— 换了档位比值会整体平移。
+        # 质量层的会话基线也不能跨档位/跨通道沿用。
         self.quality.reset()
+        self._refresh_chan_label()
+
+    def _refresh_chan_label(self) -> None:
+        """通道状态。先报「收没收到」，再报标定是否适用 —— 前者更要紧。"""
+        ch = self.channel()
+        if self._n_chan_bad and not self._n_chan_ok:
+            seen = "、".join(str(c) for c in sorted(self._chan_seen))
+            self.lbl_chan.setText(
+                f"✗ 通道 {ch} 无数据：收到 {self._n_chan_bad} 帧，"
+                f"但都标着通道 {seen} —— 设备未切换")
+            self.lbl_chan.setStyleSheet("color:#c33;font-weight:bold")
+            return
+        if self._n_chan_bad:
+            self.lbl_chan.setText(f"⚠ 混入 {self._n_chan_bad} 帧非本通道，已丢弃")
+            self.lbl_chan.setStyleSheet("color:#c33")
+            return
+        # 标定是按某一路探头标的，换通道后 G(λ) 不再成立 —— 必须显形。
+        self.lbl_chan.setText(
+            "" if ch == CHANNEL_MIN
+            else f"⚠ 通道 {ch}：标定 {self.cal.doc.get('version', '?')} "
+                 f"是按通道 {CHANNEL_MIN} 标的，绝对值不可信")
+        self.lbl_chan.setStyleSheet("color:#8a5a00")
 
     # ------------------------------------------------------------------
     # 原始归档（架构文档 R9）
@@ -744,6 +807,9 @@ class OnlineWindow(QtWidgets.QWidget):
                 #    连上就立刻归档时它还没有，直接取会抛 AttributeError，
                 #    被下面的 except 吞掉 → 归档静默不启动。
                 "gear": getattr(self, "_gear_sent", None),
+                # 通道同理。原始帧的 byte10 实测恒为 0x01，**回传不可信**，
+                # 所以归档里记的是我们**下发**的那个通道号。
+                "channel_sent": getattr(self, "_chan_sent", None),
                 "cal": self.cal.doc.get("version", "none"),
                 "wavelengths_active_nm": [float(w) for w in WL],
                 "rho_cm": [float(r) for r in RHO],
@@ -849,6 +915,9 @@ class OnlineWindow(QtWidgets.QWidget):
         self._fresh.clear()
         self._since = 0
         self._starved = []
+        self._n_chan_ok = 0
+        self._n_chan_bad = 0
+        self._chan_seen.clear()
 
     # -- 反演 --------------------------------------------------------------
 
@@ -919,8 +988,18 @@ class OnlineWindow(QtWidgets.QWidget):
         if need != self._need:
             self._resize(need)
         nk = len(self._keys)
+        want = self.channel()
         for f in frames:
             self._frames += 1
+            # ⚠️ **通道以回传为准**：帧自己标的 byte10 不等于选中的通道，
+            #    这一帧就不属于当前通道，直接不要 —— 「没有就是没有」，
+            #    不能把别的通道（或根本没切换）的数据当成选中通道的来显示。
+            #    归档在上面已经写过了，原始数据一帧不丢。
+            self._chan_seen.add(f.channel)
+            if f.channel != want:
+                self._n_chan_bad += 1
+                continue
+            self._n_chan_ok += 1
             # 暗时隙排在每个周期最前：记下本周期的暗，后面的信号帧当场扣。
             # 这比标定文件里的静态暗电平强得多 —— 暗电平的漂移时间常数
             # 只有几个周期，静态值几秒钟就过期了。
@@ -1085,6 +1164,7 @@ class OnlineWindow(QtWidgets.QWidget):
         # 基线 / AUC 状态放在早退之前：开头 SRS 还没出点时，
         # 这一行正该说清「在等什么」。
         self._refresh_bars()
+        self._refresh_chan_label()
         if not hasattr(self, "last_res"):
             self._refresh_wait()
             return
@@ -1177,11 +1257,22 @@ class OnlineWindow(QtWidgets.QWidget):
         """
         n = min((len(d) for d in self.win.values()), default=0)
         need = self._need
-        cps = self._fps / FRAMES_PER_CYCLE if self._fps > 0 else 0.0
-        eta = f"，还差 {(need - n) / cps:.0f} s" if cps > 0 else ""
         self.p_toi.setXRange(0, max(need, 1), padding=0)
         self.p_toi.setYRange(0, 100, padding=0)
         self.txt_toi.setPos(need / 2.0, 50.0)
+        # 一帧都没收到本通道的 —— 这不是「在攒」，是「没有」，要分开说
+        if self._n_chan_bad and not self._n_chan_ok:
+            seen = "、".join(str(c) for c in sorted(self._chan_seen))
+            self.txt_toi.setHtml(
+                "<div style='text-align:center;font-size:11pt;color:#c33'>"
+                f"<b>通道 {self.channel()} 没有数据</b><br>"
+                "<span style='font-size:9pt'>"
+                f"收到 {self._n_chan_bad} 帧，但都标着通道 {seen}。<br>"
+                "设备没有切换 —— 要么该通道无硬件，要么切换指令不对</span></div>")
+            self.txt_toi.setVisible(True)
+            return
+        cps = self._fps / FRAMES_PER_CYCLE if self._fps > 0 else 0.0
+        eta = f"，还差 {(need - n) / cps:.0f} s" if cps > 0 else ""
         self.txt_toi.setHtml(
             "<div style='text-align:center;font-size:11pt'>"
             f"<b>攒第一个平均窗　{n} / {need} 周期{eta}</b><br>"

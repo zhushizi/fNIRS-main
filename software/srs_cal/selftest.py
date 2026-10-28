@@ -1454,18 +1454,20 @@ def t19_online_ui() -> None:
            (770.0, 3.0): 343269, (770.0, 4.0): 56690}
     DARK, DT = 1000, 1.5213
 
-    def frames(c0, n, scale=1.0):
+    def frames(c0, n, scale=1.0, channel=1):
+        """channel 默认 1 —— 真机数据帧的 byte10 实测恒为 0x01。"""
         out = []
         for cyc in range(c0, c0 + n):
             base = cyc * DT
             for rho in (3.0, 4.0):
                 out.append(Frame(wavelength_nm=0.0, distance_cm=rho, adc=DARK,
-                                 channel=0, raw=b"", t_host=base, cycle_id=cyc))
+                                 channel=channel, raw=b"", t_host=base,
+                                 cycle_id=cyc))
                 for j, wlx in enumerate(hw.WAVELENGTHS_ACTIVE_NM):
                     out.append(Frame(
                         wavelength_nm=float(wlx), distance_cm=rho,
                         adc=int(NET[(float(wlx), rho)] * scale) + DARK,
-                        channel=0, raw=b"", t_host=base + 0.1 * (j + 1),
+                        channel=channel, raw=b"", t_host=base + 0.1 * (j + 1),
                         cycle_id=cyc))
         return out
 
@@ -1605,6 +1607,53 @@ def t19_online_ui() -> None:
                len(win.toi_hist) > n_toi and "派生量出错" in win.lbl_sub.text(),
                f"{n_toi} → {len(win.toi_hist)}")
         del win.bl.push                      # 还原成类上的方法
+
+        # --- 通道选择（2026-10-28）------------------------------------------
+        from srs_cal.protocol import (CHANNEL_MAX, CHANNEL_MIN,
+                                      build_brightness, format_frame)
+        _check("19 通道下拉框有 CHANNEL_MIN~CHANNEL_MAX 共 4 项",
+               win.cmb_chan.count() == CHANNEL_MAX - CHANNEL_MIN + 1
+               and [win.cmb_chan.itemData(i) for i in range(win.cmb_chan.count())]
+               == list(range(CHANNEL_MIN, CHANNEL_MAX + 1)),
+               f"{win.cmb_chan.count()} 项")
+        sent: list = []
+        win.worker = type("W", (), {"send": lambda self, b: sent.append(b)})()
+        win.spn_bright.setValue(15)
+        win.cmb_chan.setCurrentIndex(2)          # 通道 3
+        _check("19 换通道立即下发，byte5=档位、byte6=通道",
+               sent and sent[-1][5] == 15 and sent[-1][6] == 3
+               and win.channel() == 3,
+               format_frame(sent[-1])[:26] if sent else "没发")
+        _check("19 换通道后清屏（换探头 = 换光学套件，旧曲线与基线作废）",
+               len(win.toi_hist) == 0 and win.bl.baseline is None)
+        _check("19 非 1 号通道时提示标定不适用",
+               "标定" in win.lbl_chan.text() and "通道 3" in win.lbl_chan.text(),
+               win.lbl_chan.text()[:40])
+
+        # --- 以回传为准：byte10 不符就当没有，不拿来充数 --------------------
+        win._on_frames(frames(0, 40))            # 这些帧 byte10 恒为 1
+        win._refresh()
+        _check("19 选通道 3 却只收到标着通道 1 的帧 → 一个点都不出",
+               len(win.toi_hist) == 0 and win._n_chan_ok == 0
+               and win._n_chan_bad > 0,
+               f"收 {win._n_chan_bad} 帧全部丢弃")
+        _check("19 界面明说「没有」，不是「在攒」",
+               "没有数据" in win.txt_toi.toPlainText()
+               and "✗" in win.lbl_chan.text() and "未切换" in win.lbl_chan.text(),
+               win.lbl_chan.text()[:44])
+
+        win.cmb_chan.setCurrentIndex(0)          # 回通道 1
+        win._on_frames(frames(40, 40))
+        win._refresh()
+        _check("19 回到通道 1：帧被收下，提示撤掉",
+               win._n_chan_ok > 0 and win._n_chan_bad == 0
+               and win.lbl_chan.text() == "",
+               f"收下 {win._n_chan_ok} 帧")
+        _check("19 指令帧仍与厂家样例逐字节一致（档位0、通道1）",
+               build_brightness(0x00) == bytes.fromhex(
+                   "55AA1A010100010000000000000000000000000000000000001D"),
+               format_frame(build_brightness(0x00)))
+        win.worker = None
 
         # --- 清屏 -----------------------------------------------------------
         win._reset()

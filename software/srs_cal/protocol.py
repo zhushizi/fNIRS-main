@@ -62,6 +62,14 @@ CODE_BY_DISTANCE = {v: k for k, v in DISTANCE_BY_CODE.items()}
 
 EXPECTED_CHANNEL = 0x01          # byte10。厂家参考实现不读这一字节，见下
 
+# 采集通道。指令帧 byte6 写它，数据帧 byte10 回它。
+#
+# ⚠️ **四通道这个数字来自用户，不是厂家文档。** 而且到 2026-10-28 为止，
+#    全部 46,572 帧归档里数据帧的 byte10 **恒为 0x01**，从未出现过别的值 ——
+#    所以「下发 byte6 能切换通道」这条**未经任何回传数据证实**。
+#    真正接上多探头后，第一件要验的就是 byte10 会不会跟着变。
+CHANNEL_MIN, CHANNEL_MAX = 0x01, 0x04
+
 # ---------------------------------------------------------------------------
 # 扫描周期（2026-10-22 新增，为 t_host / cycle_id 服务）
 # ---------------------------------------------------------------------------
@@ -286,8 +294,16 @@ def format_frame(raw: bytes) -> str:
     return " ".join(split_fields(raw))
 
 
-def build_brightness(gear: int) -> bytes:
+def build_brightness(gear: int, channel: int = EXPECTED_CHANNEL) -> bytes:
     """光源档位指令。gear = 0x00 ~ 0xFF（0~255），上电默认 0x0F（15）。
+
+    `channel` 写进 byte6，用于切换采集通道（1~4）。
+
+    ⚠️ **byte6 是通道号这件事没有厂家文档**。厂家 2026-10-10 的样例里它恒为
+       0x01，参考实现 `jhw-adc.py` 里也是写死的；我们是按字节位置推的。
+       同样地，数据帧的 byte10 在全部 46,572 帧归档里**恒为 0x01**，
+       从没见过第二个值 —— 也就是说「切换通道」目前**无法从回传数据上证实**。
+       换通道后若读数毫无变化，先怀疑这条，而不是怀疑探头。
 
     ⚠️ 档位是**一个字节**，传 >255 会被 bytearray 拒绝。上限经历过
        0x0F → 0x96(150) → 0xFF(255) 三次上调，都是厂家确认后改的；
@@ -317,7 +333,7 @@ def build_brightness(gear: int) -> bytes:
     b[3] = FRAME_TYPE_CMD
     b[4] = 0x01                    # 厂家样例固定值，含义未明
     b[5] = max(BRIGHTNESS_MIN, min(BRIGHTNESS_MAX, int(gear)))
-    b[6] = EXPECTED_CHANNEL
+    b[6] = max(CHANNEL_MIN, min(CHANNEL_MAX, int(channel)))
     b[FRAME_LEN - 1] = checksum(bytes(b))
     return bytes(b)
 
