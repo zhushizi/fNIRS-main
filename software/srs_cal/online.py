@@ -66,17 +66,19 @@ sys.path.insert(0, str(_HERE.parent))
 from srs_cal import hardware as hw                       # noqa: E402
 from srs_cal.acquire import (BAUDRATES, BRIGHTNESS_SETTLE_MS,    # noqa: E402
                              DEFAULT_GEAR, DEFAULT_PORT,
-                             FRAMES_PER_CYCLE, SerialWorker, SimWorker)
+                             SerialWorker, SimWorker)
 from srs_cal.archive import RawArchive                   # noqa: E402
 from srs_cal.robust import aggregate                     # noqa: E402
 from fnirs_pipeline.srs import (AUC_REL_DROP, BASELINE_N,  # noqa: E402
                                 SETTLE_MAX_REL, SETTLE_MAX_TOI_PTS,
                                 SETTLE_WIN_S, BaselineManager)
-from srs_cal.darksub import DarkSubtractor               # noqa: E402
-from srs_cal.quality import QualityMonitor, summarize    # noqa: E402
+from srs_cal.chpipe import ChannelPipeline, TimeBase     # noqa: E402
+from srs_cal.quality import summarize                    # noqa: E402
 from srs_cal.protocol import (BRIGHTNESS_DEFAULT, BRIGHTNESS_MAX,  # noqa: E402
                               BRIGHTNESS_MIN, CHANNEL_MAX, CHANNEL_MIN,
-                              build_brightness)
+                              CMD_START, CMD_START_CH2, CMD_STOP_CH1,
+                              EXPECTED_CHANNEL, build_brightness, build_cmd,
+                              frames_per_cycle)
 
 # DEFAULT_PORT / DEFAULT_GEAR 定义在 acquire.py，这里只 import（见上方 import 行）。
 # 两个程序共用一份，避免各改各的、悄悄跑偏。命令行 --port / --gear 可临时覆盖。
@@ -88,6 +90,9 @@ RHO = hw.RHO_CM
 # 按当时在用的波长写死，下次一改就 KeyError。
 COLOR = {0.0: "#2a78d6", 670.0: "#d62728", 770.0: "#ff7f0e",
          810.0: "#2ca02c", 850.0: "#1f77b4", 950.0: "#999999"}
+# 各采集通道在 TOI 叠图里的颜色。1 号沿用原来那个绿 —— 既有的截图、
+# 文档和操作者的记忆都挂在这个颜色上，不要因为加了通道就换掉它。
+CHAN_COLOR = {1: "#1a7f5a", 2: "#8e44ad", 3: "#d35400", 4: "#16a085"}
 MAXPTS = 20000
 REFRESH_HZ = 10
 # 默认合并多少个扫描周期出一个 TOI。
@@ -221,38 +226,28 @@ class OnlineWindow(QtWidgets.QWidget):
         self.archive_dir = archive_dir
         self.worker: QtCore.QThread | None = None
         self.archive: RawArchive | None = None
-        self.last_rejected = 0       # 上一次反演剔除的尖峰样本数
-        # L2.5 质量层。只读不改，两条链都读它、都不写它。
-        # active_wl 必须给 —— 否则分不清「反演通道坏了」和「监视通道坏了」，
-        # 后者（810/850/950）不该否决整次测量。
-        self.quality = QualityMonitor(
-            n_rho=len(RHO), n_wl=len(WL),
-            kb_calibrated=cal.kb_set,
-            active_wl=tuple(float(w) for w in WL))
-        self.last_qflags: list = []
-        self._derived_err = ""
         # 显式传 WL —— 跟着 WAVELENGTHS_ACTIVE_NM 走，别依赖 geometry() 的默认。
         # ⚠️ **不传 dark_level**：暗电平已经在 _on_frames 里用每个周期的
         #    暗时隙逐帧扣过了。再把标定文件里的静态暗传进来会扣两次。
         #    标定文件里的 dark_level 只对旧固件（无暗槽）有意义。
-        self.geom = hw.geometry(gain_correction=cal.gain, k=cal.k, b=cal.b,
-                                wavelengths_nm=WL)
-        self._keys = [(w, r) for w in WL for r in RHO]
-        self._need = DEFAULT_AVG
-        self.win = {k: deque(maxlen=DEFAULT_AVG) for k in self._keys}
-        # 逐周期暗时隙。cycle_dark 是本周期的暗值；dark_win 留一段历史，
-        # 用来显示暗电平自己漂多少 —— 它是链路健康度最直接的指标。
-        self.cycle_dark: dict[float, float] = {}
-        # 扣暗器：按时刻在前后两个暗之间插值，而不是减同周期那一个。
-        # 噪声主成分是 0.0868 Hz 的电路/环境干扰（暗时隙里也有），
-        # 而暗与信号在周期内差最多 1.5 s = 47° 相位，逐周期相减消不掉。
-        # 代价是延迟 1 个扫描周期（约 1.5 s），相对 N×1.5 s 的窗口可忽略。
-        # 详见 darksub.py 与 docs/双解码器架构.md §二·十。
-        self._darksub = DarkSubtractor()
-        self.dark_win = {r: deque(maxlen=600) for r in RHO}
-        self._no_dark = 0
-        self._fresh: set = set()
-        self._since = 0
+        #
+        # ⚠️ **四个通道共用这一份 geom**（2026-10-29 用户决定：先不等每通道
+        #    各标一份）。换通道 = 换探头 = 换光学套件，G(λ) 不跨套件转移，
+        #    所以非 1 号通道的 TOI **绝对值不可信**，只能看相对变化。
+        #    这一条在 `_refresh_chan_label` 里对操作者显形。
+        self._geom_shared = hw.geometry(gain_correction=cal.gain,
+                                        k=cal.k, b=cal.b, wavelengths_nm=WL)
+        # 各通道共享的时间原点 —— 多通道的曲线要能叠在一张图上比左右差异。
+        self.tb = TimeBase()
+        # 通道号 → 该通道的测量流水线。**以回传为准**：见到哪个通道的帧
+        # 就给它建一条（_on_frames 里），不按我们下发过什么建。
+        # 这里先建默认通道的那条，使单通道行为与改造前完全一致。
+        self.pipes: dict[int, ChannelPipeline] = {}
+        self._view_ch = EXPECTED_CHANNEL      # 界面当前在看哪个通道
+        # 工具栏「平均」的当前值。新建的流水线要按它开窗口，否则后来
+        # 出现的通道会用默认长度，两条曲线的平滑程度不一样。
+        self._need_ui = DEFAULT_AVG
+        self._pipe_for(EXPECTED_CHANNEL)
         # 通道校验：**以回传为准**。下发了 byte6 不等于设备真的切了 ——
         # 2026-10-28 实测：下发通道 2，292 帧回来 byte10 全是 01，
         # 且十路读数与通道 1 相差都在 ±1% 内（就是两次采集的正常起伏）。
@@ -260,38 +255,14 @@ class OnlineWindow(QtWidgets.QWidget):
         self._n_chan_ok = 0
         self._n_chan_bad = 0
         self._chan_seen: set = set()
-        self._starved: list[str] = []
         self._frames = 0
         self._last_frames = 0
         self._fps = 0.0
-        # 时间轴用**数据时刻**（帧的 t_host，与 perf_counter 同一个钟），
-        # 原点取第一帧。2026-10-26 前用的是「反演那一刻」的 perf_counter ——
-        # interp 扣暗下两者差约一个扫描周期（1.5 s），而且回放归档时后者
-        # 毫无意义（一瞬间喂完几百秒数据）。自动基线要 60 s 窗、AUC 要积分时间，
-        # 都必须用前者。
-        self._t_data: float | None = None    # 最近一帧的 t_host
-        self._t0_data: float | None = None   # 第一帧的 t_host，不随清屏重置
-        # 派生相对量：ΔHbO/ΔHbR/ΔtHb/THI/ΔTOI/AUC。SRS 绝对浓度减基线 ——
-        # 纯算术，延迟只有 SRS 自身的。基线与 AUC 的**全部判断**在
-        # BaselineManager 里（逻辑层），这里只调方法、读状态。
-        self.bl = BaselineManager()
-        self.d_hist: dict = {k: deque(maxlen=MAXPTS)
-                             for k in ("d_hbo", "d_hbr", "d_thb",
-                                       "d_thi", "d_toi")}
-        self.td_hist: deque = deque(maxlen=MAXPTS)
-        # AUC 与基线解耦，自己一条时间轴：只要有参考点就记，重抓基线时不断档
-        self.ta_hist: deque = deque(maxlen=MAXPTS)
-        self.auc_hist: deque = deque(maxlen=MAXPTS)
-        self.last_derived = None
         # 事件标记：(数据时刻, 文字)。界面上画竖线，并写到归档旁的 .events.csv
+        # **全局**，不按通道分 —— 按一次标记是操作者的一个动作，
+        # 那条竖线应该画在所有通道的图上。
         self.events: list[tuple[float, str]] = []
         self._event_lines: list = []
-        self.t_hist: deque = deque(maxlen=MAXPTS)
-        self.toi_hist: deque = deque(maxlen=MAXPTS)
-        # THI 绝对指数（k·tHb，µM）。不依赖基线，与 TOI 同一条时间轴。
-        self.thi_hist: deque = deque(maxlen=MAXPTS)
-        self.mua_hist: dict = {w: deque(maxlen=MAXPTS) for w in WL}
-        self.last_flags: list[str] = []
         self._build()
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self._refresh)
@@ -299,6 +270,52 @@ class OnlineWindow(QtWidgets.QWidget):
         self._rate = QtCore.QTimer(self)
         self._rate.timeout.connect(self._tick_rate)
         self._rate.start(1000)
+
+    # ------------------------------------------------------------------
+    # 通道流水线
+    # ------------------------------------------------------------------
+    # 2026-10-29：测量态从本类搬进了 ChannelPipeline（见 chpipe.py）。
+    # 下面这组转发属性让**界面代码一行不用改** —— `self.toi_hist` 仍然
+    # 读得到，只是读的是"当前在看的那个通道"的。这是刻意的：
+    #   ① 纯搬运才好验等价（自检 t21 要逐点逐位比对改造前的输出）；
+    #   ② 把通道维散成 60 个下标，漏一处就是"ch2 的数据写进 ch1 的历史"，
+    #      而这种错在界面上看不出来。集中在一处反而能查。
+    _FWD = ("win", "_keys", "_need", "_fresh", "_since", "_starved",
+            "cycle_dark", "dark_win", "_darksub", "_no_dark",
+            "geom", "quality", "last_qflags", "_derived_err",
+            "bl", "d_hist", "td_hist", "ta_hist", "auc_hist", "last_derived",
+            "t_hist", "toi_hist", "thi_hist", "mua_hist",
+            "last_I", "last_res", "last_n", "last_flags", "last_rejected",
+            "_q_net", "_q_dark", "_last_used")
+
+    def _pipe_for(self, ch: int) -> ChannelPipeline:
+        """取（必要时新建）某通道的流水线。
+
+        新建的时机是**见到该通道的第一帧**，不是下发该通道的指令 ——
+        延续本文件一贯的"以回传为准"：下发了不等于设备开了。
+        """
+        p = self.pipes.get(int(ch))
+        if p is None:
+            p = self.pipes[int(ch)] = ChannelPipeline(
+                ch, self._geom_shared, wl=WL, rho=RHO, need=self._need_ui,
+                kb_calibrated=self.cal.kb_set, timebase=self.tb,
+                maxpts=MAXPTS)
+        return p
+
+    @property
+    def pipe(self) -> ChannelPipeline:
+        """界面当前在看的那条流水线。
+
+        ⚠️ 必须跟着通道下拉走（`_on_channel` 改 `_view_ch`）。
+           漏了这一步，界面会一直显示 1 号通道的曲线却标着别的通道号 ——
+           自检 t19 的「选通道 3 却只收到通道 1 的帧 → 一个点都不出」
+           就是靠这一条抓出来的。
+        """
+        return self._pipe_for(self._view_ch)
+
+    def _now(self) -> float:
+        """数据时刻，以第一帧为 0。还没收到帧时退回 0。"""
+        return self.tb.now()
 
     # -- UI ----------------------------------------------------------------
     def _build(self) -> None:
@@ -356,26 +373,58 @@ class OnlineWindow(QtWidgets.QWidget):
             f"采集通道 {CHANNEL_MIN}~{CHANNEL_MAX}。改动立即下发"
             "（指令帧 byte6，与光源档位同一帧）。",
             "",
-            "⚠️ **byte6 是通道号这件事没有厂家文档**，是按字节位置推的。",
-            "⚠️ 到 2026-10-28 为止，全部 46,572 帧归档里数据帧的 byte10",
-            "   （回传的通道号）**恒为 0x01**，从没出现过别的值。",
-            "   也就是说「切换生效了没有」目前**无法从回传数据上证实**。",
-            "   换通道后若读数毫无变化，先怀疑这条，别先怀疑探头。",
+            "通道是**累加**的，不是切换（厂家文档「累加依次」+ 2026-10-29 实测）：",
+            "   下发 2 号之后 1 号仍在跑，设备把帧率翻倍，",
+            "   每个通道自己的周期率不变（恒 0.656 周期/s）。",
+            "   要关掉某个通道，用「关闭通道一」那类停止帧（byte4=0x00）。",
             "",
             "⚠️ 换通道 = 换探头 = 换光学套件，**G(λ) 标定不跨套件转移**。",
-            "   每个通道都要各标一份，否则绝对值无意义。")))
+            "   当前四个通道**共用 1 号通道的标定**（2026-10-29 决定），",
+            "   所以非 1 号通道的 TOI **绝对值不可信**，只能看相对变化。")))
         self.cmb_chan.currentIndexChanged.connect(self._on_channel)
         self.lbl_chan = QtWidgets.QLabel("")
         self.lbl_chan.setStyleSheet("color:#8a5a00")
+        # 每通道的开/关。档位沿用上面那个 spn_bright（它按"当前通道"下发，
+        # 而档位本身是按通道生效的 —— 实测），这里只管启停。
+        #
+        # 为什么要独立的启停：通道是**累加**的，下发某通道的启动帧只会
+        # "加上"它，没有任何指令能"只留这一个"。要关掉就得对它单独发
+        # byte4=0x00 的停止帧。改造前界面上唯一的停止帧是硬编码的
+        # 「关闭通道一」按钮，别的通道关不掉。
+        self.chk_ch: dict[int, QtWidgets.QCheckBox] = {}
+        self._gear_by_ch: dict[int, int] = {}
+        for c in range(CHANNEL_MIN, CHANNEL_MAX + 1):
+            cb = QtWidgets.QCheckBox(str(c))
+            cb.setToolTip("\n".join((
+                f"通道 {c} 的开/关。",
+                f"  勾选 → 下发启动帧 byte4=01、byte6={c:02X}，档位用它自己的；",
+                f"  取消 → 下发停止帧 byte4=00、byte6={c:02X}。",
+                "",
+                "⚠️ 勾上**不代表**设备真的开了 —— 右边的回传状态才算。",
+                "   设备上电默认就在发 1 号通道，所以 1 号初始是勾上的。")))
+            cb.setChecked(c == EXPECTED_CHANNEL)
+            cb.toggled.connect(lambda on, ch=c: self._on_chan_toggle(ch, on))
+            self.chk_ch[c] = cb
+            self._gear_by_ch[c] = BRIGHTNESS_DEFAULT
+        self.lbl_chan_live = QtWidgets.QLabel("")
+        self.lbl_chan_live.setToolTip(
+            "各通道的**回传**状态：● 在发帧　○ 静默。\n"
+            "以数据帧的 byte10 为准，不看我们下发过什么。")
         self.lbl_avg = QtWidgets.QLabel()
         self.btn_reset = QtWidgets.QPushButton("清屏")
-        self.btn_reset.setToolTip("清掉曲线、基线与 AUC，自动基线重新开始等稳定。")
-        self.btn_reset.clicked.connect(self._reset)
+        self.btn_reset.setToolTip(
+            "清掉**所有通道**的曲线、基线与 AUC，自动基线重新开始等稳定。")
+        # ⚠️ 必须包一层 lambda。`clicked` 会把 checked(False) 当第一个实参传进去，
+        #    _reset 现在有了 `channels` 形参，直接连会收到 channels=False
+        #    → `for c in False` 抛 TypeError。自检 t21 盯着这条。
+        self.btn_reset.clicked.connect(lambda: self._reset())
         for w in (QtWidgets.QLabel("串口"), self.cmb_port,
                   QtWidgets.QLabel("波特率"), self.cmb_baud,
                   self.btn_refresh, self.btn_conn,
                   QtWidgets.QLabel("  光源"), self.spn_bright,
-                  QtWidgets.QLabel("  通道"), self.cmb_chan, self.lbl_chan,
+                  QtWidgets.QLabel("  查看"), self.cmb_chan, self.lbl_chan,
+                  QtWidgets.QLabel("  开通道"), *self.chk_ch.values(),
+                  self.lbl_chan_live,
                   QtWidgets.QLabel("  平均"), self.spn_avg, self.lbl_avg,
                   self.btn_reset):
             bar.addWidget(w)
@@ -459,9 +508,21 @@ class OnlineWindow(QtWidgets.QWidget):
         self.p_toi.showGrid(x=True, y=True, alpha=0.3)
         self.p_toi.setLabel("left", "TOI (%)")
         self.p_toi.addLegend(offset=(-10, 8), labelTextSize="8pt")
-        self.c_toi = self.p_toi.plot(pen=pg.mkPen("#1a7f5a", width=2),
-                                     name="TOI")
-        self.c_toi.setClipToView(True)
+        # TOI 图**叠加所有通道** —— 左右对比是双通道脑氧的临床意义本身，
+        # 两条曲线不在同一张图上就比不了。
+        #
+        # 为什么只有这一张图叠加：4 通道 × ΔHbO/ΔHbR/ΔtHb = 12 条曲线没法读。
+        # 其余五张图只画"当前查看的通道"，由工具栏的「查看」下拉切换。
+        self.c_toi_ch: dict[int, object] = {}
+        for c in range(CHANNEL_MIN, CHANNEL_MAX + 1):
+            cur = self.p_toi.plot(
+                pen=pg.mkPen(CHAN_COLOR[c],
+                             width=2 if c == EXPECTED_CHANNEL else 1.6),
+                name=f"TOI 通道 {c}")
+            cur.setClipToView(True)
+            self.c_toi_ch[c] = cur
+        # `c_toi` 保留成"当前查看通道那条" —— 既有代码与自检都按这个名字读。
+        self.c_toi = self.c_toi_ch[EXPECTED_CHANNEL]
         # 基线与 AUC 警戒线画成**数据曲线**而不是 InfiniteLine：后者不参与
         # 自动缩放，TOI 远高于警戒线时那条线会落在视野外，等于没画。
         self.c_bl_line = self.p_toi.plot(
@@ -667,6 +728,27 @@ class OnlineWindow(QtWidgets.QWidget):
             "时刻与归档里的 t_host 同一个钟，可对齐回放。")
         self.btn_mark.clicked.connect(self._on_mark)
 
+        # —— 两条固定的协议测试帧（2026-10-29，用户逐字节指定）——
+        # 放在最右、与临床控件之间隔一个 stretch：「关闭通道一」会停数据流，
+        # 监护中误点代价不小（能不能用启动帧恢复还没验过）。
+        self.btn_cmd_ch2 = QtWidgets.QPushButton("启动通道2")
+        self.btn_cmd_ch2.setToolTip(
+            "原样下发：55 AA 1A 01 01 64 02 … 82\n"
+            "（启动 | 强度 100 | 二通道）\n\n"
+            "⚠️ 2026-10-28 实测：下发通道 2 后回传的 byte10 仍是 01。\n"
+            "   若这次仍无变化，通道状态行会直接写出来。\n"
+            "⚠️ 发出后清屏、换归档文件 —— 换通道 = 换光学套件，标定不再成立。")
+        self.btn_cmd_ch2.clicked.connect(self._on_cmd_start_ch2)
+        self.btn_cmd_stop = QtWidgets.QPushButton("关闭通道一")
+        self.btn_cmd_stop.setStyleSheet("color:#a33208;font-weight:bold")
+        self.btn_cmd_stop.setToolTip(
+            "原样下发：55 AA 1A 01 00 00 01 … 1C\n"
+            "（停止 | 强度 0 | 一通道）\n\n"
+            "⚠️ 停止帧**从未实测过**。设备一直是上电即连续发数据。\n"
+            "   生效的标志是帧率掉到 0；恢复只能靠再发启动帧，\n"
+            "   万一启动帧也不被接受，就得重新上电。先在体模上试。")
+        self.btn_cmd_stop.clicked.connect(self._on_cmd_stop_ch1)
+
         for w in (QtWidgets.QLabel("基线"), self.btn_capture,
                   QtWidgets.QLabel("TOI"), self.spn_bl_toi, self.btn_bl_apply,
                   self.lbl_bl, QtWidgets.QLabel("｜"),
@@ -675,6 +757,9 @@ class OnlineWindow(QtWidgets.QWidget):
                   self.txt_event, self.btn_mark):
             bar.addWidget(w)
         bar.addStretch(1)
+        bar.addWidget(QtWidgets.QLabel("协议测试"))
+        bar.addWidget(self.btn_cmd_ch2)
+        bar.addWidget(self.btn_cmd_stop)
         return bar
 
     def _sync_avg(self) -> None:
@@ -684,12 +769,28 @@ class OnlineWindow(QtWidgets.QWidget):
         按假设显示等于骗人。没数据时就老实显示「待测」。
         """
         n = self.spn_avg.value()
-        if self._fps > 0:
-            cps = self._fps / FRAMES_PER_CYCLE   # 一周期 = (1暗+5波长)×2距离
+        cps = self._cycles_per_s()
+        if cps > 0:
             self.lbl_avg.setText(f"窗口 ≈ {n / cps:.1f} s，"
                                  f"出点 {cps:.1f}/s")
         else:
             self.lbl_avg.setText("速率待测")
+
+    def _n_active(self) -> int:
+        """回传里还在发帧的通道数。**以回传为准**，不看我们下发过几个。"""
+        st = getattr(self.worker, "stream", None)
+        return getattr(st, "n_active", 1) if st is not None else 1
+
+    def _cycles_per_s(self) -> float:
+        """实测的「本通道」周期率 = 帧率 ÷ (12 × 活跃通道数)。
+
+        ⚠️ 必须除以活跃通道数。多通道同采时设备把帧率成倍提高，但每个
+           通道自己的周期率不变（2026-10-29 实测：双通道 15.6 帧/s，
+           ch1 仍是 0.656 周期/s）。只除 12 会按通道数成倍偏高。
+        """
+        if self._fps <= 0:
+            return 0.0
+        return self._fps / frames_per_cycle(self._n_active())
 
     # -- 串口 --------------------------------------------------------------
     def _refresh_ports(self) -> None:
@@ -730,9 +831,68 @@ class OnlineWindow(QtWidgets.QWidget):
         self._bright_timer.start()
 
     def _on_channel(self) -> None:
-        """换通道 = 换探头。立即下发，并把界面状态全部作废。"""
-        self._bright_timer.stop()       # 不等防抖，换探头要立刻生效
-        self._send_brightness()
+        """切换**查看**哪个通道。纯视角动作：不下发、不清屏。
+
+        ⚠️ 2026-10-29 改。改造前这里会 `_send_brightness()`，而那条路
+           末尾要清屏 —— 于是"看一眼 2 号再看回 1 号"会把两边的曲线**都清掉**，
+           每次都得重新攒窗口。多通道同时计算的全部意义就是数据已经在后台
+           算着了，切过去应该立刻就有，不该重来。
+
+           设备控制现在归两个地方，各管各的：
+             · 开/关某通道  → 工具栏的开关复选框（启动帧 / 停止帧）
+             · 改某通道光强 → 档位框（作用在**当前查看**的那个通道上）
+           这个下拉只决定"下面五张图画谁"，以及"档位框改的是谁"。
+        """
+        self._view_ch = self.channel()
+        # `c_toi` 的约定是"当前查看通道那条"，切视角时跟着换。
+        self.c_toi = self.c_toi_ch[self._view_ch]
+        # 档位框跟着切到该通道自己的档位。
+        # ⚠️ 必须 blockSignals：否则 setValue 会触发防抖定时器，
+        #    把上一个通道的档位当成"改动"下发给新通道 —— 档位按通道生效，
+        #    发错就真的改了它的光强。
+        self.spn_bright.blockSignals(True)
+        self.spn_bright.setValue(self._gear_by_ch.get(self._view_ch,
+                                                      BRIGHTNESS_DEFAULT))
+        self.spn_bright.blockSignals(False)
+        self._bright_timer.stop()        # 丢掉可能排着队的那次下发
+        self._refresh_chan_label()
+        self._refresh()                  # 立刻换图，不等 10 Hz 的刷新定时器
+
+    def _on_chan_toggle(self, ch: int, on: bool) -> None:
+        """某个通道的开/关复选框。
+
+        勾 → 启动帧（byte4=01，档位用它自己的那个）；
+        取消 → 停止帧（byte4=00，档位写 0）。
+        两者都只作用在 byte6 指定的那一个通道上 —— 实测（162704）：
+        停 1 号时 2 号继续流，再发启动帧 1 号恢复。
+        """
+        if self.worker is None:
+            # 发不出去就别让复选框假装生效 —— 它会被当成"设备状态"读。
+            cb = self.chk_ch[ch]
+            cb.blockSignals(True)
+            cb.setChecked(not on)
+            cb.blockSignals(False)
+            self.lbl_chan.setText(f"✗ 未连接，通道 {ch} 的{'启动' if on else '停止'}"
+                                  "帧没发出去")
+            self.lbl_chan.setStyleSheet("color:#c33;font-weight:bold")
+            return
+        g = self._gear_by_ch.get(ch, BRIGHTNESS_DEFAULT) if on else 0x00
+        self._send_cmd(build_cmd(on, g, ch), g, ch)
+
+    def _refresh_chan_live(self) -> None:
+        """各通道的**回传**状态条。看的是 byte10，不是复选框。"""
+        st = getattr(self.worker, "stream", None)
+        if st is None:
+            self.lbl_chan_live.setText("")
+            return
+        seen = set(getattr(st, "channels_seen", ()))
+        bits = []
+        for c in range(CHANNEL_MIN, CHANNEL_MAX + 1):
+            n = st.cycles_of(c) if c in seen else 0
+            bits.append(f"<span style='color:{'#2a7' if n else '#bbb'}'>"
+                        f"{'●' if n else '○'}{c}</span>")
+        self.lbl_chan_live.setText("&nbsp;".join(bits))
+        self.lbl_chan_live.setTextFormat(QtCore.Qt.RichText)
 
     def channel(self) -> int:
         return int(self.cmb_chan.currentData())
@@ -748,44 +908,123 @@ class OnlineWindow(QtWidgets.QWidget):
         if self.worker is None:
             return
         g, ch = self.spn_bright.value(), self.channel()
+        self._send_cmd(build_brightness(g, ch), g, ch)
+
+    def _send_cmd(self, frame: bytes, g: int, ch: int) -> None:
+        """发一条**已经造好**的指令帧，并走完换档位/换通道的全部善后。
+
+        界面驱动的 `_send_brightness` 与两个固定帧按钮共用这一条路，
+        否则「按钮发出去的帧」与「界面以为的状态」会分叉。
+        """
         prev = getattr(self, "_gear_sent", None)
         prev_ch = getattr(self, "_chan_sent", None)
-        self.worker.send(build_brightness(g, ch))
+        self.worker.send(frame)
         self._gear_sent, self._chan_sent = g, ch
-        self._reset()               # 换了光源/探头，之前的曲线不是同一条件，清掉
+        # 记住这个通道的档位 —— 切回来时档位框要显示它自己的，
+        # 开/关复选框重新勾上时也要用它自己的，而不是别人的。
+        # 停止帧（档位写 0）不算"这个通道的档位"，不记。
+        gear_was = self._gear_by_ch.get(ch)
+        if frame[4] == CMD_START:
+            self._gear_by_ch[ch] = g
+        # 清屏还是只断一刀？三种情况要分开 —— 这一条改造前是"一律清屏"，
+        # 而那会把别的通道、以及只是停一下再开的通道的历史白白扔掉。
+        #
+        # ⚠️ 只清**这一个通道**。档位是按通道生效的（实测：对 2 号下发
+        #    档位 100，1 号的 670/3cm 纹丝不动，693,722 → 674,276；
+        #    对 1 号下发才掉到 342,014）。别的通道的光强没变，历史仍然有效。
+        if frame[4] == CMD_START and gear_was is not None and gear_was != g:
+            # 光强真的变了：旧曲线不是同一条件下的，留着会被当成同一条读
+            self._reset(channels=[ch])
+        else:
+            # 启停：数据本身没问题，只是中间有一段空档。
+            # 留着历史、画一道断口 —— 清掉等于把"停之前是什么样"也扔了，
+            # 而那恰恰是操作者停它的原因。
+            self._pipe_for(ch).break_line()
         # 归档同理：换档位或换通道就开新文件，让每个归档文件的头里恰好
         # **一个**档位、**一个**通道。否则文件头记的是开始归档那一刻的值，
         # 中途改了就对不上 —— 而原始帧里**不含档位**（档位只在出站的指令帧里），
-        # 通道虽有 byte10 但实测恒为 0x01，两者事后都无从还原。
+        # 事后无从还原。通道则不同：byte10 是可信的（2026-10-29 实测会回
+        # 0x02），所以通道可以从帧里还原，轮转主要是为了档位。
         #
         # ⚠️ 只在**真的变了**时轮转。`_send_brightness` 会被防抖定时器
         #    重复触发（同一档位也会再发一次），不加这个守卫会产生文件碎片。
         if self.archive is not None and (prev != g or prev_ch != ch):
             self._stop_record()
             self._start_record()
-        # 质量层的会话基线也不能跨档位/跨通道沿用。
-        self.quality.reset()
+        # 质量层的会话基线也不能跨档位沿用 —— 同样只重置这一个通道的。
+        self._pipe_for(ch).quality.reset()
+        # 复选框跟着这一帧走 —— 不管这帧是谁造的（档位框、固定按钮、
+        # 还是复选框自己）。否则界面上的勾选与真正发出去的字节会分叉。
+        cb = self.chk_ch.get(ch)
+        if cb is not None:
+            cb.blockSignals(True)
+            cb.setChecked(frame[4] == CMD_START)
+            cb.blockSignals(False)
         self._refresh_chan_label()
+
+    def _send_fixed(self, frame: bytes, g: int, ch: int, name: str) -> None:
+        """固定帧按钮：原样发出这 26 个字节，再把界面调到与之一致。
+
+        ⚠️ 不走「改控件 → 触发下发」那条路：那条路会**重新造帧**，
+           重造出来的 byte4 恒为启动 —— 关闭帧会当场变回启动帧。
+        """
+        if self.worker is None:
+            self.lbl_chan.setText(f"✗ 未连接，「{name}」没发出去")
+            self.lbl_chan.setStyleSheet("color:#c33;font-weight:bold")
+            return
+        self.spn_bright.blockSignals(True)
+        self.spn_bright.setValue(g)
+        self.spn_bright.blockSignals(False)
+        i = self.cmb_chan.findData(ch)
+        if i >= 0:
+            self.cmb_chan.blockSignals(True)
+            self.cmb_chan.setCurrentIndex(i)
+            self.cmb_chan.blockSignals(False)
+        # 控件先调好再发 —— _send_cmd 末尾的 _refresh_chan_label 读的是控件。
+        self._send_cmd(frame, g, ch)
+
+    def _on_cmd_start_ch2(self) -> None:
+        self._send_fixed(CMD_START_CH2, 0x64, 0x02, "启动通道2")
+
+    def _on_cmd_stop_ch1(self) -> None:
+        self._send_fixed(CMD_STOP_CH1, 0x00, 0x01, "关闭通道一")
+
+    def _chan_counts(self) -> tuple[int, int]:
+        """(当前查看通道收到的帧数, 其他通道收到的帧数)。
+
+        ⚠️ 取的是**各条流水线自己的** `n_frames`，不是窗口级的累计计数。
+           窗口级那两个是单通道年代的东西：切换查看通道时它们不归零
+           （现在切视角不清屏了），于是会把"刚才看 1 号时收的帧"算到
+           "现在看 3 号"头上，把「通道 3 无数据」说成「有 1140 帧」。
+        """
+        mine = self.pipe.n_frames
+        other = sum(p.n_frames for c, p in self.pipes.items()
+                    if c != self._view_ch)
+        return mine, other
 
     def _refresh_chan_label(self) -> None:
         """通道状态。先报「收没收到」，再报标定是否适用 —— 前者更要紧。"""
         ch = self.channel()
-        if self._n_chan_bad and not self._n_chan_ok:
+        mine, other = self._chan_counts()
+        if other and not mine:
             seen = "、".join(str(c) for c in sorted(self._chan_seen))
             self.lbl_chan.setText(
-                f"✗ 通道 {ch} 无数据：收到 {self._n_chan_bad} 帧，"
-                f"但都标着通道 {seen} —— 设备未切换")
+                f"✗ 通道 {ch} 无数据：收到 {other} 帧，"
+                f"都标着通道 {seen} —— 该通道没有回传")
             self.lbl_chan.setStyleSheet("color:#c33;font-weight:bold")
             return
-        if self._n_chan_bad:
-            self.lbl_chan.setText(f"⚠ 混入 {self._n_chan_bad} 帧非本通道，已丢弃")
-            self.lbl_chan.setStyleSheet("color:#c33")
-            return
+        # ⚠️ 这里**不再**报「另有 N 帧属其他通道」。多通道同采是正常工况，
+        #    `other` 恒大于 0，那条提示会把下面的标定警告永远挡住 ——
+        #    而标定警告是真要紧的那条。别的通道开没开，看工具栏的 ●1 ●2。
+        #
         # 标定是按某一路探头标的，换通道后 G(λ) 不再成立 —— 必须显形。
+        # 2026-10-29 起四个通道共用 1 号的标定（用户决定），所以非 1 号通道
+        # 屏上那个 TOI 是拿别人的 G(λ) 算出来的，**绝对值不可信**。
+        # 这比「没有数据」更隐蔽：没数据看得见，算错的数看不见。
         self.lbl_chan.setText(
             "" if ch == CHANNEL_MIN
             else f"⚠ 通道 {ch}：标定 {self.cal.doc.get('version', '?')} "
-                 f"是按通道 {CHANNEL_MIN} 标的，绝对值不可信")
+                 f"是按通道 {CHANNEL_MIN} 标的，绝对值不可信（相对变化仍可看）")
         self.lbl_chan.setStyleSheet("color:#8a5a00")
 
     # ------------------------------------------------------------------
@@ -807,8 +1046,10 @@ class OnlineWindow(QtWidgets.QWidget):
                 #    连上就立刻归档时它还没有，直接取会抛 AttributeError，
                 #    被下面的 except 吞掉 → 归档静默不启动。
                 "gear": getattr(self, "_gear_sent", None),
-                # 通道同理。原始帧的 byte10 实测恒为 0x01，**回传不可信**，
-                # 所以归档里记的是我们**下发**的那个通道号。
+                # 这里记的是我们**下发**的通道号 —— 名字带 _sent 就是这个意思。
+                # 实际有哪些通道在回传，要从帧的 byte10 看（已证实可信），
+                # 读归档时用 archive.replay_channels()。两者可能不一致：
+                # 下发了不等于设备开了，而且通道是累加的（开 2 号时 1 号还在）。
                 "channel_sent": getattr(self, "_chan_sent", None),
                 "cal": self.cal.doc.get("version", "none"),
                 "wavelengths_active_nm": [float(w) for w in WL],
@@ -865,7 +1106,11 @@ class OnlineWindow(QtWidgets.QWidget):
         fps = self._frames - self._last_frames
         self._last_frames = self._frames
         self._fps = float(fps)
-        self.lbl_link.setText(f"{fps} 帧/s（{fps/FRAMES_PER_CYCLE:.1f} 周期/s）")
+        na = self._n_active()
+        self.lbl_link.setText(
+            f"{fps} 帧/s（{self._cycles_per_s():.2f} 周期/s"
+            + (f"，{na} 通道" if na > 1 else "") + "）")
+        self._refresh_chan_live()
         self._sync_avg()
         # 归档状态：有错就标红，这是操作者唯一能看到归档出问题的地方
         if self.archive is not None:
@@ -874,97 +1119,52 @@ class OnlineWindow(QtWidgets.QWidget):
             self.lbl_rec.setStyleSheet(
                 "color:#c33" if st.n_errors else "color:#2a7")
 
-    def _reset(self) -> None:
-        # ⚠️ 连 last_res 一起丢掉 —— 否则清屏后曲线空了、大数字和格子却停在旧值，
-        #    进度条也因为「已有 last_res」而不出现，看起来像卡死。
-        for k in ("last_res", "last_I", "last_derived"):
-            self.__dict__.pop(k, None)
-        self.last_derived = None
-        self.lbl_toi.setText("—")
-        self.lbl_toi.setStyleSheet("color:#888")
-        for lab in self.cells.values():
-            lab.setText("—")
-        self.t_hist.clear(); self.toi_hist.clear()
-        self.thi_hist.clear(); self.c_thi.setData([], [])
-        for d in self.mua_hist.values():
-            d.clear()
-        for d in self.win.values():
-            d.clear()
-        for d in self.dark_win.values():
-            d.clear()
-        self.cycle_dark.clear()
-        self._darksub.reset()
+    def _reset(self, channels=None) -> None:
+        """清屏。`channels=None` 清全部（工具栏「清屏」按钮）；
+        给了通道号就只清那几条（换档位时只清受影响的那一个）。
+
+        ⚠️ 连 last_res 一起丢掉 —— 否则清屏后曲线空了、大数字和格子却停在旧值，
+           进度条也因为「已有 last_res」而不出现，看起来像卡死。
+           （搬进 ChannelPipeline 后它们是 None 而不是"属性不存在"，
+            读的那一侧跟着改成了 `is None` 判断，语义一样。）
+        """
+        targets = (list(self.pipes) if channels is None
+                   else [int(c) for c in channels])
         # 清屏连基线、AUC 一起清 —— 旧基线对应的是已经被清掉的那段数据。
         # 自动基线从「等待稳定」重新开始。
-        self.bl.reset()
-        self.last_derived = None
-        self.td_hist.clear()
-        for d in self.d_hist.values():
-            d.clear()
-        self.ta_hist.clear(); self.auc_hist.clear()
-        for c in (*self.c_rel.values(), self.c_auc,
-                  self.c_bl_line, self.c_auc_line):
-            c.setData([], [])
-        # 事件只清图上的线；已写进 .events.csv 的不动
-        for ln in self._event_lines:
-            for p, item in ln:
-                p.removeItem(item)
-        self._event_lines.clear()
-        self.events.clear()
-        self._no_dark = 0
-        self._fresh.clear()
-        self._since = 0
-        self._starved = []
-        self._n_chan_ok = 0
-        self._n_chan_bad = 0
-        self._chan_seen.clear()
+        for ch in targets:
+            self._pipe_for(ch).reset()
+        # 下面这些画的是**当前在看的那个通道**。只有它被清了才该抹掉，
+        # 否则在看 1 号、改了 2 号的档位，1 号的曲线会被无故清空。
+        if self._view_ch in targets:
+            self.lbl_toi.setText("—")
+            self.lbl_toi.setStyleSheet("color:#888")
+            for lab in self.cells.values():
+                lab.setText("—")
+            self.c_thi.setData([], [])
+            for c in (*self.c_rel.values(), self.c_auc,
+                      self.c_bl_line, self.c_auc_line):
+                c.setData([], [])
+        # 事件标记是全局的，只在全清时清；图上的线清掉，
+        # 已写进 .events.csv 的不动。
+        if channels is None:
+            for ln in self._event_lines:
+                for p, item in ln:
+                    p.removeItem(item)
+            self._event_lines.clear()
+            self.events.clear()
+        # 这些是"见过哪些通道"的链路事实，只在**全清**时归零。
+        # 按通道清屏（换档位）时留着 —— 否则提示会说"没见过别的通道"，
+        # 而它们明明还在发。
+        if channels is None:
+            self._n_chan_ok = 0
+            self._n_chan_bad = 0
+            self._chan_seen.clear()
 
     # -- 反演 --------------------------------------------------------------
-
-    def _push_net(self, key, net: float, t: float, need: int, nk: int) -> None:
-        """压入一个扣暗后的样本；收齐一轮就反演。
-
-        从 `_on_frames` 的循环里抽出来 —— 插值扣暗会在**一个暗时隙到达时
-        成批**吐出上一周期的信号帧，原先内联在循环里的判定已不适用。
-
-        `t` 是这个样本所属信号帧的 t_host —— 光被测到的时刻。
-        """
-        self._t_data = float(t)
-        if self._t0_data is None:
-            self._t0_data = float(t)
-        self.win[key].append(float(net))
-        self._fresh.add(key)
-        self._since += 1
-        # 判定放在每压入一个样本之后：一批 feed 里可能含多个扫描周期，
-        # 放在批末会让出点率被串口的读节奏绑架，而不是由设备扫描速率决定。
-        #
-        # ⚠️ 2026-10-26 第二轮试过「窗口没满也出点」，**实测否决**：
-        #    TOI 是光强的非线性函数（μa ∝ μeff²），单周期噪声不是散开而是**有偏**。
-        #    实测「n 个周期算的 TOI」减「同一时刻 20 周期算的」：
-        #      n=1  中位 0.2~7.2，p90 0.4~23.1
-        #      n=10 中位 0.0~2.7，p90 0.1~7.9
-        #    103952 开头几点读 42，真值 74。主读数上放一个错 32 点的数不可接受。
-        #    改为：窗口没满时在图里画进度，不出数。想更快就把工具栏的「平均」调小。
-        if (len(self._fresh) == nk
-                and all(len(self.win[k]) >= need for k in self._keys)):
-                n = min(len(self.win[k]) for k in self._keys)
-                # ⚠️ 稳健聚合而非算术均值：实测每通道 2~6% 的周期是尖峰、
-                #    幅度约 25 倍。窗口 N=10 时约 10% 的窗口被污染，
-                #    一个尖峰会把该点的均值抬高约 2.5 倍。选型见 robust.py。
-                ags = {(w, r): aggregate(self.win[(w, r)])
-                       for w in WL for r in RHO}
-                I = np.array([[ags[(w, r)].value for r in RHO] for w in WL])
-                self.last_rejected = sum(a.n_rejected for a in ags.values())
-                self._last_used = sum(a.n_used for a in ags.values())
-                # 质量层要的三份输入。扣暗值即 ags；暗电平取本周期的。
-                self._q_net = {(float(w), float(r)): ags[(w, r)].value
-                               for w in WL for r in RHO}
-                self._q_dark = {float(r): self.cycle_dark.get(float(r))
-                                for r in RHO}
-                self._fresh.clear()
-                self._since = 0
-                self._starved = []
-                self._invert(I, n)
+    # 扣暗 → 滑窗 → 稳健聚合 → compute_toi → 派生相对量 这一整条，
+    # 2026-10-29 搬进了 `chpipe.ChannelPipeline`（每通道一条）。
+    # 本类只剩"分发帧"和"画图"。
 
     def _on_frames(self, frames: list) -> None:
         """滑动窗口：每收齐一个新扫描周期出一个点，每点平均最近 N 个周期。
@@ -985,138 +1185,74 @@ class OnlineWindow(QtWidgets.QWidget):
             self.archive.write(frames)
 
         need = self.spn_avg.value()
-        if need != self._need:
+        if need != self._need_ui:
             self._resize(need)
-        nk = len(self._keys)
+        link = getattr(self.worker, "stream", None)
         want = self.channel()
         for f in frames:
             self._frames += 1
-            # ⚠️ **通道以回传为准**：帧自己标的 byte10 不等于选中的通道，
-            #    这一帧就不属于当前通道，直接不要 —— 「没有就是没有」，
-            #    不能把别的通道（或根本没切换）的数据当成选中通道的来显示。
-            #    归档在上面已经写过了，原始数据一帧不丢。
+            # ⚠️ **通道以回传为准**：只认数据帧自己标的 byte10，不认我们
+            #    下发了什么 —— 下发了不等于设备开了。
+            #
+            # 2026-10-29 起**每个回传过的通道各建一条流水线**，一起算。
+            # 改造前这里是 `if f.channel != want: continue`，只留选中的那个
+            # 通道；现在别的通道也照算，`want` 只决定界面在**看**哪一个。
+            # 这样切换查看通道时不必重新攒窗口 —— 它一直在后台算着。
             self._chan_seen.add(f.channel)
+            # 这两个累计数留给自检与旧代码读；**界面已不用它们**，
+            # 因为切换查看通道时它们不归零（切视角不再清屏），
+            # 会把"刚才看别的通道时收的帧"算到现在这个头上。
+            # 权威数字是各条流水线自己的 `n_frames`，见 `_chan_counts`。
             if f.channel != want:
                 self._n_chan_bad += 1
-                continue
-            self._n_chan_ok += 1
-            # 暗时隙排在每个周期最前：记下本周期的暗，后面的信号帧当场扣。
-            # 这比标定文件里的静态暗电平强得多 —— 暗电平的漂移时间常数
-            # 只有几个周期，静态值几秒钟就过期了。
-            if f.is_dark:
-                self.cycle_dark[f.distance_cm] = float(f.adc)
-                self.dark_win[f.distance_cm].append(float(f.adc))
-                # 暗时隙到达 → 上一周期攒着的信号帧现在有了右端点，可解析
-                for wl, rho, t, net in self._darksub.feed_dark(
-                        f.distance_cm, f.t_host, float(f.adc)):
-                    k = (wl, rho)
-                    if k in self._keys:
-                        self._push_net(k, net, t, need, nk)
-                continue
-            key = (f.wavelength_nm, f.distance_cm)
-            if key not in self._keys:
-                continue                       # 810/950 照收不反演
-            # interp 模式下这里只是攒着，返回空；prev 模式下当场返回
-            for wl, rho, t, net in self._darksub.feed_signal(
-                    f.wavelength_nm, f.distance_cm, f.t_host, float(f.adc)):
-                self._push_net((wl, rho), net, t, need, nk)
-            self._no_dark = self._darksub.n_dropped_nodark
+            else:
+                self._n_chan_ok += 1
+            if f.channel < CHANNEL_MIN or f.channel > CHANNEL_MAX:
+                continue              # 协议范围外的通道号：帧本身有问题
+            pipe = self._pipe_for(f.channel)
+            pipe._link = link
+            pipe.feed(f, need)
 
-        if self._since > max(need * 20, 400):
-            # 某一路长期不来（LED 没亮、协议变了）。不能默默停更 ——
-            # 界面必须说清是哪一路，否则看起来就只是「卡住了」。
-            self._starved = [f"{w:.0f}nm/{r:.0f}cm" for w, r in self._keys
-                             if (w, r) not in self._fresh
-                             or len(self.win[(w, r)]) < need]
-            self._since = 0
+        for p in self.pipes.values():
+            p.check_starved(need)
 
     def _resize(self, need: int) -> None:
-        """平均窗口长度变了 —— 重建队列，保留已有样本的尾部。"""
-        self.win = {k: deque(list(self.win.get(k, ()))[-need:], maxlen=need)
-                    for k in self._keys}
-        self._need = need
-
-    def _invert(self, I: np.ndarray, n_cycles: int) -> None:
-        from fnirs_pipeline.srs import compute_toi
-
-        res = compute_toi(I, self.geom)
-        t = self._now()
-        self.last_I = I
-        self.last_res = res
-        self.last_n = n_cycles
-        self.last_flags = res.flags
-        # ⚠️ 物理判据由 compute_toi 产出，这里只转达；质量层不重复计算。
-        self.last_qflags = self.quality.update(
-            net_by_channel=getattr(self, "_q_net", None),
-            n_used=getattr(self, "_last_used", 0),
-            n_rejected=self.last_rejected,
-            dark_level=getattr(self, "_q_dark", None),
-            link=getattr(self.worker, "stream", None),
-            physics_flags=res.flags)   # 现在只含真异常
-        if np.isfinite(res.toi):
-            self.t_hist.append(t)
-            self.toi_hist.append(res.toi)
-            for j, w in enumerate(WL):
-                self.mua_hist[w].append(res.mua[j])
-            self.thi_hist.append(res.thb_uM)
-        self._update_derived(res, I, t)
-
-    def _now(self) -> float:
-        """数据时刻，以第一帧为 0。还没收到帧时退回 0。"""
-        if self._t_data is None or self._t0_data is None:
-            return 0.0
-        return self._t_data - self._t0_data
+        """平均窗口长度变了 —— 各通道都重建队列，保留已有样本的尾部。"""
+        self._need_ui = need
+        for p in self.pipes.values():
+            p.resize(need)
 
     # -- 派生相对量 ---------------------------------------------------------
-    def _update_derived(self, res, I, t: float) -> None:
-        """每次反演后调用。判断全在 BaselineManager 里，这里只记历史。
-
-        整个包在 try 里 —— 这一格坏掉不能影响 TOI。
-        """
-        try:
-            d = self.bl.push(t, res, I)
-            self.last_derived = d
-            if d is not None:
-                self.td_hist.append(t)
-                for k in self.d_hist:
-                    self.d_hist[k].append(getattr(d, k))
-            if self.bl.auc.ref_toi is not None:
-                self.ta_hist.append(t)
-                self.auc_hist.append(self.bl.auc.value_min)
-        except Exception as e:                               # noqa: BLE001
-            self._derived_err = f"{type(e).__name__}: {e}"
-
-    def _break_derived_line(self) -> None:
-        """基线换了：在相对量曲线里插一个 NaN，断开前后两段。
-
-        历史**不清掉** —— 旧的那段是相对旧基线算的，本身没错，删了反而丢信息；
-        但两段不该连成一条线，否则重抓那一刻会画出一条假的跳变斜线。
-        """
-        if self.td_hist:
-            self.td_hist.append(self.td_hist[-1])
-            for d in self.d_hist.values():
-                d.append(float("nan"))
+    # `_update_derived` / `_break_derived_line` 已搬进 ChannelPipeline。
+    #
+    # 基线与 AUC 的操作口径（2026-10-29 定）：**一次操作、各通道各算各存**。
+    # 理由：抓基线是操作者在某个时刻的一个动作，这个时刻对所有通道相同；
+    # 但每个通道的基线**数值**必然不同（不同探头、不同部位），
+    # 所以动作广播、状态各存。
 
     def _on_capture(self) -> None:
-        self.bl.capture()
-        self.last_derived = None
-        self._break_derived_line()
+        for p in self.pipes.values():
+            p.capture_baseline()
+            p.break_derived_line()
 
     def _on_manual_toi(self) -> None:
-        if not self.bl.set_manual_toi(self.spn_bl_toi.value()):
+        # 先在"当前在看的"那条上试 —— 没有浓度基线时它会拒绝，
+        # 此时不该把别的通道也改掉。
+        if not self.pipe.bl.set_manual_toi(self.spn_bl_toi.value()):
             QtWidgets.QMessageBox.information(
                 self, "手填基线",
                 "还没有浓度基线 —— 先等自动基线，或点「抓取当前」。\n"
                 "手填只改 TOI 基线；ΔHbO/ΔHbR/ΔtHb/THI 需要抓取得到的浓度基线。")
             return
-        self._break_derived_line()
+        self.pipe.break_derived_line()
+        # ⚠️ 手填的 TOI 基线**只给当前通道** —— 操作者填的是看着这一路的
+        #    读数填的，广播给别的通道等于替它们编一个基线。
+        #    这与「抓取当前」不同：抓取是各通道各取自己此刻的值。
 
     def _on_auc_reset(self) -> None:
-        self.bl.reset_auc()
-        # AUC 曲线断开：复位前后不是同一笔账
-        if self.ta_hist:
-            self.ta_hist.append(self.ta_hist[-1])
-            self.auc_hist.append(float("nan"))
+        for p in self.pipes.values():
+            p.bl.reset_auc()
+            p.break_auc_line()      # 复位前后不是同一笔账，曲线断开
 
     def _on_mark(self) -> None:
         """事件标记：画竖线，并写进归档旁的 .events.csv。"""
@@ -1153,7 +1289,7 @@ class OnlineWindow(QtWidgets.QWidget):
                 if new:
                     fh.write("wall_time,t_host,t_rel_s,label\n")
                 wall = time.strftime("%Y-%m-%d %H:%M:%S")
-                t_host = "" if self._t_data is None else f"{self._t_data:.6f}"
+                t_host = "" if self.tb.t is None else f"{self.tb.t:.6f}"
                 safe = label.replace('"', "“")          # CSV 字段里不留裸引号
                 fh.write(f'{wall},{t_host},{t:.3f},"{safe}"\n')
         except Exception as e:                               # noqa: BLE001
@@ -1165,7 +1301,10 @@ class OnlineWindow(QtWidgets.QWidget):
         # 这一行正该说清「在等什么」。
         self._refresh_bars()
         self._refresh_chan_label()
-        if not hasattr(self, "last_res"):
+        # 搬进 ChannelPipeline 后，「还没出过值」是 last_res is None
+        # （改造前是"属性根本不存在"，由 _reset 里的 __dict__.pop 造出来）。
+        # 两者语义相同，但 hasattr 对 property 恒为真，必须改成 None 判断。
+        if self.last_res is None:
             self._refresh_wait()
             return
         self.txt_toi.setVisible(False)
@@ -1207,13 +1346,27 @@ class OnlineWindow(QtWidgets.QWidget):
                 it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
                 self.tbl.setItem(j, c, it)
 
+        # TOI 叠图：**每个通道各一条**，各用自己的时间轴（共享原点）。
+        # 不能共用当前通道的 ts —— 各通道的点数可能差一两个（扣暗要等
+        # 下一个暗时隙，谁先到谁先出点），长度对不上 setData 会报错。
+        for c, cur in self.c_toi_ch.items():
+            p = self.pipes.get(c)
+            if p is None or not p.t_hist:
+                cur.setData([], [])
+                continue
+            n = min(len(p.t_hist), len(p.toi_hist))
+            # connect="finite"：通道停一下再开会在历史里留一个 NaN，
+            # 直连会画出一条横跨空档的假斜线。
+            cur.setData(np.fromiter(p.t_hist, float, len(p.t_hist))[:n],
+                        np.fromiter(p.toi_hist, float, len(p.toi_hist))[:n],
+                        connect="finite")
+
         if self.t_hist:
             ts = np.fromiter(self.t_hist, float, len(self.t_hist))
-            self.c_toi.setData(ts, np.fromiter(self.toi_hist, float,
-                                               len(self.toi_hist)))
             for w, c in self.c_mua.items():
                 c.setData(ts, np.fromiter(self.mua_hist[w], float,
-                                          len(self.mua_hist[w])))
+                                          len(self.mua_hist[w])),
+                          connect="finite")
             self.c_thi.setData(ts, np.fromiter(self.thi_hist, float,
                                                len(self.thi_hist)),
                                connect="finite")
@@ -1261,17 +1414,19 @@ class OnlineWindow(QtWidgets.QWidget):
         self.p_toi.setYRange(0, 100, padding=0)
         self.txt_toi.setPos(need / 2.0, 50.0)
         # 一帧都没收到本通道的 —— 这不是「在攒」，是「没有」，要分开说
-        if self._n_chan_bad and not self._n_chan_ok:
+        mine, other = self._chan_counts()
+        if other and not mine:
             seen = "、".join(str(c) for c in sorted(self._chan_seen))
             self.txt_toi.setHtml(
                 "<div style='text-align:center;font-size:11pt;color:#c33'>"
                 f"<b>通道 {self.channel()} 没有数据</b><br>"
                 "<span style='font-size:9pt'>"
-                f"收到 {self._n_chan_bad} 帧，但都标着通道 {seen}。<br>"
-                "设备没有切换 —— 要么该通道无硬件，要么切换指令不对</span></div>")
+                f"收到 {other} 帧，都标着通道 {seen}。<br>"
+                "该通道没有回传 —— 要么没发过它的启动帧、要么被停止帧关掉了、"
+                "要么该通道无硬件</span></div>")
             self.txt_toi.setVisible(True)
             return
-        cps = self._fps / FRAMES_PER_CYCLE if self._fps > 0 else 0.0
+        cps = self._cycles_per_s()
         eta = f"，还差 {(need - n) / cps:.0f} s" if cps > 0 else ""
         self.txt_toi.setHtml(
             "<div style='text-align:center;font-size:11pt'>"
@@ -1363,6 +1518,31 @@ class OnlineWindow(QtWidgets.QWidget):
             self.worker.stop()
         self._stop_record()          # 关窗也要把归档文件正常收尾
         e.accept()
+
+
+# ---------------------------------------------------------------------------
+# 把测量态转发到「当前在看的通道」的流水线上。
+#
+# 为什么用生成的 property 而不是手写 32 个：手写就是 32 处可以各自写错的
+# 地方，而且以后往 ChannelPipeline 加状态时必然忘记同步。_FWD 是唯一的名单。
+#
+# 为什么连 setter 也给：`_on_capture` 之类的老代码会直接赋值
+# （如 `self.last_derived = None`）。给了 setter，那些代码一行不用改。
+def _install_forwarding(cls) -> None:
+    for name in cls._FWD:
+        def _mk(n=name):
+            def _get(self):
+                return getattr(self.pipe, n)
+
+            def _set(self, v):
+                setattr(self.pipe, n, v)
+            return property(_get, _set, doc=f"转发到 self.pipe.{n}")
+        if name in cls.__dict__:                 # 别覆盖手写的同名实现
+            raise RuntimeError(f"{cls.__name__} 已自有 {name}，不能再转发")
+        setattr(cls, name, _mk())
+
+
+_install_forwarding(OnlineWindow)
 
 
 # ---------------------------------------------------------------------------

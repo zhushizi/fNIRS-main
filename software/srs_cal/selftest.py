@@ -400,6 +400,57 @@ def t9_frame_timing() -> None:
            len(starts) == N and CYCLE_START_DISTANCE_CM == min(rhos),
            f"{len(starts)} 个起点，起点距离 {CYCLE_START_DISTANCE_CM}cm")
 
+    # --- 多通道：周期要按通道各记一套（2026-10-29）------------------------
+    # 真机实测：开通道 2 后通道**累加**，串口上一周期 24 帧、按波长交错。
+    # 改造前用一个全局计数器与 12 相比，几乎每个周期都被记成短周期
+    # （实测 51/52、127/128、93/94、129/130）—— 质量层持续报假警。
+    from srs_cal.protocol import frames_per_cycle
+
+    def one_cycle_ch(ch: int) -> bytes:
+        return b"".join(build_frame(w, r, 1000 + int(w), ch)
+                        for w in wls for r in rhos)
+
+    def interleaved(n: int) -> bytes:
+        """两个通道交错，逐波长/距离轮流 —— 与真机帧序一致。"""
+        out = []
+        for _ in range(n):
+            for w in wls:
+                for r in rhos:
+                    out.append(build_frame(w, r, 1000 + int(w), 1))
+                    out.append(build_frame(w, r, 2000 + int(w), 2))
+        return b"".join(out)
+
+    st5 = FrameStream(clock=lambda: 0.0)
+    fr5 = st5.feed(interleaved(4))
+    _check("9 多通道：总帧数 = 周期 × 12 × 通道数",
+           len(fr5) == 4 * FRAMES_PER_CYCLE * 2, f"{len(fr5)} 帧")
+    _check("9 多通道：不再误报短周期（改造前几乎每周期都报）",
+           st5.n_short_cycles == 0, f"短周期 {st5.n_short_cycles}（应 0）")
+    _check("9 多通道：每通道各自数满 4 个周期",
+           st5.cycles_of(1) == 4 and st5.cycles_of(2) == 4,
+           f"ch1={st5.cycles_of(1)} ch2={st5.cycles_of(2)}")
+    _check("9 多通道：cycle_id 按本通道递增，两通道各自从 0 起",
+           [f.cycle_id for f in fr5 if f.channel == 1] ==
+           [f.cycle_id for f in fr5 if f.channel == 2] ==
+           [i for i in range(4) for _ in range(FRAMES_PER_CYCLE)])
+    _check("9 多通道：channels_seen 以回传为准",
+           st5.channels_seen == (1, 2), f"{st5.channels_seen}")
+    _check("9 多通道：n_active 数出 2 个活跃通道",
+           st5.n_active == 2, f"{st5.n_active}")
+    _check("9 frames_per_cycle 随通道数成倍 —— 周期率换算要用它",
+           frames_per_cycle(1) == 12 and frames_per_cycle(2) == 24
+           and frames_per_cycle(4) == 48 and frames_per_cycle(0) == 12,
+           f"{[frames_per_cycle(i) for i in (0, 1, 2, 4)]}")
+    # 静默的通道不该再计入活跃数：否则关掉一个通道后周期率会一直偏低
+    st5.feed(one_cycle_ch(1), t_host=1000.0)
+    _check("9 多通道：静默超时的通道不再计入 n_active",
+           st5.n_active == 1, f"{st5.n_active}")
+    # 单通道口径必须与改造前**逐位相同**
+    _check("9 单通道时 n_cycles / cycle_id 口径不变",
+           st.n_cycles == N and st.cycles_of(1) == N and st.n_active == 1
+           and frames[-1].cycle_id == N - 1,
+           f"n_cycles={st.n_cycles} 末帧 cycle_id={frames[-1].cycle_id}")
+
 
 def t10_raw_archive() -> None:
     """10 原始帧归档：往返、轮转、总量上限、截断容错、出错不中断。
@@ -414,7 +465,8 @@ def t10_raw_archive() -> None:
 
     from srs_cal.archive import (MAGIC, REC_LEN, RawArchive, list_archives,
                                  read_header, read_records, replay)
-    from srs_cal.protocol import FRAME_LEN, FRAMES_PER_CYCLE, build_frame
+    from srs_cal.protocol import (FRAME_LEN, FRAMES_PER_CYCLE,
+                                  WAVELENGTH_BY_CODE, build_frame)
 
     wls = [0.0] + sorted(hw.WAVELENGTHS_ALL_NM.tolist())
     rhos = sorted(hw.RHO_CM.tolist())
@@ -462,6 +514,85 @@ def t10_raw_archive() -> None:
         _check("10 重放重建 cycle_id",
                [f.cycle_id for f in back] ==
                [i for i in range(5) for _ in range(FRAMES_PER_CYCLE)])
+
+        # --- 离线通道闸（2026-10-29）--------------------------------------
+        # 双通道归档里两通道的帧是交错的，而 DarkSubtractor 只认 (λ, ρ)、
+        # 不认通道 —— 不筛就会把 ch2 的暗（实测峰峰 786,447）扣到 ch1 的
+        # 信号上（ch1 的暗峰峰只有 11,461）。在线那两条链在处理前按 byte10
+        # 过滤过，离线没有那道闸，`replay(channel=)` 就是那道闸。
+        from srs_cal.archive import replay_channels
+        ar_mc = RawArchive(root / "mc", clock=lambda: 0.0)
+        st_mc = FrameStream()
+        wls_mc = [0.0] + sorted(WAVELENGTH_BY_CODE.values())
+        blob = b"".join(build_frame(w, r, (ch * 1000) + int(w), ch)
+                        for w in wls_mc for r in (3.0, 4.0) for ch in (1, 2))
+        ar_mc.write(st_mc.feed(blob, t_host=0.0))
+        ar_mc.close()
+        mc = list_archives(root / "mc")[0]
+        _check("10 replay 默认不筛通道（既有调用方的行为不变）",
+               len(replay(mc)) == FRAMES_PER_CYCLE * 2,
+               f"{len(replay(mc))} 帧")
+        r1, r2 = replay(mc, channel=1), replay(mc, channel=2)
+        _check("10 replay(channel=) 只给该通道的帧",
+               len(r1) == len(r2) == FRAMES_PER_CYCLE
+               and all(f.channel == 1 for f in r1)
+               and all(f.channel == 2 for f in r2),
+               f"ch1={len(r1)} ch2={len(r2)}")
+        _check("10 筛出来的是各自通道的 ADC，没有串台",
+               all(f.adc < 2000 for f in r1) and all(f.adc >= 2000 for f in r2))
+        grp = replay_channels(mc)
+        _check("10 replay_channels 按回传的 byte10 分组",
+               sorted(grp) == [1, 2]
+               and all(len(v) == FRAMES_PER_CYCLE for v in grp.values()),
+               f"{ {k: len(v) for k, v in grp.items()} }")
+
+        # --- 离线链路不筛通道会错多少（2026-10-29 实测抓到的真 bug）------
+        # `mbll_decoder.run.load` 原先把 replay() 的全部帧喂进**一个**
+        # DarkSubtractor，并按 cycle_id 建键。多通道下两件事同时错：
+        #   ① 另一通道的暗被扣到这一通道的信号上；
+        #   ② cycle_id 是按通道各自编号的，两个通道的同号周期撞进同一个键。
+        # 实测 20261029_162520：670nm 得 −2,613,581，而 ch1 真值 667,664
+        # —— 偏 491% 且**符号是反的**。这里用合成数据把这条钉住。
+        from srs_cal.darksub import DarkSubtractor as _DS
+
+        def _net_by_cycle(fs):
+            ds, per = _DS(), {}
+            for f in fs:
+                if f.cycle_id < 0:
+                    continue
+                got = (ds.feed_dark(f.distance_cm, f.t_host, float(f.adc))
+                       if f.is_dark else
+                       ds.feed_signal(f.wavelength_nm, f.distance_cm,
+                                      f.t_host, float(f.adc)))
+                for w, r, _t, v in got:
+                    if r == 3.0 and w == 670.0:
+                        per.setdefault(f.cycle_id, []).append(v)
+            return per
+
+        # ch1 暗 1000 / 信号 51000；ch2 暗 900000 / 信号 50000（像真机那样
+        # 量级完全不同），不筛通道必然串台
+        mix = RawArchive(root / "mix", clock=lambda: 0.0)
+        st_mx = FrameStream()
+        blob2 = b"".join(
+            build_frame(w, r, (1000 if ch == 1 else 900_000) if w == 0.0
+                        else ((51_000 if ch == 1 else 950_000)), ch)
+            for _cyc in range(3)
+            for w in wls_mc for r in (3.0, 4.0) for ch in (1, 2))
+        mix.write(st_mx.feed(blob2, t_host=0.0))
+        mix.close()
+        mixp = list_archives(root / "mix")[0]
+        pure = _net_by_cycle(replay(mixp, channel=1))
+        dirty = _net_by_cycle(replay(mixp))
+        v_pure = [v for vs in pure.values() for v in vs]
+        v_dirty = [v for vs in dirty.values() for v in vs]
+        _check("10 不筛通道会把另一通道的暗扣进来（这就是那条离线 bug）",
+               v_pure and v_dirty and max(abs(a - b) for a, b in
+                                          zip(v_dirty, v_pure)) > 1e5,
+               f"只 ch1 净值 {v_pure[0]:,.0f}　不筛 {v_dirty[0]:,.0f}")
+        _check("10 筛了通道之后净值就对了（= 信号 − 本通道的暗）",
+               v_pure and all(abs(v - (51_000 - 1000)) < 1e-6
+                              for v in v_pure),
+               f"{v_pure[:3]}，应全为 {51_000 - 1000:,}")
 
         # --- 轮转 ---------------------------------------------------------
         ticks = iter([0.0] + [i * 10.0 for i in range(1, 50)])
@@ -1619,40 +1750,79 @@ def t19_online_ui() -> None:
         sent: list = []
         win.worker = type("W", (), {"send": lambda self, b: sent.append(b)})()
         win.spn_bright.setValue(15)
-        win.cmb_chan.setCurrentIndex(2)          # 通道 3
-        _check("19 换通道立即下发，byte5=档位、byte6=通道",
-               sent and sent[-1][5] == 15 and sent[-1][6] == 3
-               and win.channel() == 3,
+        # 档位走防抖定时器，自检里没有事件循环等它 —— 直接调一次。
+        win._send_brightness()
+        _check("19 改档位立即下发，byte5=档位、byte6=当前查看的通道",
+               sent and sent[-1][5] == 15 and sent[-1][6] == win.channel(),
                format_frame(sent[-1])[:26] if sent else "没发")
-        _check("19 换通道后清屏（换探头 = 换光学套件，旧曲线与基线作废）",
-               len(win.toi_hist) == 0 and win.bl.baseline is None)
-        _check("19 非 1 号通道时提示标定不适用",
+        # ⚠️ 2026-10-29 改口：「查看」下拉是**纯视角切换**，不下发也不清屏。
+        #    改造前它会走 _send_brightness → 末尾清屏，于是"看一眼 2 号
+        #    再看回 1 号"会把两边的曲线都清掉、每次都要重新攒窗口。
+        #    多通道同时计算的意义就是数据已经在后台算着，切过去该立刻就有。
+        #    设备控制已经归开关复选框（启停）和档位框（光强）了。
+        n_before = len(sent)
+        win.cmb_chan.setCurrentIndex(2)          # 通道 3
+        _check("19 切换「查看」通道**不下发**（设备控制归开关与档位框）",
+               len(sent) == n_before and win.channel() == 3,
+               f"切视角后又发了 {len(sent) - n_before} 帧")
+        # 标定警告要在**该通道真有数据**时出现 —— 那才是会误导人的情况
+        # （屏上有一个像模像样的 TOI，但它是拿 1 号的 G(λ) 算的）。
+        # 没数据时优先报「无数据」，那条更要紧，见 _refresh_chan_label。
+        win._on_frames(frames(0, 5, channel=3))
+        win._refresh_chan_label()
+        _check("19 非 1 号通道**且有数据**时，提示标定不适用（共用 1 号的标定）",
                "标定" in win.lbl_chan.text() and "通道 3" in win.lbl_chan.text(),
-               win.lbl_chan.text()[:40])
+               win.lbl_chan.text()[:44])
+        win.pipes[3].reset()
+        win.pipes[3].n_frames = 0        # 还原，后面还要验「通道 3 无数据」
 
         # --- 以回传为准：byte10 不符就当没有，不拿来充数 --------------------
         win._on_frames(frames(0, 40))            # 这些帧 byte10 恒为 1
         win._refresh()
+        # 看的是**每条流水线自己的**帧数（_chan_counts），不是窗口级累计 ——
+        # 后者切换查看通道时不归零，会把别的通道的帧算到这一个头上。
+        mine, other = win._chan_counts()
         _check("19 选通道 3 却只收到标着通道 1 的帧 → 一个点都不出",
-               len(win.toi_hist) == 0 and win._n_chan_ok == 0
-               and win._n_chan_bad > 0,
-               f"收 {win._n_chan_bad} 帧全部丢弃")
+               len(win.toi_hist) == 0 and mine == 0 and other > 0,
+               f"本通道 {mine} 帧，其他通道 {other} 帧")
+        # 提示的口径 2026-10-29 改过：原先说「设备未切换」，但通道其实是
+        # 累加的、切换也确实生效了，收不到只说明该通道没在回传（没发启动帧／
+        # 被停止帧关了／无硬件）。判据跟着改成「没有回传」。
         _check("19 界面明说「没有」，不是「在攒」",
                "没有数据" in win.txt_toi.toPlainText()
-               and "✗" in win.lbl_chan.text() and "未切换" in win.lbl_chan.text(),
+               and "✗" in win.lbl_chan.text()
+               and "没有回传" in win.lbl_chan.text(),
                win.lbl_chan.text()[:44])
 
         win.cmb_chan.setCurrentIndex(0)          # 回通道 1
         win._on_frames(frames(40, 40))
         win._refresh()
+        mine, other = win._chan_counts()
         _check("19 回到通道 1：帧被收下，提示撤掉",
-               win._n_chan_ok > 0 and win._n_chan_bad == 0
-               and win.lbl_chan.text() == "",
-               f"收下 {win._n_chan_ok} 帧")
+               mine > 0 and other == 0 and win.lbl_chan.text() == "",
+               f"本通道收下 {mine} 帧，其他通道 {other} 帧")
         _check("19 指令帧仍与厂家样例逐字节一致（档位0、通道1）",
                build_brightness(0x00) == bytes.fromhex(
                    "55AA1A010100010000000000000000000000000000000000001D"),
                format_frame(build_brightness(0x00)))
+
+        # --- 两个固定帧按钮：逐字节对着**用户给的那串**验 --------------------
+        n0 = len(sent)
+        win._on_cmd_start_ch2()
+        _check("19 「启动通道2」送出的字节与指定值逐字节相同",
+               sent[-1] == bytes.fromhex(
+                   "55AA1A0101640200000000000000000000000000000000000082")
+               and win.spn_bright.value() == 100 and win.channel() == 2
+               and len(sent) == n0 + 1,
+               f"档位 {win.spn_bright.value()}　通道 {win.channel()}　"
+               f"本次发 {len(sent) - n0} 帧")
+        win._on_cmd_stop_ch1()
+        _check("19 「关闭通道一」byte4=00，不被重造成启动帧",
+               sent[-1] == bytes.fromhex(
+                   "55AA1A010000010000000000000000000000000000000000001C")
+               and sent[-1][4] == 0x00 and len(sent) == n0 + 2,
+               f"末帧 byte4={sent[-1][4]:02X}，共发 {len(sent) - n0} 帧")
+        win.cmb_chan.setCurrentIndex(0)          # 回通道 1，别影响后面的清屏断言
         win.worker = None
 
         # --- 清屏 -----------------------------------------------------------
@@ -1676,6 +1846,501 @@ def t19_online_ui() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t20_acquire_channel() -> None:
+    """20 acquire 的通道选择（2026-10-29）：下发、以回传校验、入库记录。"""
+    print("\n[20] acquire 通道：下发 byte6 / 回传 byte10 校验 / 写进 xlsx")
+    import os
+    import tempfile
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5 import QtWidgets
+
+    from srs_cal import acquire as acq
+    from srs_cal.protocol import (CHANNEL_MAX, CHANNEL_MIN, EXPECTED_CHANNEL,
+                                  Frame, build_brightness, build_frame)
+    from srs_cal.run_calibration import load_xlsx
+
+    class _FakeWorker:
+        """只记下发出去的字节，不碰串口。"""
+
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+
+        def send(self, payload: bytes) -> None:
+            self.sent.append(payload)
+
+        def stop(self) -> None:
+            pass
+
+    def frames(channel: int, n_cycles: int = 1):
+        """一个完整扫描周期 = (1 暗 + 5 波长) × 2 距离。
+
+        `raw` 用 `build_frame` 造真字节 —— acquire 的终端打印会去校验它，
+        给 `b""` 会在打印那一行抛 IndexError（本块第一版就是这么挂的）。
+        """
+        out = []
+        for _ in range(n_cycles):
+            for rho in acq.RHOS:
+                for w, adc in [(0.0, 850_000)] + [(x, 880_000) for x in acq.WLS]:
+                    out.append(Frame(wavelength_nm=w, distance_cm=rho, adc=adc,
+                                     channel=channel,
+                                     raw=build_frame(w, rho, adc, channel)))
+        return out
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    win = acq.MainWindow(simulate=True)
+    win.chk_print.setChecked(False)          # 否则 144 帧全打到自检输出里
+    try:
+        _check("20 下拉框有 CHANNEL_MIN~CHANNEL_MAX 共 4 项，默认 1",
+               win.cmb_chan.count() == CHANNEL_MAX - CHANNEL_MIN + 1
+               and win.channel() == EXPECTED_CHANNEL,
+               f"{win.cmb_chan.count()} 项，当前 {win.channel()}")
+
+        # --- 下发：档位与通道同一帧 -----------------------------------------
+        win.worker = _FakeWorker()
+        win.spn_bright.setValue(0x0F)
+        win.cmb_chan.setCurrentIndex(win.cmb_chan.findData(3))
+        sent = win.worker.sent[-1]
+        _check("20 换通道立即下发，byte5=档位、byte6=通道",
+               sent == build_brightness(0x0F, 3)
+               and sent[5] == 0x0F and sent[6] == 3,
+               sent.hex(" ").upper()[:29])
+        _check("20 下发后 channel_in_effect 跟上（未连接时不乱报）",
+               win.channel_in_effect() == 3)
+
+        # --- 回传校验：说好的通道 3，来的却都是通道 1 -------------------------
+        win.on_frames(frames(1, n_cycles=4))
+        win._refresh_chan_label()
+        _check("20 选通道 3 却只收到标着通道 1 的帧 → 一帧都不收",
+               win._n_chan_ok == 0 and win._n_chan_bad == 48
+               and win.latest == {},
+               f"收 {win._n_chan_bad} 帧全部丢弃，实时表 {len(win.latest)} 项")
+        _check("20 界面明说「没有」，不是「在攒」",
+               "无数据" in win.lbl_chan.text()
+               and "没有回传" in win.lbl_chan.text(),
+               win.lbl_chan.text()[:34])
+        _check("20 原始帧窗口仍留着这些帧（丢的只是显示与入库，不是证据）",
+               len(win.raw_buf) == 48)
+
+        # --- 这种状态下不许开采：进度条停在 0% 比报错更难查 -------------------
+        n_takes = len(win.takes)
+        win.start_capture("A2")
+        _check("20 本通道没有数据时拦住采集，不让进度条空转",
+               win.capturing is None and len(win.takes) == n_takes
+               and "没开始采集" in win.lbl_banner.text(),
+               win.lbl_banner.text()[:30])
+
+        # --- 回到通道 1：帧被收下 ---------------------------------------------
+        win.cmb_chan.setCurrentIndex(win.cmb_chan.findData(1))
+        _check("20 换通道清掉实时读数（旧通道的数字不能留在屏上）",
+               win.latest == {} and win._n_chan_bad == 0
+               and all(l.text() == "—" for l in win.live_lbl.values()))
+        win.on_frames(frames(1, n_cycles=4))
+        win._refresh_chan_label()
+        _check("20 回到通道 1：帧被收下，提示撤掉",
+               win._n_chan_ok == 48 and win._n_chan_bad == 0
+               and win.lbl_chan.text() == "",
+               f"收下 {win._n_chan_ok} 帧")
+
+        # --- 采集一次，通道要进 Take 与 xlsx ---------------------------------
+        win.spn_frames.setValue(24)
+        win.start_capture("A2")
+        _check("20 本通道有数据时正常开采", win.capturing == "A2")
+        win.on_frames(frames(1, n_cycles=6))
+        _check("20 Take 记下**经校验的**通道号",
+               len(win.takes) == 1 and win.takes[0].channel == 1,
+               f"channel={win.takes[0].channel if win.takes else None}")
+
+        # --- 两条固定的协议测试帧 ------------------------------------------
+        # 逐字节对着**用户给的那串**验，不是对着我们自己造的 —— 按钮送出去的
+        # 必须就是这 26 个字节。
+        WANT_CH2 = bytes.fromhex(
+            "55AA1A0101640200000000000000000000000000000000000082")
+        WANT_STOP = bytes.fromhex(
+            "55AA1A010000010000000000000000000000000000000000001C")
+        _check("20 对照串本身就是 26 字节（上一版拆成两段写多了一个字节）",
+               len(WANT_CH2) == 26 and len(WANT_STOP) == 26,
+               f"{len(WANT_CH2)} / {len(WANT_STOP)} 字节")
+        win.worker = _FakeWorker()
+        win.cmb_chan.setCurrentIndex(win.cmb_chan.findData(1))
+        win._on_cmd_start_ch2()
+        _check("20 「启动通道2」送出的字节与指定值逐字节相同",
+               win.worker.sent[-1] == WANT_CH2,
+               win.worker.sent[-1].hex(" ").upper()[:23] + " … "
+               + f"{win.worker.sent[-1][-1]:02X}")
+        _check("20 「启动通道2」后界面跟上（档位 100、通道 2），且不二次下发",
+               win.spn_bright.value() == 100 and win.channel() == 2
+               and len(win.worker.sent) == 1,
+               f"档位 {win.spn_bright.value()}　通道 {win.channel()}　"
+               f"共发 {len(win.worker.sent)} 帧")
+        win._on_cmd_stop_ch1()
+        _check("20 「关闭通道一」送出的字节与指定值逐字节相同（byte4=00 停止）",
+               win.worker.sent[-1] == WANT_STOP
+               and win.worker.sent[-1][4] == 0x00,
+               win.worker.sent[-1].hex(" ").upper()[:23] + " … "
+               + f"{win.worker.sent[-1][-1]:02X}")
+        _check("20 关闭帧不会被重造成启动帧（走的是固定字节那条路）",
+               win.spn_bright.value() == 0 and win.channel() == 1
+               and len(win.worker.sent) == 2,
+               f"共发 {len(win.worker.sent)} 帧，"
+               f"末帧 byte4={win.worker.sent[-1][4]:02X}")
+        _check("20 固定帧按钮把对应通道的复选框也调过来（界面不与字节分叉）",
+               win.chk_ch[2].isChecked() and not win.chk_ch[1].isChecked(),
+               f"{ {c: win.chk_ch[c].isChecked() for c in sorted(win.chk_ch)} }")
+
+        # --- 每通道开关（2026-10-29 新增，与 online 同一套做法）------------
+        from srs_cal.protocol import CMD_START as _START
+        from srs_cal.protocol import CMD_STOP as _STOP
+        _check("20 四个通道各有一个开关复选框",
+               sorted(win.chk_ch) == list(range(CHANNEL_MIN, CHANNEL_MAX + 1)))
+        # ⚠️ 起始状态要显式摆正：前面那些下发已经把 3 号的复选框带成勾选了，
+        #    直接 setChecked(True) 是空操作、不发信号、一帧也不发。
+        #    （第一版就栽在这里，自检报「一帧没发」。）
+        win.chk_ch[3].blockSignals(True)
+        win.chk_ch[3].setChecked(False)
+        win.chk_ch[3].blockSignals(False)
+        win.worker.sent.clear()
+        win.chk_ch[3].setChecked(True)
+        _check("20 勾选通道 3 → 启动帧 byte4=01、byte6=03，档位是 3 号自己的",
+               len(win.worker.sent) == 1
+               and win.worker.sent[-1][4] == _START
+               and win.worker.sent[-1][6] == 0x03
+               and win.worker.sent[-1][5] == win._gear_by_ch[3],
+               win.worker.sent[-1].hex(" ").upper()[:20]
+               if win.worker.sent else "一帧没发")
+        win.worker.sent.clear()
+        win.chk_ch[3].setChecked(False)
+        _check("20 取消通道 3 → 停止帧 byte4=00、byte6=03",
+               len(win.worker.sent) == 1
+               and win.worker.sent[-1][4] == _STOP
+               and win.worker.sent[-1][6] == 0x03,
+               win.worker.sent[-1].hex(" ").upper()[:20]
+               if win.worker.sent else "一帧没发")
+        # 采集进行中不许改设备状态 —— 会让这一次的数据前后不一致
+        win.worker.sent.clear()
+        win.capturing = "B3"
+        win.chk_ch[4].setChecked(True)
+        _check("20 采集进行中：开关不下发，且复选框弹回原状（不假装生效）",
+               not win.worker.sent and not win.chk_ch[4].isChecked()
+               and "采集进行中" in win.lbl_banner.text(),
+               f"发了 {len(win.worker.sent)} 帧，"
+               f"ch4={win.chk_ch[4].isChecked()}")
+        win.capturing = None
+
+        path = Path(tempfile.gettempdir()) / "_srs_cal_chan.xlsx"
+        try:
+            acq.write_workbook(path, win.takes, simulate=True)
+            from openpyxl import load_workbook
+            wb = load_workbook(path)
+            head = [c.value for c in wb["明细"][1]]
+            col = head.index("channel")
+            _check("20 「明细」有 channel 列，且每行都填上了",
+                   all(r[col].value == 1 for r in wb["明细"].iter_rows(min_row=2)),
+                   f"列 {col}，{wb['明细'].max_row - 1} 行")
+            _check("20 「汇总」末尾加「通道」列，混采时会显形",
+                   wb["汇总"][1][-1].value == "通道")
+            meta = {r[0].value: r[1].value for r in wb["元信息"].iter_rows()}
+            _check("20 「元信息」记下本次通道与「换通道 G(λ) 不迁移」的警告",
+                   "采集通道" in meta and "G(λ) 不迁移" in meta["采集通道"])
+            # 加了两列之后，run_calibration 必须照样能读 —— 它按列名取值
+            I, codes = load_xlsx(path)
+            _check("20 加列不破坏 run_calibration 的读取（它按列名取）",
+                   I.shape == (1, WL.size, 2) and tuple(codes) == ("A2",),
+                   f"{I.shape}，块 {tuple(codes)}")
+        finally:
+            if path.exists():
+                os.unlink(path)
+    finally:
+        win.worker = None
+        win.close()
+
+
+def t21_multichannel_pipelines() -> None:
+    """21 多通道同时计算：分发隔离 / 各通道独立 / 按通道清屏 / 转发跟着视角走。
+
+    2026-10-29 新增。改造前 online 只算"选中的那个通道"，别的通道的帧在
+    处理前就被 `continue` 丢掉；现在每个回传过的通道各建一条流水线一起算。
+
+    这一组判据要守住的是**最容易出错也最看不出来的那件事**：
+    两个通道的数据不能互相污染。污染了界面上看不出来 —— 曲线照样平滑，
+    只是数字是错的。所以这里用「同时喂两个通道」与「只喂一个通道」
+    逐点比对，而不是看曲线像不像。
+
+    ⚠️ 改造当时还做了一次性的**改造前后等价性**验收（不在本自检里，
+       因为那需要改造前的代码）：5 份真实归档 × 2 通道 = 10 个组合、
+       156 个 TOI 点，`toi/thi/t/td/ta/auc/d_hist/mua` 全部逐点逐位相同。
+       数据见 .claude/变更记录/2026-10-29.md。
+    """
+    print("\n[21] 多通道同时计算")
+    import tempfile
+    from pathlib import Path
+
+    from PyQt5 import QtWidgets
+
+    from srs_cal.online import CAL_DIR, DEFAULT_CAL, Calibration, OnlineWindow
+    from srs_cal.protocol import Frame
+
+    # 1 号通道用正常信号；2 号故意小一截，这样一旦串台，数值立刻不同。
+    NET = {(670.0, 3.0): 113641, (670.0, 4.0): 18108,
+           (770.0, 3.0): 343269, (770.0, 4.0): 56690}
+    DARK, DT = 1000, 1.5213
+
+    def frames(c0, n, channel=1, scale=None):
+        """`scale` 是 {(波长, 距离): 倍数}。
+
+        ⚠️ 造"另一个通道"时要让 **TOI 真的不同**，否则「没串台」这条
+           判据形同虚设。两种不够的做法，都是这次自检里试出来的：
+             ① 整体乘一个常数：I3/I4 不变 → TOI 一点不变
+                （这正是"改档位对 SRS 安全"的原因，见 protocol.build_brightness）；
+             ② 只压 4cm 但两个波长一起压：两路 μeff 同向平移，
+                μeff 之比变化很小 —— 实测 TOI 只差 0.30 点。
+           所以这里只压 **670 的 4cm**：单独改一路的空间斜率，
+           μeff 之比才真正变，TOI 差到 5 点以上。
+        """
+        scale = scale or {}
+        out = []
+        for cyc in range(c0, c0 + n):
+            base = cyc * DT
+            for rho in (3.0, 4.0):
+                out.append(Frame(wavelength_nm=0.0, distance_cm=rho, adc=DARK,
+                                 channel=channel, raw=b"", t_host=base,
+                                 cycle_id=cyc))
+                for j, wlx in enumerate(hw.WAVELENGTHS_ACTIVE_NM):
+                    k = (float(wlx), rho)
+                    out.append(Frame(
+                        wavelength_nm=float(wlx), distance_cm=rho,
+                        adc=int(NET[k] * scale.get(k, 1.0)) + DARK,
+                        channel=channel, raw=b"", t_host=base + 0.1 * (j + 1),
+                        cycle_id=cyc))
+        return out
+
+    CH2_SCALE = {(670.0, 4.0): 0.55}    # 只压 670/4cm → μeff 之比真的变
+    N_CYC = 30
+    PER_CYC = len(frames(0, 1))     # (1暗 + 在用波长数) × 距离数，别手写
+
+    def interleave(c0, n):
+        """两通道按到达顺序交错 —— 与真机帧序一致（实测按波长交错）。"""
+        a, b = frames(c0, n, 1), frames(c0, n, 2, CH2_SCALE)
+        return [x for pair in zip(a, b) for x in pair]
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def run(feed, view=1):
+        tmp = Path(tempfile.mkdtemp(prefix="online_t21_"))
+        w = OnlineWindow(Calibration.load(CAL_DIR / DEFAULT_CAL),
+                         archive_dir=tmp)
+        w.chk_rec.setChecked(False)
+        w.archive = None
+        if view != 1:
+            w.cmb_chan.setCurrentIndex(w.cmb_chan.findData(view))
+        w._on_frames(feed)
+        return w
+
+    # --- ① 分发隔离：同时喂两个通道，1 号的结果必须与单喂 1 号逐点相同 ----
+    solo = run(frames(0, N_CYC, 1))
+    both = run(interleave(0, N_CYC))
+    s = list(solo.pipes[1].toi_hist)
+    b1 = list(both.pipes[1].toi_hist)
+    _check("21 同时算两个通道时，1 号的 TOI 与单独算它**逐点相同**",
+           len(s) > 0 and s == b1,
+           f"单喂 {len(s)} 点 / 同喂 {len(b1)} 点，"
+           f"末点 {s[-1]:.6f} vs {b1[-1] if b1 else float('nan'):.6f}")
+    _check("21 两条流水线都建起来了，且各自收到自己的帧",
+           sorted(both.pipes) == [1, 2]
+           and both.pipes[1].n_frames == both.pipes[2].n_frames
+           == N_CYC * PER_CYC,
+           f"{ {c: p.n_frames for c, p in sorted(both.pipes.items())} }"
+           f"，应各 {N_CYC * PER_CYC}")
+    t2 = list(both.pipes[2].toi_hist)
+    _check("21 2 号通道独立出值，且与 1 号明显不同（没有串台）",
+           len(t2) == len(b1) and t2 != b1
+           and abs(t2[-1] - b1[-1]) > 5.0,
+           f"ch1 {b1[-1]:.4f}　ch2 {t2[-1]:.4f}　差 "
+           f"{abs(t2[-1] - b1[-1]):.4f} 点")
+
+    # --- ② 扣暗器各自独立：2 号的暗绝不能扣到 1 号的信号上 ----------------
+    _check("21 两通道各有自己的扣暗器与暗窗（共用会把别人的暗扣进来）",
+           both.pipes[1]._darksub is not both.pipes[2]._darksub
+           and both.pipes[1].dark_win is not both.pipes[2].dark_win
+           and both.pipes[1].bl is not both.pipes[2].bl
+           and both.pipes[1].quality is not both.pipes[2].quality)
+
+    # --- ③ 转发属性跟着"在看哪个通道"走 ----------------------------------
+    _check("21 界面读到的是当前查看通道的历史（默认 1 号）",
+           both._view_ch == 1 and list(both.toi_hist) == b1)
+    both._view_ch = 2
+    _check("21 切换查看通道后，界面读到的换成 2 号的历史",
+           list(both.toi_hist) == t2 and both.toi_hist is both.pipes[2].toi_hist)
+    both._view_ch = 1
+
+    # --- ④ 时间轴共享：两通道的曲线要能叠在一张图上比 ---------------------
+    _check("21 两通道共享时间原点（各自取原点会假造出一个时间差）",
+           both.pipes[1].tb is both.pipes[2].tb
+           and list(both.pipes[1].t_hist) == list(both.pipes[2].t_hist),
+           f"t0={both.tb.t0}")
+
+    # --- ⑤ 按通道清屏：档位是按通道生效的，清屏也该按通道 -----------------
+    both._reset(channels=[2])
+    _check("21 只清 2 号：它清空了，1 号的历史纹丝不动",
+           len(both.pipes[2].toi_hist) == 0
+           and list(both.pipes[1].toi_hist) == b1,
+           f"ch1 {len(both.pipes[1].toi_hist)} 点　ch2 "
+           f"{len(both.pipes[2].toi_hist)} 点")
+    both._reset()
+    _check("21 不带参数的清屏清掉全部通道（工具栏「清屏」的语义）",
+           all(len(p.toi_hist) == 0 for p in both.pipes.values())
+           and not both.events)
+
+    # --- ⑥ 协议范围外的通道号不建流水线 ----------------------------------
+    odd = run(frames(0, 2, 1) + frames(0, 2, 9))      # 9 超出 CHANNEL_MAX
+    _check("21 通道号超出 1~4 的帧不建流水线（那是帧本身有问题）",
+           sorted(odd.pipes) == [1], f"{sorted(odd.pipes)}")
+
+    # --- ⑦ 来回切换查看通道，两边的曲线都不能被清掉 ----------------------
+    # 用户 2026-10-29 报的那个问题：在 1 号等曲线画满 → 点开 2 号看 → 切回
+    # 1 号，结果两边都重新开始攒。根因是「查看」下拉当时还会走下发那条路，
+    # 而下发末尾要清屏。这一条就是钉住它。
+    sw = run(interleave(0, N_CYC))
+    n1_before = len(sw.pipes[1].toi_hist)
+    n2_before = len(sw.pipes[2].toi_hist)
+    sw.worker = type("W", (), {"send": lambda self, b: None,
+                               "stop": lambda self: None})()
+    seen_sent: list = []
+    sw.worker.send = lambda b: seen_sent.append(bytes(b))
+    sw.cmb_chan.setCurrentIndex(sw.cmb_chan.findData(2))   # 去看 2 号
+    sw.cmb_chan.setCurrentIndex(sw.cmb_chan.findData(1))   # 再看回 1 号
+    _check("21 来回切换查看通道：两边的曲线都还在（不重新攒窗口）",
+           len(sw.pipes[1].toi_hist) == n1_before > 0
+           and len(sw.pipes[2].toi_hist) == n2_before > 0,
+           f"ch1 {n1_before}→{len(sw.pipes[1].toi_hist)}　"
+           f"ch2 {n2_before}→{len(sw.pipes[2].toi_hist)}")
+    _check("21 切换查看通道不下发任何指令（它只决定画谁）",
+           not seen_sent, f"发了 {len(seen_sent)} 帧")
+    _check("21 切回来后界面读到的仍是 1 号的历史",
+           sw._view_ch == 1 and sw.c_toi is sw.c_toi_ch[1]
+           and len(sw.toi_hist) == n1_before)
+
+    # --- ⑧ 停一个通道：历史留着、画一道断口，而不是清掉 ------------------
+    # ⚠️ 起始状态要显式摆正：构造时只有 1 号的复选框是勾上的，
+    #    直接 setChecked(False) 是空操作、不发信号、什么都不会发生。
+    sw.chk_ch[2].blockSignals(True)
+    sw.chk_ch[2].setChecked(True)
+    sw.chk_ch[2].blockSignals(False)
+    seen_sent.clear()
+    sw.chk_ch[2].setChecked(False)
+    p2 = sw.pipes[2]
+    _check("21 停掉 2 号：历史保留并插入断口（清掉等于把停它的理由也扔了）",
+           len(p2.toi_hist) == n2_before + 1
+           and np.isnan(p2.toi_hist[-1])
+           and p2.t_hist[-1] == p2.t_hist[-2],
+           f"{n2_before} → {len(p2.toi_hist)} 点，"
+           f"末点 {'NaN' if np.isnan(p2.toi_hist[-1]) else p2.toi_hist[-1]}")
+    sw.chk_ch[2].setChecked(True)
+    _check("21 再开回来不重复插断口（连插几道会在图上留一串空洞）",
+           len(p2.toi_hist) == n2_before + 1)
+    # 而**改档位**仍然要清屏 —— 光强变了，旧曲线不是同一条件下的
+    sw.spn_bright.setValue(123)
+    sw._send_brightness()
+    _check("21 改当前通道的档位仍然清屏（光强变了，旧曲线不可比）",
+           len(sw.pipes[1].toi_hist) == 0
+           and len(sw.pipes[2].toi_hist) == n2_before + 1,
+           f"ch1 {len(sw.pipes[1].toi_hist)} 点（应 0）　"
+           f"ch2 {len(sw.pipes[2].toi_hist)} 点（应不动）")
+
+    # --- ⑨ 「清屏」按钮：clicked 会多塞一个 False 实参 -------------------
+    # _reset 加了 `channels` 形参之后，直连 clicked 会收到 channels=False，
+    # `for c in False` 当场抛 TypeError。这一条盯的就是那个坑。
+    w2 = run(frames(0, 30, 1))
+    try:
+        w2.btn_reset.click()
+        ok, why = len(w2.pipes[1].toi_hist) == 0, ""
+    except TypeError as e:
+        ok, why = False, f"{type(e).__name__}: {e}"
+    _check("21 「清屏」按钮点下去不报错且真清掉（clicked 会多传一个 False）",
+           ok, why)
+
+    # --- ⑩ 每通道独立开关：发出去的字节必须是对的那一个 -------------------
+    from srs_cal.protocol import CMD_START, CMD_STOP, FRAME_LEN
+    sent: list[bytes] = []
+    w3 = run(frames(0, 2, 1))
+    w3.worker = type("W", (), {"send": lambda self, b: sent.append(bytes(b)),
+                               "stop": lambda self: None})()
+    _check("21 四个通道各有一个开关复选框，1 号初始勾上（上电默认在发它）",
+           sorted(w3.chk_ch) == [1, 2, 3, 4]
+           and w3.chk_ch[1].isChecked()
+           and not any(w3.chk_ch[c].isChecked() for c in (2, 3, 4)),
+           f"{ {c: w3.chk_ch[c].isChecked() for c in sorted(w3.chk_ch)} }")
+
+    sent.clear()
+    w3.spn_bright.setValue(200)          # 1 号通道的档位
+    w3._send_brightness()
+    w3.cmb_chan.setCurrentIndex(w3.cmb_chan.findData(2))
+    w3.spn_bright.setValue(90)           # 2 号通道的档位
+    w3._send_brightness()
+    _check("21 档位按通道各记一份（切回去不会把别人的档位发给它）",
+           w3._gear_by_ch[1] == 200 and w3._gear_by_ch[2] == 90,
+           f"{ {c: w3._gear_by_ch[c] for c in (1, 2)} }")
+    w3.cmb_chan.setCurrentIndex(w3.cmb_chan.findData(1))
+    _check("21 切回 1 号，档位框显示的是 1 号自己的 200（不是 2 号的 90）",
+           w3.spn_bright.value() == 200, f"{w3.spn_bright.value()}")
+
+    sent.clear()
+    w3.chk_ch[3].setChecked(True)        # 开 3 号
+    _check("21 勾选通道 3 → 启动帧 byte4=01、byte6=03，档位是 3 号自己的",
+           len(sent) == 1 and len(sent[-1]) == FRAME_LEN
+           and sent[-1][3] == 0x01 and sent[-1][4] == CMD_START
+           and sent[-1][6] == 0x03
+           and sent[-1][5] == w3._gear_by_ch[3],
+           " ".join(f"{b:02X}" for b in sent[-1][:7]) if sent else "一帧没发")
+    sent.clear()
+    w3.chk_ch[3].setChecked(False)       # 关 3 号
+    _check("21 取消通道 3 → 停止帧 byte4=00、byte6=03（不被重造成启动帧）",
+           len(sent) == 1 and sent[-1][4] == CMD_STOP and sent[-1][6] == 0x03,
+           " ".join(f"{b:02X}" for b in sent[-1][:7]) if sent else "一帧没发")
+    sent.clear()
+    w3.chk_ch[2].setChecked(False)
+    _check("21 关 2 号发的是 2 号的停止帧 —— 不是硬编码的「关闭通道一」",
+           len(sent) == 1 and sent[-1][4] == CMD_STOP and sent[-1][6] == 0x02,
+           " ".join(f"{b:02X}" for b in sent[-1][:7]) if sent else "一帧没发")
+    # 固定帧按钮与复选框不能分叉
+    sent.clear()
+    w3._on_cmd_start_ch2()
+    _check("21 「启动通道2」把 2 号的复选框也勾上（界面不与发出的字节分叉）",
+           w3.chk_ch[2].isChecked() and sent and sent[-1][4] == CMD_START
+           and sent[-1][6] == 0x02)
+    sent.clear()
+    w3._on_cmd_stop_ch1()
+    _check("21 「关闭通道一」把 1 号的复选框取消",
+           not w3.chk_ch[1].isChecked() and sent
+           and sent[-1][4] == CMD_STOP and sent[-1][6] == 0x01)
+
+    # --- ⑪ TOI 叠图：每通道一条曲线，各画自己的点 ------------------------
+    _check("21 TOI 图有 4 条通道曲线，各自颜色不同",
+           sorted(both.c_toi_ch) == [1, 2, 3, 4]
+           and len({both.c_toi_ch[c].opts["pen"].color().name()
+                    for c in (1, 2, 3, 4)}) == 4)
+    both2 = run(interleave(0, N_CYC))
+    both2._refresh()
+    x1, y1 = both2.c_toi_ch[1].getData()
+    x2, y2 = both2.c_toi_ch[2].getData()
+    x3, _ = both2.c_toi_ch[3].getData()
+    _check("21 叠图上 1 号与 2 号各画出自己的曲线，没数据的通道是空的",
+           x1 is not None and len(x1) > 0 and len(x2) == len(x1)
+           and not np.array_equal(y1, y2)
+           and (x3 is None or len(x3) == 0),
+           f"ch1 {len(x1)} 点　ch2 {len(x2)} 点　"
+           f"ch3 {0 if x3 is None else len(x3)} 点")
+    _check("21 c_toi 跟着「查看」下拉走（既有代码按这个名字读）",
+           both2.c_toi is both2.c_toi_ch[1]
+           and (both2.cmb_chan.setCurrentIndex(
+               both2.cmb_chan.findData(2)) or True)
+           and both2.c_toi is both2.c_toi_ch[2])
+
+    for w in (solo, both, both2, odd, sw, w2, w3):
+        w.worker = None
+        w.close()
+
+
 def main() -> int:
     print("=" * 72)
     print("srs_cal 自检 —— 新硬件 (670/770/810/850 nm, ρ=3.0/4.0 cm)")
@@ -1689,7 +2354,8 @@ def main() -> int:
                t13_quality_layer, t14_dark_subtraction,
                t15_mbll_decoder, t16_mbll_live,
                t17_derived_quantities, t18_baseline_manager,
-               t19_online_ui):
+               t19_online_ui, t20_acquire_channel,
+               t21_multichannel_pipelines):
         fn()
     n_ok = sum(1 for _, ok in _RESULTS if ok)
     print("\n" + "=" * 72)

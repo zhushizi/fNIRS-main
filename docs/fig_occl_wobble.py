@@ -39,12 +39,22 @@ GEOM = hw.geometry(gain_correction=np.asarray(CAL["gain_correction"], float),
                    wavelengths_nm=WL, dark_level=None)
 
 
-def run(nm, mode=MODE_INTERP, avg=20):
-    """复刻 online 的链路：DarkSubtractor → 滑动窗 → 稳健聚合 → compute_toi。"""
+def run(nm, mode=MODE_INTERP, avg=20, channel=None):
+    """复刻 online 的链路：DarkSubtractor → 滑动窗 → 稳健聚合 → compute_toi。
+
+    ⚠️ **必须限定一个采集通道**（2026-10-29）。这里只有一个 `DarkSubtractor`，
+       而它只认 (λ, ρ)、不认通道 —— 多通道归档不筛就会把另一通道的暗时隙
+       扣到这一通道的信号上。`channel=None` 取归档里出现的第一个通道。
+       （阻断实验那几份都是单通道采的，所以此前没出事；但脚本不该靠
+       "输入恰好是单通道"这个巧合。）
+    """
     ds = DarkSubtractor(mode=mode)
     win = {k: [] for k in KEYS}
     out, fresh, t0 = [], set(), None
-    for f in archive.replay(ARC / f"{nm}.srsraw"):
+    frames = archive.replay(ARC / f"{nm}.srsraw")
+    if channel is None:
+        channel = next((int(f.channel) for f in frames), 1)
+    for f in (f for f in frames if int(f.channel) == int(channel)):
         if t0 is None:
             t0 = f.t_host
         if f.is_dark:

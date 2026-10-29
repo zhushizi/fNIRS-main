@@ -3,6 +3,7 @@
 
     python -m srs_cal.acquire                # 连真机
     python -m srs_cal.acquire --simulate     # 无硬件，用正演模型造数据排练
+    python -m srs_cal.acquire --channel 2    # 指定采集通道（默认 1）
 
 采集逻辑：点某块的按钮 → 连续收 N 帧（默认 200，约 20 个扫描周期）→
 对每个「波长 × 距离」组合取均值、标准差、帧数。同一块可以反复采多次
@@ -33,9 +34,11 @@ from srs_cal import hardware as hw           # noqa: E402
 from srs_cal import phantom                  # noqa: E402
 from srs_cal.robust import aggregate         # noqa: E402
 from srs_cal.protocol import (                # noqa: E402
-    BRIGHTNESS_MAX, BRIGHTNESS_MIN, DISTANCE_BY_CODE, EXPECTED_CHANNEL,
+    BRIGHTNESS_MAX, BRIGHTNESS_MIN, CHANNEL_MAX, CHANNEL_MIN,
+    CMD_START_CH2, CMD_STOP_CH1, DISTANCE_BY_CODE, EXPECTED_CHANNEL,
     BRIGHTNESS_DEFAULT, WAVELENGTH_BY_CODE, Frame, FrameStream,
-    build_brightness, build_frame, format_frame)
+    CMD_START, build_brightness, build_cmd, build_frame, format_frame,
+    frames_per_cycle)
 
 WLS = [WAVELENGTH_BY_CODE[c] for c in sorted(WAVELENGTH_BY_CODE)]     # 670..950
 RHOS = [DISTANCE_BY_CODE[c] for c in sorted(DISTANCE_BY_CODE)]        # 3.0, 4.0
@@ -63,7 +66,10 @@ PULSE_BAND_HZ = (0.67, 3.0)
 # 谱峰显著度（带内谱峰/全谱中位）的判定下限。自验：心搏 0.5% 振幅给
 # 250~354，纯噪声给 4.8~5.7 —— 两者差约 50 倍，取 30 留足余量。
 PULSE_PROM_MIN = 30.0
-# 一个扫描周期的帧数：(1 暗槽 + 5 波长) × 2 距离。
+# 一个扫描周期的帧数：(1 暗槽 + 5 波长) × 2 距离。**单个通道**的。
+# 多通道同采时串口上一周期是它的通道数倍，拿帧率换算周期率要用
+# protocol.frames_per_cycle(活跃通道数)；而采集缓冲里的帧已按通道过滤过，
+# 所以 _sync_frame_hint 的「每组合帧数」仍除这个常量，不乘通道数。
 FRAMES_PER_CYCLE = (1 + len(WLS)) * len(RHOS)
 # 实时表的配色阈值：扣暗后低于此值标红（srs.py 的 MIN_COUNTS 是 2000），
 # 原始值高于此值标黄（疑似接近满量程）。
@@ -176,6 +182,16 @@ class Take:
     # ⚠️ 2026-10-09/10 的五个文件记的「1」是界面默认值、从未下发过，
     #    实际是设备上电默认档位 0x0F（最亮）。那几份数据按 15 解读。
     brightness: int | None = None
+    # 采这一次时的采集通道（指令帧 byte6 / 数据帧 byte10）。
+    #
+    # ⚠️ 这个值是**经回传校验过**的：on_frames 只把 byte10 与所选通道相符的帧
+    #    放进缓冲，不符的当场丢弃。所以「这次采集的帧全部来自该通道」是
+    #    由过滤保证的，不是由「我们下发过」推断的 —— 后者已被实测证伪
+    #    （2026-10-28：下发通道 2，292 帧回来 byte10 全是 01）。
+    #
+    # ⚠️ 2026-10-28 之前采的文件没有这一列，不代表它们是通道 1 采的 ——
+    #    只代表当时没记。按「未知」处理，别回填。
+    channel: int | None = None
     mean: dict = field(default_factory=dict)
     # 稳健聚合剔除的样本数，键同 mean。供质量层使用，别丢。
     rejected: dict = field(default_factory=dict)
@@ -415,7 +431,13 @@ class SimWorker(QtCore.QThread):
         self.block = block
 
     def send(self, payload: bytes) -> None:
-        """模拟器忽略指令，只为与 SerialWorker 接口一致。"""
+        """模拟器忽略指令，只为与 SerialWorker 接口一致。
+
+        ⚠️ 造帧时 `build_frame` 的通道走默认值 1，所以在模拟器下选通道 2~4
+           会**一帧都收不到**（全被 on_frames 的 byte10 校验丢掉）。
+           这不是 bug —— 真机实测也是这个表现（下发 byte6 不被接受）。
+           想排练多通道，得先有一台真会切换的设备。
+        """
 
     def stop(self) -> None:
         self._run = False
@@ -510,7 +532,11 @@ class MainWindow(QtWidgets.QWidget):
         self.live_dark: dict[float, int] = {}
         # 最后一次**成功下发**的档位。None = 从未发过，设备停在上电默认档。
         self._gear_sent: int | None = None
-        self.channel_warned = False
+        # 通道同理。另外三个计数器用于**以回传为准**的校验（见 on_frames）。
+        self._chan_sent: int | None = None
+        self._n_chan_ok = 0
+        self._n_chan_bad = 0
+        self._chan_seen: set = set()
         self._frames_seen = 0
         self.raw_buf: deque = deque(maxlen=RAW_BUFFER)   # (序号, 相对秒, Frame)
         self._t0 = time.perf_counter()
@@ -562,7 +588,7 @@ class MainWindow(QtWidgets.QWidget):
             f"光源档位 0~{BRIGHTNESS_MAX} 共 {BRIGHTNESS_MAX + 1} 档，"
             f"上电默认 {BRIGHTNESS_DEFAULT}（= 上限的 "
             f"{BRIGHTNESS_DEFAULT / BRIGHTNESS_MAX * 100:.0f}%）。\n"
-            "改动立即下发指令帧 55 AA 1A 01 01 <档位> 01 …\n\n"
+            "改动立即下发指令帧 55 AA 1A 01 01 <档位> <通道> …\n\n"
             "对 SRS 是安全的：光强整体乘一个因子时两个探测器同步变，空间斜率不变，\n"
             "所以不同体模块可以用不同档位迁就动态范围。同一块采集期间不要改。\n"
             "每次采集的档位会随数据存进 xlsx。\n\n"
@@ -578,6 +604,47 @@ class MainWindow(QtWidgets.QWidget):
         self._bright_timer.setInterval(BRIGHTNESS_SETTLE_MS)
         self._bright_timer.timeout.connect(self._send_brightness)
         self.spn_bright.valueChanged.connect(self._bright_timer.start)
+        # 采集通道。与档位同走一条指令帧（byte5 档位、byte6 通道），
+        # 所以改哪一个都调 _send_brightness。下拉框是离散选择、不会连点，
+        # 不需要档位那样的静默期。
+        self.cmb_chan = QtWidgets.QComboBox()
+        for c in range(CHANNEL_MIN, CHANNEL_MAX + 1):
+            self.cmb_chan.addItem(f"通道 {c}", c)
+        i = self.cmb_chan.findData(EXPECTED_CHANNEL)
+        self.cmb_chan.setCurrentIndex(max(i, 0))
+        self.cmb_chan.setToolTip(
+            f"采集通道 {CHANNEL_MIN}~{CHANNEL_MAX}，写进指令帧 byte6。\n"
+            "改动立即下发 55 AA 1A 01 01 <档位> <通道> …\n\n"
+            "⚠️ 以**回传**为准：只有数据帧 byte10 与此处相符的帧才会进缓冲，\n"
+            "   不符的当场丢弃并在下方报出来。\n\n"
+            "通道是**累加**的（厂家文档「累加依次」+ 2026-10-29 实测）：\n"
+            "   开了 2 号之后 1 号仍在发，设备把帧率翻倍。\n"
+            "   采集只收这里选中的那一个 —— 标定本来就是一次标一套探头。\n"
+            "   要真正关掉某个通道，用右边的开关复选框。\n\n"
+            "⚠️ 换通道 = 换一整套光学器件，G(λ) 不迁移。\n"
+            "   一个 xlsx 里混多个通道，标定会被带歪。")
+        self.cmb_chan.currentIndexChanged.connect(self._on_channel)
+        # 每通道的开/关。与 online 同一套做法：勾 → 启动帧，取消 → 停止帧，
+        # 都只作用在 byte6 指定的那个通道上。
+        #
+        # 采集侧为什么也要：通道累加意味着别的通道一直在占串口带宽，
+        # 并且（2026-10-29 实测）开着 2 号会让 1 号的快噪声涨 5.3~5.9 倍。
+        # 标定时要能把别的通道**真正关掉**，而不只是"不看它"。
+        self.chk_ch: dict[int, QtWidgets.QCheckBox] = {}
+        self._gear_by_ch: dict[int, int] = {}
+        for c in range(CHANNEL_MIN, CHANNEL_MAX + 1):
+            cb = QtWidgets.QCheckBox(str(c))
+            cb.setToolTip(
+                f"通道 {c} 的开/关。\n"
+                f"  勾选 → 启动帧 byte4=01、byte6={c:02X}（档位用它自己的）\n"
+                f"  取消 → 停止帧 byte4=00、byte6={c:02X}\n\n"
+                "⚠️ 勾上不代表设备真开了 —— 以下方的回传状态为准。\n"
+                "⚠️ 标定时建议**只开要标的那一个**：开着别的通道会给它\n"
+                "   带来可观的电气噪声（实测快噪声涨 5.3~5.9 倍）。")
+            cb.setChecked(c == EXPECTED_CHANNEL)
+            cb.toggled.connect(lambda on, ch=c: self._on_chan_toggle(ch, on))
+            self.chk_ch[c] = cb
+            self._gear_by_ch[c] = BRIGHTNESS_DEFAULT
         self.chk_print = QtWidgets.QCheckBox("终端打印")
         self.chk_print.setChecked(PRINT_FRAMES_DEFAULT)
         self.chk_print.setToolTip(
@@ -591,8 +658,10 @@ class MainWindow(QtWidgets.QWidget):
         for w in (QtWidgets.QLabel("串口"), self.cmb_port, QtWidgets.QLabel("波特率"),
                   self.cmb_baud, self.btn_refresh, self.btn_conn,
                   QtWidgets.QLabel("  光源档位"), self.spn_bright,
-                  self.lbl_gearhex, self.btn_run,
-                  self.chk_print,
+                  self.lbl_gearhex,
+                  QtWidgets.QLabel("  采集通道"), self.cmb_chan,
+                  QtWidgets.QLabel(" 开"), *self.chk_ch.values(),
+                  self.btn_run, self.chk_print,
                   QtWidgets.QLabel("  每次采集"), self.spn_frames,
                   self.lbl_percombo):
             bar.addWidget(w)
@@ -601,6 +670,11 @@ class MainWindow(QtWidgets.QWidget):
         self.lbl_link.setStyleSheet("color:#888")
         bar.addWidget(self.lbl_link)
         root.addLayout(bar)
+        # 通道状态：单独一行而不是挤在工具栏里 —— 「收到 N 帧但都标着通道 M」
+        # 这句话很长，塞进工具栏会把串口下拉框挤没。
+        self.lbl_chan = QtWidgets.QLabel("")
+        self.lbl_chan.setWordWrap(True)
+        root.addWidget(self.lbl_chan)
         self.btn_refresh.clicked.connect(self.refresh_ports)
         self.btn_conn.clicked.connect(self.toggle_conn)
         if self.simulate:
@@ -742,8 +816,30 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_save.setStyleSheet("font-weight:bold;padding:7px 18px")
         self.btn_del.clicked.connect(self.delete_selected)
         self.btn_save.clicked.connect(self.save_xlsx)
+        # —— 两条固定的协议测试帧（2026-10-29，用户逐字节指定）——
+        # 放在底排而不是顶排：顶排是常规控件，而「关闭通道一」会停数据流，
+        # 误点一下代价不小（能不能用启动帧恢复还没验过）。
+        self.btn_cmd_ch2 = QtWidgets.QPushButton("启动通道2")
+        self.btn_cmd_ch2.setToolTip(
+            "原样下发：55 AA 1A 01 01 64 02 … 82\n"
+            "（启动 | 强度 100 | 二通道）\n\n"
+            "⚠️ 2026-10-28 实测：下发通道 2 后回传的 byte10 仍是 01。\n"
+            "   若这次仍无变化，看下方通道状态行会直接写出来。")
+        self.btn_cmd_ch2.clicked.connect(self._on_cmd_start_ch2)
+        self.btn_cmd_stop = QtWidgets.QPushButton("关闭通道一")
+        self.btn_cmd_stop.setStyleSheet("color:#a33208;font-weight:bold")
+        self.btn_cmd_stop.setToolTip(
+            "原样下发：55 AA 1A 01 00 00 01 … 1C\n"
+            "（停止 | 强度 0 | 一通道）\n\n"
+            "⚠️ 停止帧**从未实测过**。设备一直是上电即连续发数据。\n"
+            "   生效的标志是连接栏帧率掉到 0；恢复只能靠再发启动帧，\n"
+            "   万一启动帧也不被接受，就得重新上电。先在体模上试。")
+        self.btn_cmd_stop.clicked.connect(self._on_cmd_stop_ch1)
         self.lbl_prog = QtWidgets.QLabel("已采 0/12 块")
         bot.addWidget(self.lbl_prog); bot.addStretch(1)
+        bot.addWidget(QtWidgets.QLabel("协议测试"))
+        bot.addWidget(self.btn_cmd_ch2); bot.addWidget(self.btn_cmd_stop)
+        bot.addWidget(QtWidgets.QLabel("｜"))
         bot.addWidget(self.btn_plot); bot.addWidget(self.btn_raw)
         bot.addWidget(self.btn_del)
         bot.addWidget(self.btn_save)
@@ -828,8 +924,78 @@ class MainWindow(QtWidgets.QWidget):
         """
         return BRIGHTNESS_DEFAULT if self._gear_sent is None else self._gear_sent
 
+    def channel(self) -> int:
+        """下拉框当前选中的通道。"""
+        return int(self.cmb_chan.currentData())
+
+    def channel_in_effect(self) -> int:
+        """设备**实际**在用的通道。与 gear_in_effect 同理 ——
+        未连接时改通道发不出去，设备仍停在上电默认通道。"""
+        return EXPECTED_CHANNEL if self._chan_sent is None else self._chan_sent
+
+    def _clear_channel_state(self) -> None:
+        """换通道后把「上一个通道的痕迹」清掉。
+
+        实时表里的旧数字必须清掉 —— 那是上一个通道的读数，留着会被当成
+        新通道已经有数据。已采的 take **不动**：那是真实采到的数据，
+        每一条自带 channel 列；真混了通道，由「汇总」表的通道列显形。
+        """
+        self._n_chan_ok = self._n_chan_bad = 0
+        self._chan_seen = set()
+        self.latest = {}
+        self.live_dark = {}
+        for lb in self.live_lbl.values():
+            lb.setText("—")
+            lb.setStyleSheet("font-family:Consolas,monospace;font-size:12px;"
+                             "color:#999")
+        for lb in self.live_net.values():
+            lb.setText("—")
+            lb.setStyleSheet("font-family:Consolas,monospace;font-size:14px;"
+                             "font-weight:bold")
+
+    def _warn_mixed_channel(self) -> None:
+        """本次会话已采过别的通道时提醒 —— 一个 xlsx 混通道会把 G(λ) 带歪。"""
+        done = {t.channel for t in self.takes if t.channel is not None}
+        if done and self.channel() not in done:
+            self._banner(
+                f"⚠ 本次会话已有通道 {'、'.join(str(c) for c in sorted(done))} 的记录，"
+                f"现在切到通道 {self.channel()}。"
+                "一个 xlsx 里混多个通道会把 G(λ) 带歪 —— "
+                "要么现在先保存再换，要么记得标定时只取一个通道。", ok=False)
+
+    def _on_channel(self) -> None:
+        """下拉框换通道：清状态、提醒混采、立即下发。"""
+        self._clear_channel_state()
+        self._warn_mixed_channel()
+        self._send_brightness()
+        self._refresh_chan_label()
+
+    def _refresh_chan_label(self) -> None:
+        """通道状态。先报「收没收到」，再报别的 —— 前者更要紧。"""
+        ch = self.channel()
+        if self._n_chan_bad and not self._n_chan_ok:
+            seen = "、".join(str(c) for c in sorted(self._chan_seen))
+            self.lbl_chan.setText(
+                f"✗ 通道 {ch} 无数据：收到 {self._n_chan_bad} 帧，"
+                f"都标着通道 {seen} —— 该通道没有回传。"
+                "要么没发过它的启动帧、要么被停止帧关掉了、要么无硬件")
+            self.lbl_chan.setStyleSheet("color:#c33;font-weight:bold")
+            return
+        if self._n_chan_bad:
+            # 多通道同采是正常工况（通道累加），所以这里不是红色告警 ——
+            # 别的通道的帧本来就该被丢掉，提示只是说明"你看到的是哪一路"。
+            self.lbl_chan.setText(
+                f"通道 {ch}：{self._n_chan_ok} 帧；"
+                f"另有 {self._n_chan_bad} 帧属其他通道，未计入")
+            self.lbl_chan.setStyleSheet("color:#2a6fb0")
+            return
+        self.lbl_chan.setText("")
+
     def _send_brightness(self) -> None:
-        """把当前档位下发给设备（经静默期合并后才会走到这里）。"""
+        """把当前档位与通道下发给设备（经静默期合并后才会走到这里）。"""
+        # ⚠️ 档位与通道共用**同一条指令帧**（byte5 / byte6），发不了一个就
+        #    发不了另一个。所以 BRIGHTNESS_ADJUSTABLE 为假时通道也换不了 ——
+        #    这不是耦合失误，是协议本身如此。
         if self.worker is None or not BRIGHTNESS_ADJUSTABLE:
             # 没连上发不出去。输入框和设备不一致，要让人看见。
             if self.worker is None and BRIGHTNESS_ADJUSTABLE:
@@ -839,17 +1005,104 @@ class MainWindow(QtWidgets.QWidget):
                     ok=False)
             return
         if self.capturing is not None:
-            # 采集中改档位会让这一次的数据前后不一致。按说框已禁用，
+            # 采集中改档位/通道会让这一次的数据前后不一致。按说控件已禁用，
             # 这里是兜底 —— 真发生了要让人看见，而不是静默照发。
-            self._banner("✗ 采集进行中，档位未下发。换档位请等本次采完。",
+            self._banner("✗ 采集进行中，档位/通道未下发。要改请等本次采完。",
                          ok=False)
             return
-        g = self.spn_bright.value()
-        frame = build_brightness(g)
+        g, ch = self.spn_bright.value(), self.channel()
+        self._send_cmd(build_brightness(g, ch), g, ch,
+                       f"光源档位 0x{g:02X}、通道 {ch}")
+
+    def _send_cmd(self, frame: bytes, gear: int, ch: int, what: str) -> bool:
+        """把一条**已经造好**的指令帧发出去，并记下设备现在是什么状态。
+
+        界面驱动的 `_send_brightness` 与两个固定帧按钮共用这一条路 ——
+        否则「按钮发出去的帧」与「界面以为的状态」会分叉，
+        之后随便动一下档位就会把按钮刚设的通道覆盖掉。
+        """
         self.worker.send(frame)
-        self._gear_sent = g
-        self._banner(f"已下发光源档位 0x{g:02X}　{frame.hex(' ').upper()}　"
+        self._gear_sent, self._chan_sent = gear, ch
+        # 记住这个通道的档位 —— 开关复选框重新勾上时要用它自己的那个，
+        # 不是别人的。停止帧（档位写 0）不算"这个通道的档位"，不记。
+        if frame[4] == CMD_START:
+            self._gear_by_ch[ch] = gear
+        # 复选框跟着这一帧走，不管这帧是谁造的（档位框、固定按钮、
+        # 还是复选框自己）。否则界面上的勾选与真正发出去的字节会分叉。
+        cb = self.chk_ch.get(ch)
+        if cb is not None:
+            cb.blockSignals(True)
+            cb.setChecked(frame[4] == CMD_START)
+            cb.blockSignals(False)
+        self._banner(f"已下发 {what}　{frame.hex(' ').upper()}　"
                      "读数应随之变化；若没变，说明设备没接受这条指令。", ok=True)
+        return True
+
+    def _send_fixed(self, frame: bytes, gear: int, ch: int, name: str) -> None:
+        """固定帧按钮：原样发出这 26 个字节，再把界面调到与之一致。
+
+        ⚠️ 不走「改控件 → 触发下发」那条路：那条路会**重新造帧**，
+           而重造出来的 byte4 恒为启动 —— 关闭帧会当场变回启动帧。
+        """
+        if self.worker is None:
+            self._banner(f"✗ 未连接，「{name}」没发出去。", ok=False)
+            return
+        if self.capturing is not None:
+            self._banner(f"✗ 采集进行中，「{name}」未下发。请等本次采完。",
+                         ok=False)
+            return
+        prev_ch = self.channel()
+        self._send_cmd(frame, gear, ch, name)
+        # 界面跟上：**屏蔽信号**，否则 setValue/setCurrentIndex 会再触发一次
+        # 下发，把刚发的固定帧覆盖掉。
+        self.spn_bright.blockSignals(True)
+        self.spn_bright.setValue(gear)
+        self.spn_bright.blockSignals(False)
+        self.lbl_gearhex.setText(f"= 0x{gear:02X}")   # 信号屏了，标签手动刷
+        i = self.cmb_chan.findData(ch)
+        if i >= 0:
+            self.cmb_chan.blockSignals(True)
+            self.cmb_chan.setCurrentIndex(i)
+            self.cmb_chan.blockSignals(False)
+        if ch != prev_ch:
+            self._clear_channel_state()
+            self._warn_mixed_channel()
+        self._refresh_chan_label()
+
+    def _on_chan_toggle(self, ch: int, on: bool) -> None:
+        """某通道的开/关复选框。勾 → 启动帧；取消 → 停止帧。
+
+        只作用在 byte6 指定的那一个通道上 —— 实测（2026-10-29，162704）：
+        停 1 号时 2 号继续流，再发启动帧 1 号恢复。
+        """
+        cb = self.chk_ch[ch]
+
+        def _revert(msg: str) -> None:
+            # 发不出去就别让复选框假装生效 —— 它会被当成"设备状态"读。
+            cb.blockSignals(True)
+            cb.setChecked(not on)
+            cb.blockSignals(False)
+            self._banner(msg, ok=False)
+
+        if self.worker is None:
+            _revert(f"✗ 未连接，通道 {ch} 的"
+                    f"{'启动' if on else '停止'}帧没发出去。")
+            return
+        if self.capturing is not None:
+            _revert(f"✗ 采集进行中，通道 {ch} 的开关未下发。请等本次采完。")
+            return
+        g = self._gear_by_ch.get(ch, BRIGHTNESS_DEFAULT) if on else 0x00
+        if not self._send_cmd(build_cmd(on, g, ch), g, ch,
+                              f"通道 {ch} {'启动' if on else '停止'}"):
+            _revert(f"✗ 通道 {ch} 的开关没发出去。")
+            return
+        self._refresh_chan_label()
+
+    def _on_cmd_start_ch2(self) -> None:
+        self._send_fixed(CMD_START_CH2, 0x64, 0x02, "启动通道2")
+
+    def _on_cmd_stop_ch1(self) -> None:
+        self._send_fixed(CMD_STOP_CH1, 0x00, 0x01, "关闭通道一")
 
     def toggle_run(self, on: bool) -> None:
         """保留的启停按钮 —— 当前固件上电即发数据，**不响应启停**。
@@ -860,6 +1113,7 @@ class MainWindow(QtWidgets.QWidget):
             return
         self.btn_run.setText("■ 停止采集" if on else "▶ 开始采集")
         self.spn_bright.setEnabled(BRIGHTNESS_ADJUSTABLE and not on)
+        self.cmb_chan.setEnabled(not on)
         if on:
             self._send_brightness()
 
@@ -870,14 +1124,25 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_conn.setText("连接"); self.lbl_link.setText("未连接")
         self._abort_capture()
 
+    def _n_active(self) -> int:
+        """回传里还在发帧的通道数。**以回传为准**，不看我们下发过几个。"""
+        st = getattr(self.worker, "stream", None)
+        return getattr(st, "n_active", 1) if st is not None else 1
+
     def _cycle_hz(self) -> float:
         """实测扫描周期率（周期/秒）。判搏动必须用实测值 —— 按假设的帧率
-        算会把心搏放到错误的频率上。拿不到返回 nan，上层据此跳过搏动判定。"""
+        算会把心搏放到错误的频率上。拿不到返回 nan，上层据此跳过搏动判定。
+
+        ⚠️ 必须除以活跃通道数。`_frames_seen` 在通道过滤**之前**就自增
+           （见 on_frames），所以它数的是串口上的全部帧。多通道同采时
+           设备把帧率成倍提高而每通道的周期率不变（2026-10-29 实测：
+           双通道 15.6 帧/s，ch1 仍 0.656 周期/s）—— 只除 12 会成倍偏高。
+        """
         t = time.perf_counter() - getattr(self, "_t0", time.perf_counter())
         n = getattr(self, "_frames_seen", 0)
         if t <= 0 or n <= 0:
             return float("nan")
-        return n / t / FRAMES_PER_CYCLE
+        return n / t / frames_per_cycle(self._n_active())
 
     def _tick_rate(self) -> None:
         if self.worker is None:
@@ -889,8 +1154,12 @@ class MainWindow(QtWidgets.QWidget):
         if st is not None and (st.n_dropped or st.n_bad_checksum):
             extra = f"  <span style='color:#c33'>丢弃 {st.n_dropped}B / 校验错 " \
                     f"{st.n_bad_checksum}</span>"
-        self.lbl_link.setText(f"{fps} 帧/s（{fps/FRAMES_PER_CYCLE:.1f} 周期/s）{extra}")
+        na = self._n_active()
+        self.lbl_link.setText(
+            f"{fps} 帧/s（{fps/frames_per_cycle(na):.2f} 周期/s"
+            + (f"，{na} 通道" if na > 1 else "") + f"）{extra}")
         self._tick_darkstat()
+        self._refresh_chan_label()
 
     def _tick_darkstat(self) -> None:
         """暗时隙状态条 —— 取代原来的「尚无暗电平」提示。
@@ -935,6 +1204,20 @@ class MainWindow(QtWidgets.QWidget):
                       f" {f.distance_cm:.0f}cm | ADC={f.adc:>12,d} |"
                       f" {'OK ' if _crc_ok(f) else '校验错'} |"
                       f" {format_frame(f.raw)}", flush=True)
+            # 通道校验：**以回传为准**（数据帧 byte10），不认我们下发了什么。
+            #
+            # 2026-10-28 实测：下发通道 2，292 帧回来 byte10 全是 01，
+            # 十路读数与通道 1 相差都在 ±1% 内（就是两次采集的正常起伏）。
+            # 若把它们当通道 2 收下，就会把一号通道的数据标成二号写进标定表 ——
+            # 那比「没数据」糟得多：没数据看得见，标错的数据看不见。
+            #
+            # 原始帧照样进 raw_buf（上面已 append），丢的只是实时显示与入库，
+            # 所以「原始帧…」窗口里仍能看到设备到底发了什么。
+            self._chan_seen.add(f.channel)
+            if f.channel != self.channel():
+                self._n_chan_bad += 1
+                continue
+            self._n_chan_ok += 1
             self.latest[f.key] = f.adc
             self.live_lbl[f.key].setText(f"{f.adc:,}")
             # 实时扣暗显示 —— 与采集用的是同一个「本周期的暗」。
@@ -958,12 +1241,6 @@ class MainWindow(QtWidgets.QWidget):
                         lb.setStyleSheet(
                             "font-family:Consolas,monospace;font-size:14px;"
                             f"font-weight:bold;color:{col}")
-            if f.channel != EXPECTED_CHANNEL and not self.channel_warned:
-                self.channel_warned = True
-                QtWidgets.QMessageBox.warning(
-                    self, "通道号异常",
-                    f"收到通道号 {f.channel}，预期 {EXPECTED_CHANNEL}。\n"
-                    "当前样机应只有一个采集通道，请确认硬件配置。")
             if self.capturing is not None:
                 # 暗时隙排在每个周期最前，先记下来，本周期后面的信号帧
                 # 当场扣掉它。**必须按周期就近扣** —— 实测暗电平的漂移
@@ -997,6 +1274,19 @@ class MainWindow(QtWidgets.QWidget):
             return
         if self.capturing is not None:
             return
+        # 本通道一帧都没收到时直接拦住。不拦的话进度条会停在 0% 不动
+        # （on_frames 里这些帧根本不进缓冲），看着像死机，而真正的原因
+        # ——「设备没切到这个通道」—— 反而被进度条盖住了。
+        #
+        # 用横幅而不是模态框 —— 与 _add_row 的判定提示同一个口径（见 _banner）。
+        if self._n_chan_bad and not self._n_chan_ok:
+            seen = "、".join(str(c) for c in sorted(self._chan_seen))
+            self._banner(
+                f"✗ 没开始采集：选的是通道 {self.channel()}，但收到的 "
+                f"{self._n_chan_bad} 帧都标着通道 {seen}。"
+                "设备没切到该通道，现在采只会采到空数据 —— "
+                "先确认该通道有硬件、或切换指令是否被接受。", ok=False)
+            return
         if self.simulate and isinstance(self.worker, SimWorker):
             self.worker.set_block(block)
             QtCore.QThread.msleep(250)          # 让模拟器切到该块
@@ -1027,7 +1317,11 @@ class MainWindow(QtWidgets.QWidget):
         tk = Take(block=block, index=idx,
                   timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                   brightness=(self.gear_in_effect() if BRIGHTNESS_ADJUSTABLE
-                              else None))
+                              else None),
+                  # 记所选通道，不是 channel_in_effect() —— 进缓冲的每一帧
+                  # 都经过 byte10 校验，所以这个值是**被数据证实过**的；
+                  # 而「下发过什么」证实不了任何事。
+                  channel=self.channel())
         tk.dark = {r: list(v) for r, v in self.dark_buffer.items()}
         # ⚠️ 2026-10-22：由算术均值改为**稳健聚合**（MAD 剔除离群后取均值）。
         #    实测在体归档每通道有 2~6% 的周期是尖峰、幅度约 25 倍；
@@ -1083,6 +1377,9 @@ class MainWindow(QtWidgets.QWidget):
         # 采集期间锁住档位：中途改亮度会让这一次的前后两段不是同一个条件，
         # 而 xlsx 里只记一个档位值 —— 数据看着正常，其实已经废了。
         self.spn_bright.setEnabled(BRIGHTNESS_ADJUSTABLE and on)
+        # 通道同理，而且更严重：换通道是换一整套光学器件，
+        # 中途换等于把两套器件的读数平均进同一个 take。
+        self.cmb_chan.setEnabled(on)
         # btn_raw 故意不禁用 —— 采集过程中正是最该盯原始帧的时候
 
     def _add_row(self, tk: Take) -> None:
@@ -1259,6 +1556,12 @@ def _gear(tk: "Take"):
     return "固定" if tk.brightness is None else int(tk.brightness)
 
 
+def _chan(tk: "Take"):
+    """通道号。None（2026-10-28 之前采的文件）记「未知」而不是填 1 ——
+    那些数据当时没记通道，不能事后假设它是哪一个。"""
+    return "未知" if tk.channel is None else int(tk.channel)
+
+
 def write_workbook(path: Path, takes: list[Take], *, simulate: bool = False) -> int:
     """写 xlsx：明细 / 汇总 / 逐帧 / 元信息。返回明细行数。
 
@@ -1282,7 +1585,8 @@ def write_workbook(path: Path, takes: list[Take], *, simulate: bool = False) -> 
 
     ws = wb.active
     ws.title = "明细"
-    ws.append(["block", "take", "timestamp", "brightness_gear", "wavelength_nm",
+    ws.append(["block", "take", "timestamp", "brightness_gear", "channel",
+               "wavelength_nm",
                "distance_cm", "adc_mean", "adc_std", "rel_std_pct", "sem_pct",
                "n_frames"])
     rows = 0
@@ -1293,7 +1597,8 @@ def write_workbook(path: Path, takes: list[Take], *, simulate: bool = False) -> 
                     continue
                 m, s = tk.mean[(w, r)], tk.std[(w, r)]
                 nf = tk.count[(w, r)]
-                ws.append([tk.block, tk.index, tk.timestamp, _gear(tk), w, r,
+                ws.append([tk.block, tk.index, tk.timestamp, _gear(tk),
+                           _chan(tk), w, r,
                            round(m, 2), round(s, 2),
                            round(100 * s / m, 4) if m > 0 else None,
                            round(100 * s / m / max(nf, 1) ** 0.5, 4) if m > 0 else None,
@@ -1304,7 +1609,7 @@ def write_workbook(path: Path, takes: list[Take], *, simulate: bool = False) -> 
         # 直接决定扣暗能扣得多准，出问题时第一个要看的就是它。
         for r, (m, s, pp) in sorted(tk.dark_stats().items()):
             nf = len(tk.dark.get(r, ()))
-            ws.append([tk.block, tk.index, tk.timestamp, _gear(tk),
+            ws.append([tk.block, tk.index, tk.timestamp, _gear(tk), _chan(tk),
                        0, r, round(m, 2), round(s, 2),
                        round(100 * s / m, 4) if m > 0 else None,
                        round(100 * s / m / max(nf, 1) ** 0.5, 4) if m > 0 else None,
@@ -1312,8 +1617,12 @@ def write_workbook(path: Path, takes: list[Take], *, simulate: bool = False) -> 
             rows += 1
 
     ws2 = wb.create_sheet("汇总")
+    # ⚠️ 「通道」列加在末尾：run_calibration 按**列名**找 block/wavelength_nm/
+    #    I_3cm/I_4cm，末尾加列不影响它。
+    #    这一列显示 "1/2" 就说明该块混了两个通道的 take —— G(λ) 已被带歪，
+    #    不要用。本程序不替你拒绝（删哪一次是人的判断），但必须让它显形。
     ws2.append(["block", "wavelength_nm", "I_3cm", "I_4cm", "n_takes",
-                "光源档位", "重贴合离散_3cm_%", "重贴合离散_4cm_%"])
+                "光源档位", "重贴合离散_3cm_%", "重贴合离散_4cm_%", "通道"])
     # 只有完整的 take 进「汇总」—— 这张表是 run_calibration 的输入，
     # 缺组合的数据进去会把 G(λ) 带歪。但它们在「明细」「逐帧」里都在。
     # 不含 DARK —— 新固件的暗是每周期的暗时隙，已在采集时扣掉；
@@ -1334,6 +1643,8 @@ def write_workbook(path: Path, takes: list[Take], *, simulate: bool = False) -> 
                                                          key=_gear_key)),
                 round(float(a3.std(ddof=1) / a3.mean() * 100), 3) if a3.size > 1 else None,
                 round(float(a4.std(ddof=1) / a4.mean() * 100), 3) if a4.size > 1 else None,
+                "/".join(str(x) for x in sorted({_chan(t) for t in ts},
+                                                key=_gear_key)),
             ])
 
     # ---- 逐帧原始值 ----
@@ -1388,10 +1699,17 @@ def write_workbook(path: Path, takes: list[Take], *, simulate: bool = False) -> 
         ("数据帧", "55 AA | 1A | 02 | 波长(00=暗时隙, 01~05=670/770/810/850/950) "
                    "| 距离 | ADC(大端有符号 int32) | 通道 | 14B 保留 "
                    "| 校验=sum(b[2:25])&0xFF"),
-        ("指令帧", f"55 AA | 1A | 01 | 01 | 档位(0x00~0x{BRIGHTNESS_MAX:02X}) "
-                   "| 通道 01 | 填充 | 校验　"
-                   "（设备上电即发数据，不响应启停；只有档位指令有效）"),
-        ("协议来源", "厂家 jhw-adc.py 参考实现 + 2026-10-10 答复，逐字段核对一致"),
+        ("指令帧", "55 AA | 1A | 01 | 启停(00停/01启) | 强度 | 通道 | 填充 | 校验　"
+                   "（厂家协议文档：强度 0~100，通道 00=全部/01=一通道/02=二通道…；"
+                   f"本软件档位上限仍放到 {BRIGHTNESS_MAX}，与文档不一致，待确认）"),
+        ("采集通道", "本次使用 "
+                 + "/".join(str(c) for c in sorted({_chan(t) for t in takes},
+                                                   key=_gear_key))
+                 + "　每一帧都按数据帧 byte10 校验过，不符的已丢弃未入库。"
+                   "⚠️ 换通道 = 换一整套光学器件，G(λ) 不迁移；"
+                   "「汇总」表通道列出现 \"1/2\" 即为混采，不可用于标定"),
+        ("协议来源", "厂家 jhw-adc.py 参考实现 + 2026-10-10 答复 + "
+                     "厂家通讯协议文档（指令帧数据位 0/1/2 = 启停/强度/通道）"),
         ("数据来源", "⚠️ 模拟器生成，非真实测量" if simulate else "真机串口采集"),
         ("逐帧值", raw_note + "　两列：adc_raw = 原始读数，"
                   "adc_net = 扣掉同周期暗时隙后的值（标定用的是这一列）；"
@@ -1425,6 +1743,9 @@ def main(argv=None) -> int:
                     help=f"启动时自动连的串口，默认 {DEFAULT_PORT}")
     ap.add_argument("--gear", type=int, default=DEFAULT_GEAR,
                     help=f"启动时下发的光源档位，默认 {DEFAULT_GEAR}")
+    ap.add_argument("--channel", type=int, default=EXPECTED_CHANNEL,
+                    choices=range(CHANNEL_MIN, CHANNEL_MAX + 1),
+                    help=f"启动时下发的采集通道，默认 {EXPECTED_CHANNEL}")
     ap.add_argument("--no-autostart", action="store_true",
                     help="不自动连口、不自动下发档位")
     args = ap.parse_args(argv)
@@ -1432,6 +1753,13 @@ def main(argv=None) -> int:
     app = QtWidgets.QApplication(sys.argv[:1])
     win = MainWindow(simulate=args.simulate)
     win.auto_port, win.auto_gear = args.port, args.gear
+    # 通道在连接**之前**就选好，这样 autostart 下发的那一帧里带的就是它，
+    # 不必连上之后再发第二帧。
+    i = win.cmb_chan.findData(args.channel)
+    if i >= 0:
+        win.cmb_chan.blockSignals(True)      # 还没连口，别触发下发
+        win.cmb_chan.setCurrentIndex(i)
+        win.cmb_chan.blockSignals(False)
     win.chk_print.setChecked(args.print_frames)
     if args.print_frames:
         print("  序号   |  波长  | 距离 |          ADC | 校验 |"

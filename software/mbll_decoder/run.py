@@ -34,12 +34,27 @@ from srs_cal import archive  # noqa: E402
 from srs_cal.darksub import DarkSubtractor  # noqa: E402
 
 
-def load(path: Path, rho: float):
-    """归档 → (t, I)。扣暗用与 SRS 同一个插值扣暗器。"""
+def load(path: Path, rho: float, channel: int | None = None):
+    """归档 → (t, I)。扣暗用与 SRS 同一个插值扣暗器。
+
+    ⚠️ **必须限定一个采集通道**（2026-10-29）。多通道归档里两个通道的帧是
+       交错的，而这里只有**一个** `DarkSubtractor`、`per` 又按 `cycle_id`
+       建键 —— 不筛通道会同时犯两个错：
+         ① 把另一通道的暗时隙扣到这一通道的信号上
+            （实测 ch2 暗峰峰 786,447，ch1 只有 11,461，量级差 60 倍）；
+         ② `cycle_id` 现在是**按通道各自编号**的，ch1 的第 5 周期与 ch2 的
+            第 5 周期会落进同一个 `per[5]`，后写覆盖先写。
+       `channel=None` 时取归档里**出现的第一个**通道，并在上层打印出来 ——
+       不默认 1 号，因为归档完全可能只有 2 号（实测 20261029_162716 就是）。
+    """
     wl = [float(w) for w in mh.WAVELENGTHS_NM]
     ds = DarkSubtractor()
     per: dict = collections.defaultdict(dict)
-    for f in archive.replay(path):
+    frames = archive.replay(path)
+    if channel is None:
+        channel = next((int(f.channel) for f in frames), 1)
+    frames = [f for f in frames if int(f.channel) == int(channel)]
+    for f in frames:
         if f.cycle_id < 0:
             continue
         got = (ds.feed_dark(f.distance_cm, f.t_host, float(f.adc))
@@ -51,11 +66,11 @@ def load(path: Path, rho: float):
                 per[f.cycle_id][w] = (t, v)
     cyc = sorted(c for c in per if all(w in per[c] for w in wl))
     if not cyc:
-        return np.array([]), np.zeros((len(wl), 0))
+        return np.array([]), np.zeros((len(wl), 0)), int(channel)
     ref = wl[-1]
     t = np.array([per[c][ref][0] for c in cyc])
     I = np.vstack([[per[c][w][1] for c in cyc] for w in wl])
-    return t, I
+    return t, I, int(channel)
 
 
 def main(argv=None) -> int:
@@ -67,6 +82,9 @@ def main(argv=None) -> int:
     ap.add_argument("--low", type=float, default=mh.BP_LOW_HZ)
     ap.add_argument("--high", type=float, default=mh.BP_HIGH_HZ)
     ap.add_argument("--csv", default=None, help="把时间序列写成 CSV")
+    ap.add_argument("--channel", type=int, default=None,
+                    help="采集通道（数据帧 byte10）。不给则取归档里出现的"
+                         "第一个 —— 多通道归档必须指定，否则只算到其中一个")
     a = ap.parse_args(argv)
 
     if a.file:
@@ -82,10 +100,16 @@ def main(argv=None) -> int:
         print(f"找不到 {path}")
         return 2
 
-    t, I = load(path, a.rho)
+    seen = sorted({int(f.channel) for f in archive.replay(path)})
+    t, I, ch = load(path, a.rho, a.channel)
     print("=" * 72)
     print(f"MBLL　{path.name}　ρ={a.rho:.0f}cm　"
-          f"波长 {[int(w) for w in mh.WAVELENGTHS_NM]}")
+          f"波长 {[int(w) for w in mh.WAVELENGTHS_NM]}　通道 {ch}")
+    # 归档里有多个通道时必须说出来：这一次只算了其中一个，
+    # 不说的话下面那串数字看起来就像"这份归档的全部结果"。
+    if len(seen) > 1:
+        print(f"  ⚠ 本归档含 {len(seen)} 个采集通道 {seen}，"
+              f"这里只算了通道 {ch}。换 --channel 看别的。")
     print("=" * 72)
     if t.size == 0:
         print("  该距离上没有可用样本")

@@ -108,6 +108,8 @@ class RawArchive:
             "t0_perf": self._t0,             # 对应的 perf_counter，用于还原 t_host
             "rec_len": REC_LEN,
             "frame_len": FRAME_LEN,
+            # **单个通道**一周期的帧数。多通道同采时串口上一周期是它的
+            # 通道数倍 —— 读归档时别拿这个数去除总帧数。
             "frames_per_cycle": FRAMES_PER_CYCLE,
             "note": "t_rel = float64 小端，相对 t0_perf 的秒数；其后 raw 帧字节",
             **self.meta,
@@ -242,11 +244,21 @@ def read_records(path: Path | str):
             yield _REC.unpack_from(blk, 0)[0], blk[T_LEN:]
 
 
-def replay(path: Path | str) -> list[Frame]:
+def replay(path: Path | str, channel: int | None = None) -> list[Frame]:
     """把归档喂回 FrameStream，还原出带 t_host / cycle_id 的 Frame 列表。
 
     ⚠️ 这里刻意**重新解析**而不是直接反序列化字段 —— 这样归档既是数据，
        也是解析器的回归测试集。协议改了用新解析器重跑即可。
+
+    `channel` 给了就只返回该采集通道的帧。
+
+    ⚠️⚠️ **多通道归档必须筛通道。** 一份双通道归档里两个通道的帧是
+       交错的，而 `DarkSubtractor` 只认 (λ, ρ)、不认通道 —— 不筛就会把
+       另一个通道的暗时隙扣到这个通道的信号上。2026-10-29 实测 2 号通道
+       暗时隙峰峰 786,447，而 1 号只有 11,461，混着扣出来的净值毫无意义。
+       在线那两条链（online / acquire）安全是因为它们在处理前就按 byte10
+       过滤过，离线没有那道闸 —— 这个参数就是那道闸。
+       默认 `None`（不筛）是为了兼容既有调用方，**新代码请显式传通道**。
     """
     h = read_header(path)
     t0 = float(h.get("t0_perf", 0.0))
@@ -254,6 +266,20 @@ def replay(path: Path | str) -> list[Frame]:
     out: list[Frame] = []
     for t_rel, raw in read_records(path):
         out.extend(st.feed(raw, t_host=t0 + t_rel))
+    if channel is not None:
+        out = [f for f in out if f.channel == int(channel)]
+    return out
+
+
+def replay_channels(path: Path | str) -> dict[int, list[Frame]]:
+    """同 `replay`，但按采集通道分好组：{通道号: [该通道的帧]}。
+
+    通道**从回传推断**（数据帧 byte10），不读归档头里下发过什么 ——
+    下发了不等于设备开了（2026-10-28 实测：下发 2 号，292 帧回来全是 01）。
+    """
+    out: dict[int, list[Frame]] = {}
+    for f in replay(path):
+        out.setdefault(int(f.channel), []).append(f)
     return out
 
 

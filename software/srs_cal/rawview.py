@@ -19,7 +19,8 @@ from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from srs_cal.protocol import FRAME_LEN, checksum, split_fields
+from srs_cal.protocol import (CHANNEL_MAX, CHANNEL_MIN, FRAME_LEN, checksum,
+                              split_fields)
 
 MONO = "Consolas, 'Courier New', monospace"
 MAX_ROWS = 400                      # 表里最多显示多少行
@@ -148,8 +149,13 @@ class RawFrameViewer(QtWidgets.QDialog):
             if rho is not None and f.distance_cm != rho:
                 continue
             if self.chk_bad.isChecked():
+                # ⚠️ 2026-10-29 去掉了 `or f.channel != 1`。多通道同采是
+                #    正常工况（实测 byte10 会回 0x02），把 2 号通道的帧算成
+                #    异常帧会让「只看异常」刷满正常数据，真异常就看不见了。
+                #    通道号单独在表里成列显示，不进异常判据。
                 bad = (checksum(f.raw) != f.raw[FRAME_LEN - 1]
-                       or any(f.raw[11:25]) or f.channel != 1)
+                       or any(f.raw[11:25])
+                       or f.channel < CHANNEL_MIN or f.channel > CHANNEL_MAX)
                 if not bad:
                     continue
             out.append((seq, t, f))
@@ -184,8 +190,12 @@ class RawFrameViewer(QtWidgets.QDialog):
                     it.setForeground(QtGui.QBrush(QtGui.QColor("#c33")))
                 if c == 8 and not resv_zero:
                     it.setForeground(QtGui.QBrush(QtGui.QColor("#c33")))
-                if c == 6 and f.channel != 1:
-                    it.setForeground(QtGui.QBrush(QtGui.QColor("#d9a521")))
+                # 通道列：协议范围内的号用蓝色标出（提示"这不是 1 号"，
+                # 但不是错），超出 1~4 才算异常标红。
+                if c == 6 and f.channel != CHANNEL_MIN:
+                    bad_ch = f.channel < CHANNEL_MIN or f.channel > CHANNEL_MAX
+                    it.setForeground(QtGui.QBrush(
+                        QtGui.QColor("#c33" if bad_ch else "#2a6fb0")))
                 self.table.setItem(r, c, it)
         self.table.resizeColumnsToContents()
         self.table.horizontalHeader().setSectionResizeMode(
